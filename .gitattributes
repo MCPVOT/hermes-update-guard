@@ -1,0 +1,9 @@
+# Normalize all text to LF in the repo (Rust + markdown + workflows).
+* text=auto eol=lf
+
+# Binary artifacts must never be normalized.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.exe binary
