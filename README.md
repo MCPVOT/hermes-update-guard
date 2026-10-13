@@ -1,5 +1,10 @@
 # hermes-update-guard
 
+[![CI](https://github.com/MCPVOT/hermes-update-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/MCPVOT/hermes-update-guard/actions/workflows/ci.yml)
+[![Release](https://github.com/MCPVOT/hermes-update-guard/actions/workflows/release.yml/badge.svg)](https://github.com/MCPVOT/hermes-update-guard/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
+
 Guardian orchestrator for **safe Hermes Agent updates** — a single compiled binary
 (Windows, Linux, macOS) that wraps `hermes update` with everything the PS1 scripts
 did plus a hard preflight gate, WAL-safe backups, and a provider-surface tripwire that
