@@ -96,37 +96,17 @@ fn integrity(db: &Path) -> Result<(String, i64)> {
 }
 
 fn drift_diff_quiet(home: &Path, baseline: &Path) -> Result<()> {
-    let surface = home.join("backups").join("provider-surface");
-    let _ = &surface;
-    let mut drifted = 0usize;
-    for p in PROFILES {
-        let cfg = env::config_yaml(home, p);
-        if !cfg.exists() {
-            continue;
-        }
-        let live = crate::drift::extract_surface(&cfg)?;
-        let basef = if baseline.is_dir() {
-            baseline.join(format!("{}.json", p))
-        } else {
-            baseline.to_path_buf()
-        };
-        if !basef.exists() {
-            continue;
-        }
-        let basev: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&basef)?)?;
-        if live != basev {
-            drifted += 1;
-            println!(
-                "  ! {} drifted vs {}",
-                p,
-                basef.file_name().unwrap_or_default().to_string_lossy()
-            );
-        }
-    }
-    if drifted == 0 {
+    let lines = crate::drift::compare_against(home, baseline);
+    if lines.is_empty() {
         println!("  ok   no drift vs pre-update export");
     } else {
-        println!("  !    {} profile(s) drifted vs pre-update export", drifted);
+        for l in &lines {
+            println!("  ! {}", l.trim());
+        }
+        println!(
+            "  !    {} profile(s) drifted vs pre-update export",
+            lines.len()
+        );
     }
     Ok(())
 }

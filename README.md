@@ -47,6 +47,7 @@ Prebuilt binaries: see GitHub Releases (when published) — grab per-OS artifact
 | `backup` | WAL-safe SQLite backup of every profile's `state.db` + config/env/auth/gateway/content dirs → `backups/pre-update-<stamp>/`, verifies integrity + message counts | **refuses on incomplete backup** |
 | `update` | Full guarded update: preflight gate → export → backup → `hermes update --yes` → verify | refuses while venv held or desktop app running (add `--close-desktop`) |
 | `verify` | Post-update: HEAD advanced, DB integrity, drift-vs-export, gateway pid/state | reports FAIL on any bad DB |
+| `vibe` | Print the MCPVOT identity banner | none |
 
 ### Example flow
 

@@ -164,66 +164,35 @@ pub fn diff(home: &Path, explicit_baseline: Option<&Path>) -> Result<()> {
     );
     println!("baseline: {} state", base_label);
 
-    let mut drifted = 0usize;
-    let mut drift_lines: Vec<String> = Vec::new();
-    for p in PROFILES {
-        let cfg = env::config_yaml(home, p);
-        if !cfg.exists() {
-            continue;
-        }
-        let live = extract_surface(&cfg)?;
-        let basef = if base.is_dir() {
-            base.join(format!("{}.json", p))
-        } else {
-            base.to_path_buf()
-        };
-        if !basef.exists() {
-            continue;
-        }
-        let basev: Value = serde_json::from_str(&std::fs::read_to_string(&basef)?)
-            .with_context(|| format!("parse baseline {}", basef.display()))?;
-        let profile_drift: Vec<String> = SURFACE_KEYS
-            .iter()
-            .filter(|k| live.get(*k) != basev.get(*k))
-            .map(|k| k.to_string())
-            .collect();
-        if !profile_drift.is_empty() {
-            drifted += 1;
-            for k in &profile_drift {
-                let lv = live.get(k).cloned().unwrap_or(Value::Null);
-                let bv = basev.get(k).cloned().unwrap_or(Value::Null);
-                let line_live = format!("  {} {:<22} -> LIVE={}", p, k, trunc(&lv.to_string(), 90));
-                let line_base = format!(
-                    "  {:<10} {:<22}   BASE({})={}",
-                    "",
-                    "",
-                    base_label,
-                    trunc(&bv.to_string(), 90)
-                );
-                println!("{}", line_live);
-                println!("{}", line_base);
-                drift_lines.push(line_live);
-                drift_lines.push(line_base);
-            }
-        }
+    let lines = compare_against(home, &base);
+    for l in &lines {
+        println!("{}", l);
     }
 
-    if drifted == 0 {
+    if lines.is_empty() {
         println!("  no provider-surface drift detected");
         Ok(())
     } else {
         println!();
         println!(
             "  [FAIL] DRIFT: {} profile(s) differ from baseline",
-            drifted
+            count_drift_lines(&lines)
         );
         eprintln!("DRIFT_DETAILS_START");
-        for l in &drift_lines {
+        for l in &lines {
             eprintln!("{}", l);
         }
         eprintln!("DRIFT_DETAILS_END");
         std::process::exit(1);
     }
+}
+
+/// Count how many profiles drifted from the shared compare walk output.
+fn count_drift_lines(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .filter(|l| l.starts_with("  ") && l.contains(" drifted vs "))
+        .count()
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -234,6 +203,60 @@ fn trunc(s: &str, n: usize) -> String {
         out.push_str("...");
         out
     }
+}
+
+/// Shared drift-walk: compare every present profile's live surface against a
+/// baseline (a golden.json file OR a directory of per-profile json), returning
+/// per-profile drift lines. Used by `diff`, `preflight` summary and `verify`.
+pub fn compare_against(home: &Path, base: &Path) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for p in PROFILES {
+        let cfg = env::config_yaml(home, p);
+        if !cfg.exists() {
+            continue;
+        }
+        let Ok(live) = extract_surface(&cfg) else {
+            continue;
+        };
+        let basef = if base.is_dir() {
+            base.join(format!("{}.json", p))
+        } else {
+            base.to_path_buf()
+        };
+        if !basef.exists() {
+            continue;
+        }
+        let Ok(basev) =
+            serde_json::from_str::<Value>(&std::fs::read_to_string(&basef).unwrap_or_default())
+        else {
+            continue;
+        };
+        let profile_drift: Vec<&str> = SURFACE_KEYS
+            .iter()
+            .filter(|k| live.get(*k) != basev.get(*k))
+            .copied()
+            .collect();
+        if profile_drift.is_empty() {
+            continue;
+        }
+        lines.push(format!(
+            "  {} drifted vs {}",
+            p,
+            basef.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        for k in profile_drift {
+            lines.push(format!(
+                "  {:<22} -> LIVE={}  BASE={}",
+                k,
+                trunc(&live.get(k).cloned().unwrap_or(Value::Null).to_string(), 80),
+                trunc(
+                    &basev.get(k).cloned().unwrap_or(Value::Null).to_string(),
+                    80
+                )
+            ));
+        }
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -283,5 +306,53 @@ mod tests {
         let v: Value = serde_json::from_str(r#"{"a":{"b":{"c":1}}}"#).unwrap();
         assert_eq!(get_path(&v, "a.b.c"), Value::from(1));
         assert_eq!(get_path(&v, "a.missing"), Value::Null);
+    }
+
+    #[test]
+    fn compare_against_detects_drift() {
+        // fake home with one profile whose model.provider differs from baseline
+        let home = std::env::temp_dir().join("hug-test-home");
+        let prof = home.join("profiles").join("elevate");
+        std::fs::create_dir_all(&prof).unwrap();
+        std::fs::write(
+            prof.join("config.yaml"),
+            "model:\n  provider: openrouter\n  default: x\n  api_key: sk-1234567890123456\n",
+        )
+        .unwrap();
+        let base = home.join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("elevate.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model.provider": "anthropic",
+                "model.default": "x",
+                "model.base_url": null,
+                "model.api_key": "sk-1234567890123456",
+                "auxiliary": null,
+                "fallback_providers": null,
+                "fallback_model": null,
+                "delegation": null,
+                "providers": null,
+                "moa": null,
+                "display.language": null,
+                "stt.language": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let lines = compare_against(&home, &base);
+        assert!(
+            lines.iter().any(|l| l.contains("elevate drifted vs")),
+            "expected elevate drift line, got {:?}",
+            lines
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("model.provider")),
+            "expected key-level line, got {:?}",
+            lines
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

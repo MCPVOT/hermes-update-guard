@@ -9,6 +9,7 @@ use crate::env;
 /// This is the Rust analogue of update-hermes.ps1 -Update (without -CloseDesktop, the caller
 /// stops the Desktop app first when requested).
 pub fn run(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
+    crate::vibe::print_compact(env!("CARGO_PKG_VERSION"));
     println!("== HERMES UPDATE GUARDIAN ==");
     if !force {
         println!("\n-- PREFLIGHT GATE --");
@@ -71,27 +72,23 @@ pub fn run(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
         println!("{}", out);
     }
     if code != 0 {
-        eprintln!("\n[!] hermes update exited {}", code);
-        eprintln!("    backup retained at: {}", backup_dir.display());
-        eprintln!("    see update.log tail; do NOT continue.")
-    } else {
-        println!("  hermes update exit 0");
+        println!("\n*** UPDATE FAILED (exit {}) ***", code);
+        println!("    backup retained at: {}", backup_dir.display());
+        println!("    run `hermes-update-guard verify` only after you restore/harden");
+        return Err(anyhow::anyhow!(
+            "hermes update failed (exit {}) - backup at {} for restore",
+            code,
+            backup_dir.display()
+        ));
     }
+    println!("  hermes update exit 0");
 
     println!("\n-- POST-UPDATE VERIFY --");
     crate::verify::run(home)?;
 
-    if code == 0 {
-        println!(
-            "\nUPDATE FLOW COMPLETE - backup at {}",
-            backup_dir.display()
-        );
-    } else {
-        bail!(
-            "hermes update failed (exit {}) - backup at {} for restore",
-            code,
-            backup_dir.display()
-        );
-    }
+    println!(
+        "\nUPDATE FLOW COMPLETE - backup at {}",
+        backup_dir.display()
+    );
     Ok(())
 }
