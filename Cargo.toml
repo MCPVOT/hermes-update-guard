@@ -5,8 +5,8 @@ edition = "2021"
 description = "Guardian orchestrator for safe Hermes Agent updates: preflight, WAL-safe backup, provider-drift tripwire, update, post-verify, restore."
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/YOUR_USERNAME/hermes-update-guard"
-homepage = "https://github.com/YOUR_USERNAME/hermes-update-guard"
+repository = "https://github.com/MCPVOT/hermes-update-guard"
+homepage = "https://github.com/MCPVOT/hermes-update-guard"
 keywords = ["hermes", "agent", "update", "backup", "guard"]
 categories = ["command-line-utilities", "development-tools"]
 
