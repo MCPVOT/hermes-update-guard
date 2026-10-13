@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-13
+
+### Added
+
+- `vibe` subcommand: MCPVOT identity banner (Doom figlet), plus compact MCPVOT
+  header on `preflight` and `update` outputs.
+- Vibe tests: banner stays pure ASCII, no stray trailing newline.
+
+### Fixed
+
+- `update` now returns immediately on a failed `hermes update` instead of
+  running post-verify over a broken install; it prints the restore path and
+  leaves `verify` to be run only after recovery.
+- Removed dead `sha256_via_cmd` (PowerShell-only) — pure Rust sha2 based
+  manifest hashing is now used everywhere.
+- Removed dead PowerShell-only helpers; POSIX builds now use `pgrep` for the
+  process probe.
+
 ## [0.1.0] - 2026-10-13
 
 ### Added

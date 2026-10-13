@@ -11,6 +11,7 @@ mod env;
 mod guard;
 mod preflight;
 mod verify;
+mod vibe;
 
 #[derive(Parser)]
 #[command(
@@ -56,6 +57,8 @@ enum Cmd {
     },
     /// Post-update verification (HEAD advanced, DB integrity, drift check, gateway state).
     Verify,
+    /// Print the MCPVOT identity vibe banner.
+    Vibe,
 }
 
 /// Map a --baseline string to an explicit baseline path (None = auto: golden, else last-known).
@@ -95,5 +98,9 @@ fn main() -> Result<()> {
             force,
         } => guard::run(&home, close_desktop, force),
         Cmd::Verify => verify::run(&home),
+        Cmd::Vibe => {
+            vibe::print_full();
+            Ok(())
+        }
     }
 }

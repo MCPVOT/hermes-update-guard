@@ -1,10 +1,11 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-use crate::env::{self, PROFILES};
+use crate::env;
 
 /// Read-only preflight: surface every condition that decides an update.
 pub fn run(home: &Path) -> Result<()> {
+    crate::vibe::print_compact(env!("CARGO_PKG_VERSION"));
     println!("== HERMES UPDATE PREFLIGHT ==");
     println!("home: {}", home.display());
 
@@ -167,35 +168,18 @@ fn drift_summary(home: &Path) -> Result<()> {
         println!("  no golden/last-known baseline (run export first)");
         return Ok(());
     };
-    let mut drifted = 0usize;
-    for p in PROFILES {
-        let cfg = env::config_yaml(home, p);
-        if !cfg.exists() {
-            continue;
-        }
-        let live = crate::drift::extract_surface(&cfg)?;
-        let basef = if base.is_dir() {
-            base.join(format!("{}.json", p))
-        } else {
-            base.to_path_buf()
-        };
-        if !basef.exists() {
-            continue;
-        }
-        let basev: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&basef)?)?;
-        if live != basev {
-            drifted += 1;
-            println!(
-                "  ! {} drifted vs {}",
-                p,
-                basef.file_name().unwrap_or_default().to_string_lossy()
-            );
-        }
-    }
-    if drifted == 0 {
+    let basef = base.clone();
+    let lines = crate::drift::compare_against(home, &basef);
+    if lines.is_empty() {
         println!("  all present profiles match baseline");
     } else {
-        println!("  {} profile(s) drifted", drifted);
+        for l in &lines {
+            println!("  ! {}", l.trim());
+        }
+        println!(
+            "  {} profile(s) drifted",
+            lines.iter().filter(|l| l.contains(" drifted vs ")).count()
+        );
     }
     Ok(())
 }

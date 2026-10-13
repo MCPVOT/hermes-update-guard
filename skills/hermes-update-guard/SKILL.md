@@ -1,7 +1,7 @@
 ---
 name: hermes-update-guard
 description: Use before running `hermes update` — orchestrates the update with preflight, WAL-safe backup, provider-drift tripwire, and post-verify via the hermes-update-guard binary.
-version: 0.1.0
+version: 0.1.1
 author: hermes-update-guard
 license: MIT
 platforms: [darwin, linux, windows]
@@ -32,6 +32,7 @@ local build). If it is not installed:
 ```bash
 GUARD=hermes-update-guard               # adjust to absolute path if needed
 
+$GUARD vibe                              # MCPVOT identity banner (optional flourish)
 $GUARD preflight                        # read-only: surprises?
 $GUARD export                           # pin known-good provider surface
 $GUARD diff --baseline last-known       # prove clean, exit 0
