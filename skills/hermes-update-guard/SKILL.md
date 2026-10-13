@@ -64,4 +64,4 @@ gateway (`hermes gateway stop`) and closing Hermes.
 
 ## Exit codes
 
-`0` ok · `1` drift/backup/verify failure · `2+` hard error.
+`0` ok · `1` drift found, backup incomplete, verify failure, or any runtime error · `2` CLI usage error (bad flags/arguments).

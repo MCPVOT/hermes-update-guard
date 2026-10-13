@@ -71,7 +71,7 @@ hermes-update-guard update --close-desktop
 hermes-update-guard verify
 ```
 
-Exit codes: `0` ok, `1` drift/backup/verify failure, `2+` hard error (bad home, missing git, command failure).
+Exit codes: `0` ok · `1` drift found, backup incomplete, verify failure, or any runtime error · `2` CLI usage error (bad flags/arguments).
 
 ## Provider-surface tripwire
 
@@ -91,12 +91,13 @@ config or `.env` — only to `backups/`.
 ```
 src/
   main.rs      CLI (clap)
-  env.rs       home/profile discovery, os probes, command runner
-  drift.rs     surface extract/export/diff (PS1 semantics)
+  env.rs       home/profile discovery, os probes (run/process), command runner
+  drift.rs     surface extract/export/diff + shared compare walk (PS1 semantics)
   backup.rs    WAL-safe DB backup + completeness gate
   guard.rs     full update orchestration
   verify.rs    post-update verification
   preflight.rs read-only state check
+  vibe.rs      MCPVOT identity banner
 skills/        hermes skill wrapper (for Hermes agents)
 .github/       CI (matrix) + release workflows
 ```
