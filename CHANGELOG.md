@@ -19,10 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `update` now returns immediately on a failed `hermes update` instead of
   running post-verify over a broken install; it prints the restore path and
   leaves `verify` to be run only after recovery.
+- `--close-desktop` kill path is now cross-platform (`taskkill` on Windows,
+  `pkill` on POSIX) and bails loudly when the kill command itself fails.
 - Removed dead `sha256_via_cmd` (PowerShell-only) — pure Rust sha2 based
   manifest hashing is now used everywhere.
 - Removed dead PowerShell-only helpers; POSIX builds now use `pgrep` for the
   process probe.
+- Docs made accurate: exit codes (`1` runtime/drift/backup/verify failure,
+  `2` clap usage errors — not `2+` hard errors), release workflow now drafts
+  the GitHub Release for review instead of publishing immediately, layout
+  section includes `vibe.rs`.
 
 ## [0.1.0] - 2026-10-13
 

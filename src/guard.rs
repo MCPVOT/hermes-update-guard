@@ -26,11 +26,10 @@ pub fn run(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
         if desktop {
             if close_desktop {
                 println!("  Desktop app running - closing it (forced)...");
-                let _ = env::run_capture(
-                    Path::new("taskkill"),
-                    &["/IM", "Hermes.exe", "/F", "/T"],
-                    None,
-                );
+                let killed = env::kill_process("Hermes.exe");
+                if !killed {
+                    bail!("failed to stop the Desktop app - close it and re-run");
+                }
                 std::thread::sleep(std::time::Duration::from_secs(6));
                 if env::process_running("Hermes.exe") {
                     bail!("Desktop app still running after kill - close it and re-run");

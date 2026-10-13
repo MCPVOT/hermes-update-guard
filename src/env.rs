@@ -159,3 +159,21 @@ pub fn process_running(image: &str) -> bool {
     };
     code == 0
 }
+
+/// Force-stop every process matching `image` (taskkill on Windows, pkill on POSIX).
+/// Returns true when the kill command itself exited 0.
+#[cfg(windows)]
+pub fn kill_process(image: &str) -> bool {
+    matches!(
+        run_capture(Path::new("taskkill"), &["/IM", image, "/F", "/T"], None),
+        Ok((0, _))
+    )
+}
+
+#[cfg(not(windows))]
+pub fn kill_process(image: &str) -> bool {
+    matches!(
+        run_capture(Path::new("pkill"), &["-f", image], None),
+        Ok((0, _))
+    )
+}
