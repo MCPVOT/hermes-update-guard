@@ -1,7 +1,7 @@
 ---
 name: hermes-update-guard
 description: Use when running or verifying a `hermes update`, or after a failed update left a stale lock — drives the guarded pipeline (preflight, WAL-safe backup, provider-drift tripwire, post-verify) through the hermes-update-guard binary.
-version: 0.1.1
+version: 0.2.0
 author: MCPVOT
 license: MIT
 platforms: [macos, linux, windows]
@@ -68,13 +68,27 @@ local build). If it is not installed:
 ## Decision rules
 
 - `preflight` reports `dirty: N file(s)` → those files will be stashed by the
-  updater. If a tracked core file is intentionally patched (for example
-  `hermes_cli/models_catalog_static.py`), verify the stash list after the update
-  and restore it if the update dropped it.
-- `diff` exits 1 (drift found) → **do not update**; investigate `model.*`,
-  `fallback_*`, `delegation`, and `display.language` first.
-- `update` refuses to run while a venv holder or the Desktop app is running; pass
-  `--close-desktop` only when the operator has already closed their session.
+  updater. `verify` afterwards proves they came back: a clean tree **with** stash
+  entries still present is a FAIL (the patched file was parked, not restored).
+  `hermes_cli/models_catalog_static.py` is the usual such patch.
+- `preflight` → `[update receipts]` shows an unfinished receipt (`running` /
+  `interrupted`, `finished_at=null`) → **an update is already mid-flight**; a real
+  `hermes update` is owed before anything else. Never start a second one.
+- `preflight` → `[venv holders]`:
+  - `probe exit 3` = holders present, with pid/kind/exe listed. Wait for them.
+  - `venv state UNKNOWN` = hermes answered the probe with prose instead of the
+    documented JSON list, which is what it does while an update is already
+    running. Treat the venv as held.
+- `diff` exits 1 (drift found, or a baseline was `UNREADABLE`) → **do not
+  update**; investigate `model.*`, `fallback_*`, `delegation`, and
+  `display.language` first.
+- Baselines come in three shapes and all are understood: `golden.json` (one
+  object per profile), `last-known/` (one flat file per profile), and an explicit
+  `--baseline <path>` (one flat surface). An aggregate that does not list a
+  profile means "no baseline yet", not drift.
+- `update` refuses to run while a venv is held or its state is unknown, or while
+  the Desktop app is running; pass `--close-desktop` only when the operator has
+  already closed their session.
 - Backup FAIL → never update from an unverified backup.
 
 ## Pitfalls
@@ -87,6 +101,17 @@ local build). If it is not installed:
   backups; do not override it.
 - **Stale lock after a previous failed update** → `preflight` surfaces it; clear
   it before retrying.
+- **Assuming a free venv** → `hermes` exits `3` when holders exist. Anything
+  other than an empty list means "wait", not "go".
+- **Trusting a `[]` that is really prose** → while an update runs, hermes answers
+  the venv probe with a sentence instead of JSON. Preflight flags that as
+  `venv state UNKNOWN`; treat it as held.
+- **False drift from a shaped baseline** → `golden.json` holds one object per
+  profile. Comparing a profile against the whole aggregate reports every key as
+  drift with `BASE=null`. Baselines are resolved per profile for this reason.
+- **A baseline that fails to parse saying "no drift"** → the PowerShell exporter
+  writes a UTF-8 BOM, and a silent skip reads as clean. Unreadable baselines are
+  now reported and fail the check.
 
 ## Manual restore (emergency)
 

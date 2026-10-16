@@ -6,6 +6,57 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-16
+
+### Added
+
+- `preflight` now scans `logs/update_receipts/*.json` and reports every receipt
+  left in `running` / `interrupted` state, with the pid, start time and the
+  version it was pulling. This is the exact "a build step died mid-run and left a
+  stale receipt" failure the tool exists for, and it is the reason every later
+  Hermes launch keeps retrying the work it owes. `update`'s preflight gate warns
+  on the same condition.
+- `verify` now checks **local-patch restoration**: a clean working tree *with* git
+  stash entries still present is reported as FAIL, because the updater parked your
+  patched core file instead of re-applying it. It normally stashes, pulls, then
+  restores on top — this proves that actually happened.
+- `export` now refreshes the aggregate `golden.json` (the same shape the
+  PowerShell exporter writes) alongside `last-known/`, keeping the previous file
+  as `golden.json.bak-<stamp>`, so `--baseline golden` stays current.
+
+### Fixed
+
+- **`diff`/`preflight` compared against the wrong baseline shape.**
+  `golden.json` is an *aggregate-by-profile* map (`{elevate: {...}, mcpvot: {...}}`),
+  but every file baseline was read as one flat surface. Each profile was therefore
+  compared against a wrapper object and all twelve surface keys were reported as
+  drift with `BASE=null` — on a live install that produced 7 profiles x 12 keys of
+  false drift and blocked a clean update. Baselines are now resolved per profile
+  across all three shapes in the wild: a per-profile directory (`last-known/`), an
+  aggregate-by-profile file (`golden.json`), and a flat single-profile file
+  (explicit `--baseline <path>`). An aggregate that does not list a profile is
+  "no baseline yet", not a drift storm.
+- **The venv-holder gate was blind.** `hermes update --list-venv-holders` exits
+  `3` when holders are present, but the old code treated any non-zero exit as
+  "free" and returned an empty list — so a live session could slip straight
+  through the guard that exists to stop exactly that. Exit 3 is now parsed as
+  data, and the probe's exit code is surfaced in `preflight`.
+- **A baseline that could not be parsed was silently skipped.** The PowerShell
+  exporter writes `last-known/*.json` with a UTF-8 BOM; `serde_json` fails on a
+  leading BOM and the old code answered the failure with a silent `continue`,
+  i.e. "no drift" when the baseline was unreadable. JSON is now read
+  BOM/CRLF-tolerantly, and an unparseable baseline is reported as an explicit
+  `baseline UNREADABLE` line that **fails** the check — a broken baseline can
+  never read as clean again.
+- When Hermes is already mid-update it answers the venv probe with prose instead
+  of the documented JSON list. That is now reported as
+  "venv state UNKNOWN — treat as held" rather than being mistaken for a free venv,
+  and `update` refuses on it.
+- `verify`'s "profile(s) drifted" summary counted every drift *line* instead of
+  the number of profiles that drifted.
+- Removed the now-unused `venv_holders` wrapper (dead code rejected by
+  `clippy -D warnings`).
+
 ## [0.1.1] - 2026-10-13
 
 ### Added
@@ -73,6 +124,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `hermes-provider-drift.ps1` semantics; `hermes update --yes` is invoked via the
   official CLI, never reimplemented.
 
-[Unreleased]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/MCPVOT/hermes-update-guard/releases/tag/v0.1.0

@@ -14,11 +14,16 @@ pub fn run(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
     if !force {
         println!("\n-- PREFLIGHT GATE --");
 
-        let holders = env::venv_holders(home);
-        if !holders.is_empty() {
+        // --list-venv-holders exits 3 when holders are present, so the probe's
+        // exit code is part of the answer, not an error to be discarded. An
+        // unparseable answer (hermes is mid-update) counts as held.
+        let (holders, vexit, parsed) = env::venv_holders_probe(home);
+        if !parsed || !holders.is_empty() || vexit == 3 {
             bail!(
-                "venv is held by: {} — update would refuse or strand the install. Stop them first.",
-                holders.join(", ")
+                "venv is held by: {} (probe exit {}, json={}) — update would refuse or strand the install. Stop them first.",
+                holders.join(", "),
+                vexit,
+                parsed
             );
         }
 
@@ -51,6 +56,17 @@ pub fn run(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
                     m
                 );
             }
+        }
+        // an unfinished receipt means a real `hermes update` is still owed
+        let stale = crate::preflight::stale_receipts(home);
+        if !stale.is_empty() {
+            for s in &stale {
+                eprintln!("  [warn] unfinished update receipt: {}", s);
+            }
+            eprintln!(
+                "  [warn] {} receipt(s) left running — finish the owed update before starting another",
+                stale.len()
+            );
         }
         println!("  preflight gate passed");
     } else {
