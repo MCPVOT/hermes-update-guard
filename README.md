@@ -65,7 +65,7 @@ the update runs — then verifies the result afterwards.
 
 ```bash
 # Linux / macOS — fetch, mark executable, put it on PATH
-VER=0.1.1
+VER=0.2.0
 curl -fsSL -o hermes-update-guard \
   "https://github.com/MCPVOT/hermes-update-guard/releases/download/v${VER}/hermes-update-guard-${VER}-x86_64-unknown-linux-gnu"
 chmod +x hermes-update-guard
@@ -83,12 +83,12 @@ cargo build --release         # or run target/release/hermes-update-guard
 
 | Command | What it does | Gate |
 |---|---|---|
-| `preflight` | Read-only state check: version, git HEAD/behind/dirty/stashes, venv holders, stale locks, desktop app running, provider drift summary, gateway state | none (read-only) |
-| `export` | Snapshot each profile's provider surface into `backups/provider-surface/<stamp>/` and advance `last-known` | none (read-only on live config) |
-| `diff` | Compare the live surface against **golden** (or `--baseline last-known` / a path) | **exit 1 on any drift** |
+| `preflight` | Read-only state check: version, git HEAD/behind/dirty/stashes, venv holders, **unfinished update receipts**, stale locks, desktop app running, provider drift summary, gateway state | none (read-only) |
+| `export` | Snapshot each profile's provider surface into `backups/provider-surface/<stamp>/`, advance `last-known`, refresh the aggregate `golden.json` | none (read-only on live config) |
+| `diff` | Compare the live surface against **golden** (or `--baseline last-known` / a path) | **exit 1 on any drift or unreadable baseline** |
 | `backup` | WAL-safe SQLite backup of every profile's `state.db` plus config/env/auth/gateway/content dirs into `backups/pre-update-<stamp>/`; verifies integrity + message counts | **refuses on incomplete backup** |
-| `update` | Full guarded update: preflight gate → export → backup → `hermes update --yes` → verify | refuses while a venv is held or the desktop app is running (add `--close-desktop`) |
-| `verify` | Post-update: HEAD advanced, DB integrity, drift-vs-export, gateway pid/state | reports FAIL on any bad DB |
+| `update` | Full guarded update: preflight gate → export → backup → `hermes update --yes` → verify | refuses while a venv is held (or its state is unknown) or the desktop app is running (add `--close-desktop`) |
+| `verify` | Post-update: HEAD advanced, DB integrity, **local-patch restoration**, drift-vs-export, gateway pid/state | reports FAIL on any bad DB or a parked patch |
 | `vibe` | Print the MCPVOT identity banner | none |
 
 ## Quick start
@@ -129,6 +129,31 @@ change — the same twelve keys the original drift script guarded:
 Secrets are **masked** (`sk-…` / `nvapi…` truncated) before anything is written,
 and the manifest records a SHA-256 of each snapshot. The tool never writes to
 live config or `.env` — only to `backups/`.
+
+### Baseline shapes
+
+A baseline is any of three shapes found in the wild, and each profile is compared
+against its **own** slice of it:
+
+| Baseline | Shape | Read as |
+|---|---|---|
+| `golden.json` (default) | one JSON object **per profile** | `base[<profile>]` |
+| `last-known/` | a directory of one flat file per profile | `last-known/<profile>.json` |
+| explicit `--baseline <path>` | one flat surface | the file itself |
+
+Two rules make the tripwire trustworthy rather than merely loud: files are read
+BOM/CRLF-tolerantly (the PowerShell exporter writes a UTF-8 BOM), and a baseline
+that exists but cannot be parsed is reported as `baseline UNREADABLE` and
+**fails** the check. An aggregate that does not list a profile is "no baseline
+yet", never a drift storm.
+
+### Interrupted-update receipts
+
+`preflight` also reads `logs/update_receipts/*.json`. A receipt left in `running`
+or `interrupted` state with `finished_at: null` means the previous update died
+mid-flight — and that hermes will keep retrying the work it owed on every launch
+until a real `hermes update` completes it. The pid, start time and target version
+are printed so you can tell a genuine in-flight update from an abandoned one.
 
 ## Exit codes
 
