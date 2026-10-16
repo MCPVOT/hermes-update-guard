@@ -78,13 +78,24 @@ pub fn run(home: &Path) -> Result<()> {
 
     // venv holders + update plan
     println!("\n[venv holders]");
-    let holders = env::venv_holders(home);
-    if holders.is_empty() {
-        println!("  (none)");
+    let (holders, vexit, parsed) = env::venv_holders_probe(home);
+    if !parsed {
+        // hermes answered with prose, not the documented JSON list: that is what
+        // it does while an update is already in flight. Never call this "free".
+        for h in &holders {
+            println!("  ! {}", h);
+        }
+        println!("  ! venv state UNKNOWN — hermes could not answer the probe; treat as HELD");
+    } else if holders.is_empty() {
+        println!("  (none) — probe exit {} (0 = venv free)", vexit);
     } else {
         for h in &holders {
             println!("  {}", h);
         }
+        println!(
+            "  probe exit {} (3 = holders present) — the update must wait for these",
+            vexit
+        );
     }
 
     // stale locks / interrupted-update markers
@@ -121,6 +132,12 @@ pub fn run(home: &Path) -> Result<()> {
         println!("  (no stale update markers)");
     }
 
+    // interrupted-update receipts: a receipt still marked `running` is the exact
+    // failure this tool exists for (a build step that dies mid-run and leaves a
+    // stale receipt), and it is why every later launch retries the owed work.
+    println!("\n[update receipts]");
+    report_stale_receipts(home);
+
     // desktop app running (a blocker for the update phase)
     let desktop = env::process_running("Hermes.exe");
     println!(
@@ -151,6 +168,74 @@ pub fn run(home: &Path) -> Result<()> {
 
     println!("\nPREFLIGHT DONE — see flags above.");
     Ok(())
+}
+
+/// Scan `logs/update_receipts/*.json` for updates that never finished.
+/// A receipt with `outcome == "running"` or `finished_at == null` means the last
+/// update died mid-flight; hermes keeps retrying the work it owed on every
+/// launch until a real `hermes update` completes it.
+/// Returns one line per unfinished receipt.
+pub fn stale_receipts(home: &Path) -> Vec<String> {
+    let dir = home.join("logs").join("update_receipts");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .map(|x| x.eq_ignore_ascii_case("json"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    let mut out: Vec<String> = Vec::new();
+    for f in &files {
+        let Ok(txt) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+            continue;
+        };
+        let outcome = v.get("outcome").and_then(|x| x.as_str()).unwrap_or("");
+        let unfinished = v.get("finished_at").map(|x| x.is_null()).unwrap_or(false);
+        if outcome != "running" && !unfinished {
+            continue;
+        }
+        let started = v.get("started_at").and_then(|x| x.as_str()).unwrap_or("?");
+        let target = v
+            .get("plan")
+            .and_then(|p| p.get("expected_version"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("?");
+        let pid = v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0);
+        out.push(format!(
+            "{} : outcome={} finished_at=null (pid {}, started {}, was pulling v{})",
+            f.file_name().unwrap_or_default().to_string_lossy(),
+            outcome,
+            pid,
+            started,
+            target
+        ));
+    }
+    out
+}
+
+fn report_stale_receipts(home: &Path) {
+    let lines = stale_receipts(home);
+    if lines.is_empty() {
+        println!("  no receipt left in a running state");
+    } else {
+        for l in &lines {
+            println!("  ! {}", l);
+        }
+        println!(
+            "  {} receipt(s) never finished - an update is mid-flight; every launch retries it",
+            lines.len()
+        );
+    }
 }
 
 fn drift_summary(home: &Path) -> Result<()> {

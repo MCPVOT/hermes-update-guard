@@ -26,6 +26,7 @@ pub fn run(home: &Path) -> Result<()> {
 
     // every live db integrity check (read-only)
     let mut bad = 0usize;
+    let mut patch_bad = 0usize;
     for p in PROFILES {
         let db = env::state_db(home, p);
         if !db.exists() {
@@ -48,6 +49,47 @@ pub fn run(home: &Path) -> Result<()> {
     }
     if bad > 0 {
         println!("  [FAIL] {} database(s) have integrity problems", bad);
+    }
+
+    // local patch restoration: the updater stashes tracked modifications, pulls,
+    // then re-applies them. A clean tree WITH stash entries left behind means it
+    // parked your patch instead of restoring it - a silent loss of a pinned core
+    // file (e.g. models_catalog_static.py).
+    println!("  local patch (stash/restore):");
+    let (_, dirty_now) = env::run_capture(
+        Path::new("git"),
+        &["-C", repo.to_str().unwrap(), "status", "--short"],
+        None,
+    )
+    .unwrap_or((-1, String::new()));
+    let (_, stashes) = env::run_capture(
+        Path::new("git"),
+        &["-C", repo.to_str().unwrap(), "stash", "list"],
+        None,
+    )
+    .unwrap_or((-1, String::new()));
+    let dirty_lines: Vec<&str> = dirty_now.lines().filter(|l| !l.trim().is_empty()).collect();
+    let stash_lines: Vec<&str> = stashes.lines().filter(|l| !l.trim().is_empty()).collect();
+    if !dirty_lines.is_empty() {
+        println!(
+            "  ok   {} local modification(s) re-applied on top of the update:",
+            dirty_lines.len()
+        );
+        for d in &dirty_lines {
+            println!("         {}", d.trim());
+        }
+    } else if stash_lines.is_empty() {
+        println!("  ok   working tree clean, no stash entries (nothing was pinned)");
+    } else {
+        patch_bad += 1;
+        println!(
+            "  FAIL tree is clean but {} stash entr{} remain - the update parked your local patch",
+            stash_lines.len(),
+            if stash_lines.len() == 1 { "y" } else { "ies" }
+        );
+        for s in &stash_lines {
+            println!("         {}", s.trim());
+        }
     }
 
     // drift vs the newest export (post-update diff)
@@ -77,7 +119,7 @@ pub fn run(home: &Path) -> Result<()> {
         }
     }
 
-    if bad > 0 {
+    if bad > 0 || patch_bad > 0 {
         println!("\nVERIFY: FAIL");
     } else {
         println!("\nVERIFY: PASS");
