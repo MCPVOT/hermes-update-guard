@@ -1,2 +1,9 @@
 /target
 *.log
+
+# never commit live Hermes state or credentials
+.env
+auth.json
+config.yaml
+*.local
+backups/
