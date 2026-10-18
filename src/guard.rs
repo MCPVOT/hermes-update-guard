@@ -80,7 +80,13 @@ pub fn run(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
     let backup_dir = backup::run(home, false)?;
 
     println!("\n-- HERMES UPDATE --");
-    let hermes = env::venv_hermes(home);
+    let hermes = match env::resolve_hermes(home) {
+        Some(p) => p,
+        None => {
+            bail!("no hermes CLI found (venv, PATH, ~/.local/bin, /usr/local/bin) — cannot update")
+        }
+    };
+    println!("  using {}", hermes.display());
     let (code, out) = env::run_capture(&hermes, &["update", "--yes"], None)?;
 
     if !out.is_empty() {

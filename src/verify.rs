@@ -1,130 +1,288 @@
-use anyhow::Result;
-use std::path::Path;
+use anyhow::{bail, Context, Result};
+use std::path::{Path, PathBuf};
 
 use crate::env::{self, PROFILES};
 
 /// Post-update verification: HEAD advanced, version sane, every live db integrity ok,
-/// provider surface matches the pre-update export, gateway state present.
+/// provider surface matches the pre-update export, gateway state present, and every
+/// locally pinned file still applied.
+///
+/// FAIL-CLOSED CONTRACT: any check that cannot be *performed* is a failure, not a
+/// pass. An earlier version printed `VERIFY: PASS` and exited 0 on an empty home
+/// (no hermes-agent, unreadable HEAD, no venv) and even counted git's stderr as
+/// "1 local modification re-applied". A verifier that cannot fail is worse than no
+/// verifier, because it certifies a broken install.
 pub fn run(home: &Path) -> Result<()> {
     println!("== POST-UPDATE VERIFY ==");
 
+    let mut failures: Vec<String> = Vec::new();
     let repo = home.join("hermes-agent");
-    let (_, head) = env::run_capture(
+
+    // ---- 1. HEAD ------------------------------------------------------------
+    println!("  HEAD:");
+    match env::run_checked(
         Path::new("git"),
-        &["-C", repo.to_str().unwrap(), "rev-parse", "--short", "HEAD"],
-        None,
-    )
-    .unwrap_or((-1, "?".into()));
-    println!("  HEAD now : {}", head.trim());
+        &["rev-parse", "--short", "HEAD"],
+        Some(&repo),
+    ) {
+        Ok((stdout, _)) => println!("  ok   HEAD {}", stdout.trim()),
+        Err(e) => {
+            println!("  FAIL HEAD unreadable: {}", e);
+            failures.push(format!("HEAD unreadable: {}", e));
+        }
+    }
 
-    let (_, version) =
-        env::run_capture(&env::venv_hermes(home), &["--version"], None).unwrap_or((-1, "?".into()));
-    println!(
-        "  version  : {}",
-        version.lines().next().unwrap_or("?").trim()
-    );
+    // ---- 2. version ---------------------------------------------------------
+    println!("  version:");
+    match env::resolve_hermes(home) {
+        None => {
+            println!("  FAIL no hermes CLI found (venv, PATH, ~/.local/bin, /usr/local/bin)");
+            failures.push("hermes CLI not found".into());
+        }
+        Some(hermes) => match env::run_checked(&hermes, &["--version"], None) {
+            Ok((stdout, _)) => {
+                let v = stdout.lines().next().unwrap_or("?").trim().to_string();
+                if v.is_empty() {
+                    println!("  FAIL --version printed nothing");
+                    failures.push("version empty".into());
+                } else {
+                    println!("  ok   {}", v);
+                }
+            }
+            Err(e) => {
+                println!("  FAIL version check could not run: {}", e);
+                failures.push(format!("version: {}", e));
+            }
+        },
+    }
 
-    // every live db integrity check (read-only)
-    let mut bad = 0usize;
-    let mut patch_bad = 0usize;
+    // ---- 3. database integrity ---------------------------------------------
+    println!("  databases:");
+    let mut checked = 0usize;
     for p in PROFILES {
         let db = env::state_db(home, p);
         if !db.exists() {
             continue;
         }
+        checked += 1;
         match integrity(&db) {
             Ok((ok, msgs)) => {
                 if ok != "ok" {
-                    bad += 1;
                     println!("  FAIL {} integrity={}", p, ok);
+                    failures.push(format!("{} integrity={}", p, ok));
                 } else {
                     println!("  ok   {} integrity=ok messages={}", p, msgs);
                 }
             }
             Err(e) => {
-                bad += 1;
                 println!("  FAIL {} {}", p, e);
+                failures.push(format!("{} db: {}", p, e));
             }
         }
     }
-    if bad > 0 {
-        println!("  [FAIL] {} database(s) have integrity problems", bad);
+    if checked == 0 {
+        println!("  FAIL no profile database found - nothing was verified");
+        failures.push("no state.db found in any profile".into());
     }
 
-    // local patch restoration: the updater stashes tracked modifications, pulls,
-    // then re-applies them. A clean tree WITH stash entries left behind means it
-    // parked your patch instead of restoring it - a silent loss of a pinned core
-    // file (e.g. models_catalog_static.py).
+    // ---- 4. local patch restoration ----------------------------------------
     println!("  local patch (stash/restore):");
-    let (_, dirty_now) = env::run_capture(
-        Path::new("git"),
-        &["-C", repo.to_str().unwrap(), "status", "--short"],
-        None,
-    )
-    .unwrap_or((-1, String::new()));
-    let (_, stashes) = env::run_capture(
-        Path::new("git"),
-        &["-C", repo.to_str().unwrap(), "stash", "list"],
-        None,
-    )
-    .unwrap_or((-1, String::new()));
-    let dirty_lines: Vec<&str> = dirty_now.lines().filter(|l| !l.trim().is_empty()).collect();
-    let stash_lines: Vec<&str> = stashes.lines().filter(|l| !l.trim().is_empty()).collect();
-    if !dirty_lines.is_empty() {
-        println!(
-            "  ok   {} local modification(s) re-applied on top of the update:",
-            dirty_lines.len()
-        );
-        for d in &dirty_lines {
-            println!("         {}", d.trim());
-        }
-    } else if stash_lines.is_empty() {
-        println!("  ok   working tree clean, no stash entries (nothing was pinned)");
-    } else {
-        patch_bad += 1;
-        println!(
-            "  FAIL tree is clean but {} stash entr{} remain - the update parked your local patch",
-            stash_lines.len(),
-            if stash_lines.len() == 1 { "y" } else { "ies" }
-        );
-        for s in &stash_lines {
-            println!("         {}", s.trim());
-        }
-    }
+    check_patch_restored(home, &repo, &mut failures);
 
-    // drift vs the newest export (post-update diff)
+    // ---- 5. provider surface vs pre-update export --------------------------
     println!("  provider surface vs last export:");
-    let surface = home.join("backups").join("provider-surface");
-    let pointer = surface.join("last-export.txt");
-    if pointer.exists() {
-        if let Ok(stamp) = std::fs::read_to_string(&pointer) {
-            let baseline = surface.join(stamp.trim());
-            if baseline.is_dir() {
-                let _ = drift_diff_quiet(home, &baseline);
-            }
-        }
-    }
+    check_drift(home, &mut failures);
 
-    // gateway state (root multiplexed)
+    // ---- 6. gateway state ---------------------------------------------------
     let gw = home.join("gateway_state.json");
     if gw.exists() {
-        if let Ok(js) = serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&gw)?) {
-            println!(
-                "  gateway  : pid={} state={}",
+        match std::fs::read_to_string(&gw)
+            .context("gateway_state.json unreadable")
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).context("bad json"))
+        {
+            Ok(js) => println!(
+                "  gateway : pid={} state={}",
                 js.get("pid").and_then(|v| v.as_u64()).unwrap_or(0),
                 js.get("gateway_state")
                     .and_then(|v| v.as_str())
                     .unwrap_or("?")
-            );
+            ),
+            Err(e) => {
+                println!("  FAIL gateway_state.json: {}", e);
+                failures.push(format!("gateway state: {}", e));
+            }
         }
     }
 
-    if bad > 0 || patch_bad > 0 {
-        println!("\nVERIFY: FAIL");
-    } else {
+    // ---- verdict ------------------------------------------------------------
+    if failures.is_empty() {
         println!("\nVERIFY: PASS");
+        Ok(())
+    } else {
+        println!("\nVERIFY: FAIL ({} check(s))", failures.len());
+        for f in &failures {
+            println!("  - {}", f);
+        }
+        bail!("{} verification check(s) failed", failures.len())
     }
-    Ok(())
+}
+
+/// Prove a locally pinned file is still applied.
+///
+/// Two distinct failures: a clean tree WITH stash entries (the updater parked the
+/// patch) and a clean tree with NO stashes while the pre-update backup recorded a
+/// working-tree patch (the change vanished entirely).
+fn check_patch_restored(home: &Path, repo: &Path, failures: &mut Vec<String>) {
+    let dirty = match env::run_checked(Path::new("git"), &["status", "--short"], Some(repo)) {
+        Ok((stdout, _)) => stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string())
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            println!("  FAIL cannot read working tree: {}", e);
+            failures.push(format!("git status: {}", e));
+            return;
+        }
+    };
+    let stashes = match env::run_checked(Path::new("git"), &["stash", "list"], Some(repo)) {
+        Ok((stdout, _)) => stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string())
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            println!("  FAIL cannot read stash list: {}", e);
+            failures.push(format!("git stash list: {}", e));
+            return;
+        }
+    };
+
+    let expected = expected_patched_files(home);
+
+    if !dirty.is_empty() {
+        println!(
+            "  ok   {} local modification(s) present in the tree:",
+            dirty.len()
+        );
+        for d in &dirty {
+            println!("         {}", d);
+        }
+        for f in &expected {
+            if !dirty.iter().any(|d| d.ends_with(f.as_str())) {
+                println!("  FAIL pinned file no longer modified: {}", f);
+                failures.push(format!("pinned patch lost: {}", f));
+            }
+        }
+        if !stashes.is_empty() {
+            println!(
+                "  !    {} stash entr{} also present (a partial restore?)",
+                stashes.len(),
+                if stashes.len() == 1 { "y" } else { "ies" }
+            );
+        }
+        return;
+    }
+
+    if !stashes.is_empty() {
+        println!(
+            "  FAIL tree is clean but {} stash entr{} remain - the update parked your local patch",
+            stashes.len(),
+            if stashes.len() == 1 { "y" } else { "ies" }
+        );
+        for s in &stashes {
+            println!("         {}", s);
+        }
+        failures.push(format!("{} stashed patch(es) not restored", stashes.len()));
+        return;
+    }
+
+    if expected.is_empty() {
+        println!("  ok   working tree clean, nothing was pinned pre-update");
+    } else {
+        println!(
+            "  FAIL tree is clean but the pre-update backup pinned {} file(s) - the patch was dropped:",
+            expected.len()
+        );
+        for f in &expected {
+            println!("         {}", f);
+        }
+        failures.push(format!(
+            "{} pinned file(s) dropped by the update",
+            expected.len()
+        ));
+    }
+}
+
+/// File paths recorded in the newest pre-update backup's working-tree.patch.
+fn expected_patched_files(home: &Path) -> Vec<String> {
+    let backups = home.join("backups");
+    let Ok(entries) = std::fs::read_dir(&backups) else {
+        return vec![];
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("pre-update-"))
+                .unwrap_or(false)
+        })
+        .collect();
+    dirs.sort();
+    let Some(newest) = dirs.last() else {
+        return vec![];
+    };
+    let patch = newest.join("working-tree.patch");
+    let Ok(text) = std::fs::read_to_string(&patch) else {
+        return vec![];
+    };
+    let mut files: Vec<String> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("+++ b/"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "/dev/null")
+        .collect();
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn check_drift(home: &Path, failures: &mut Vec<String>) {
+    let surface = home.join("backups").join("provider-surface");
+    let pointer = surface.join("last-export.txt");
+    if !pointer.exists() {
+        println!("  FAIL no export baseline (last-export.txt missing) - drift cannot be checked");
+        failures.push("no provider baseline".into());
+        return;
+    }
+    let stamp = match std::fs::read_to_string(&pointer) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => {
+            println!("  FAIL baseline pointer unreadable: {}", e);
+            failures.push(format!("baseline pointer: {}", e));
+            return;
+        }
+    };
+    let baseline = surface.join(&stamp);
+    if !baseline.is_dir() {
+        println!("  FAIL baseline directory missing: {}", baseline.display());
+        failures.push("baseline directory missing".into());
+        return;
+    }
+    // compare_against also emits a `baseline UNREADABLE` line for unparseable
+    // baselines, so that case surfaces as drift instead of "clean".
+    let lines = crate::drift::compare_against(home, &baseline);
+    if lines.is_empty() {
+        println!("  ok   no drift vs pre-update export");
+    } else {
+        for l in &lines {
+            println!("  ! {}", l.trim());
+        }
+        println!("  FAIL {} drift line(s) vs pre-update export", lines.len());
+        failures.push(format!("{} provider drift line(s)", lines.len()));
+    }
 }
 
 fn integrity(db: &Path) -> Result<(String, i64)> {
@@ -137,18 +295,47 @@ fn integrity(db: &Path) -> Result<(String, i64)> {
     Ok((ok, msgs))
 }
 
-fn drift_diff_quiet(home: &Path, baseline: &Path) -> Result<()> {
-    let lines = crate::drift::compare_against(home, baseline);
-    if lines.is_empty() {
-        println!("  ok   no drift vs pre-update export");
-    } else {
-        for l in &lines {
-            println!("  ! {}", l.trim());
-        }
-        println!(
-            "  !    {} profile(s) drifted vs pre-update export",
-            lines.len()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pre-update working-tree.patch is the record of what was pinned. If we
+    /// cannot read the file list back, verify can never notice a dropped patch.
+    #[test]
+    fn expected_patched_files_reads_newest_backup() {
+        let root = std::env::temp_dir().join(format!("hug-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let old = root.join("backups").join("pre-update-20260101-000000");
+        let new = root.join("backups").join("pre-update-20260102-000000");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(old.join("working-tree.patch"), "+++ b/old.py\n").unwrap();
+        std::fs::write(
+            new.join("working-tree.patch"),
+            "--- a/hermes_cli/models_catalog_static.py\n\
+             +++ b/hermes_cli/models_catalog_static.py\n\
+             --- a/pkg/x.py\n\
+             +++ b/pkg/x.py\n\
+             --- /dev/null\n\
+             +++ /dev/null\n",
+        )
+        .unwrap();
+
+        let files = expected_patched_files(&root);
+        assert_eq!(
+            files,
+            vec![
+                "hermes_cli/models_catalog_static.py".to_string(),
+                "pkg/x.py".to_string()
+            ],
+            "newest backup only, /dev/null excluded, sorted+deduped"
         );
+        let _ = std::fs::remove_dir_all(&root);
     }
-    Ok(())
+
+    /// No backup at all must yield an empty list (not a panic, not a fake entry).
+    #[test]
+    fn expected_patched_files_empty_without_backups() {
+        assert!(expected_patched_files(Path::new("C:/definitely-not-here-xyz")).is_empty());
+    }
 }
