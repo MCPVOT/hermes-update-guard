@@ -12,6 +12,12 @@ use crate::env;
 /// Port of update-hermes-v2.ps1 phase 3 (H1-H5): online-backup API, integrity_check +
 /// message count per db, COMPLETENESS GATE refusing to continue when a profile's db is missing.
 pub fn run(home: &Path, dry_run: bool) -> Result<PathBuf> {
+    run_with(home, dry_run, &mut |_, _| {})
+}
+
+/// Same as [`run`], reporting each profile's database result as it completes so a
+/// live viewer can show per-profile progress during the long, silent copy phase.
+pub fn run_with(home: &Path, dry_run: bool, on_db: &mut dyn FnMut(&str, bool)) -> Result<PathBuf> {
     let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
     let backup_root = home.join("backups");
     let dir = backup_root.join(format!("pre-update-{}", stamp));
@@ -87,10 +93,12 @@ pub fn run(home: &Path, dry_run: bool) -> Result<PathBuf> {
                 }
                 println!("  {} {} state.db", if ok { "ok  " } else { "FAIL" }, p);
                 println!("      {}", msg);
+                on_db(p, ok);
             }
             Err(e) => {
                 fails += 1;
                 println!("  FAIL {} state.db backup failed: {:#}", p, e);
+                on_db(p, false);
             }
         }
     }

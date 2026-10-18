@@ -6,6 +6,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-17
+
+### Added
+
+- `watch` — a live, read-only view of a run (ratatui): a stage rail
+  (preflight/export/backup/update/verify), a per-profile matrix so the long silent
+  backup phase is no longer a dead cursor, a blockers band, and the guard's log
+  tail coloured by severity. `watch --no-tui` prints a one-shot snapshot for
+  scripts and CI. The viewer reads `backups/guard-run.json` and never writes state,
+  so a viewer crash cannot strand an install, and it works over SSH on a droplet.
+- `update --detached` — the update runs in its own process group, detached from
+  the calling shell, with its output in `backups/guard-update.log`. Two of the
+  historical failures were finalisers killed by a caller's timeout, each leaving a
+  marker that blocked every later command; a detached child cannot be killed that way.
+- `backups/guard-run.json` — structured run state (stages with start/finish times,
+  per-profile state, blockers, exit code) written atomically at every transition.
+- `env::profiles(home)` — enumerates the profiles that actually exist, instead of
+  assuming the local fleet.
+
+### Fixed
+
+- **`verify` could never fail.** It printed `VERIFY: PASS` and exited 0 on a home
+  with no `hermes-agent`, an unreadable HEAD and no venv — and counted git's
+  stderr as "1 local modification re-applied". A verifier that cannot fail is
+  worse than none: it certifies a broken install. Every check that cannot be
+  performed is now a failure and `run()` returns `Err`, so the process exits 1.
+- **stdout and stderr were merged**, so a failed `git` invocation's error text was
+  parsed as data. `run_checked` keeps them separate and treats a non-zero exit as
+  an error.
+- **A dropped patch was reported as "nothing was pinned".** A clean tree with no
+  stash entries passed the old check even when the pre-update backup recorded a
+  working-tree patch. `verify` now reads the file list from the newest
+  `pre-update-*/working-tree.patch` and fails when a pinned file is no longer
+  modified.
+- **The profile fleet was hardcoded to the local seven.** On the droplet
+  (hoodbot/sentinel/solana/storemoat) the guard backed up, exported and verified
+  the wrong set, or nothing at all, while reporting success.
+- **The hermes CLI was looked up only inside the venv.** System installs
+  (`/usr/local/bin/hermes`) and the droplet (`~/.local/bin/hermes`, absent from a
+  non-interactive PATH) could not be found. `resolve_hermes` now tries the venv,
+  the well-known locations, then PATH, and returns `None` rather than a path that
+  cannot exist.
+
+### Changed
+
+- 19 tests (was 11); the fail-closed contract, the patch-file parser and the state
+  round-trip are covered.
+
 ## [0.2.0] - 2026-10-16
 
 ### Added
@@ -124,7 +172,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `hermes-provider-drift.ps1` semantics; `hermes update --yes` is invoked via the
   official CLI, never reimplemented.
 
-[Unreleased]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/MCPVOT/hermes-update-guard/releases/tag/v0.1.0

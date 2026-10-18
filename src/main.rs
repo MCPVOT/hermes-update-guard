@@ -10,6 +10,8 @@ mod drift;
 mod env;
 mod guard;
 mod preflight;
+mod state;
+mod tui;
 mod verify;
 mod vibe;
 
@@ -54,6 +56,17 @@ enum Cmd {
         /// Skip the read-only preflight gate (dangerous).
         #[arg(long)]
         force: bool,
+        /// Run the update in its own detached process and return immediately, so a
+        /// closed terminal or a caller timeout cannot kill it mid-build.
+        #[arg(long)]
+        detached: bool,
+    },
+    /// Live view of a running (or finished) guarded update: stages, per-profile
+    /// backup progress, blockers and the log tail.
+    Watch {
+        /// Print a one-shot text snapshot instead of the full-screen view.
+        #[arg(long)]
+        no_tui: bool,
     },
     /// Post-update verification (HEAD advanced, DB integrity, drift check, gateway state).
     Verify,
@@ -96,7 +109,15 @@ fn main() -> Result<()> {
         Cmd::Update {
             close_desktop,
             force,
-        } => guard::run(&home, close_desktop, force),
+            detached,
+        } => guard::run(&home, close_desktop, force, detached),
+        Cmd::Watch { no_tui } => {
+            if no_tui {
+                tui::snapshot(&home)
+            } else {
+                tui::run(&home)
+            }
+        }
         Cmd::Verify => verify::run(&home),
         Cmd::Vibe => {
             vibe::print_full();

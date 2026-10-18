@@ -4,13 +4,36 @@ use std::path::Path;
 use crate::backup;
 use crate::drift;
 use crate::env;
+use crate::state::{RunState, StageState};
 
 /// Full guarded update: preflight -> drift export -> WAL-safe backup -> hermes update --yes -> verify.
-/// This is the Rust analogue of update-hermes.ps1 -Update (without -CloseDesktop, the caller
-/// stops the Desktop app first when requested).
-pub fn run(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
+///
+/// Writes `backups/guard-run.json` at every stage transition so `watch` can render
+/// the run live without touching the updater.
+pub fn run(home: &Path, close_desktop: bool, force: bool, detached: bool) -> Result<()> {
+    if detached {
+        return spawn_detached(home, close_desktop, force);
+    }
+
     crate::vibe::print_compact(env!("CARGO_PKG_VERSION"));
     println!("== HERMES UPDATE GUARDIAN ==");
+
+    let mut st = RunState::new(home, env!("CARGO_PKG_VERSION"));
+    st.seed_profiles(&env::profiles(home));
+    let _ = st.write(home);
+
+    let result = run_stages(home, close_desktop, force, &mut st);
+
+    st.finish(if result.is_ok() { 0 } else { 1 });
+    let _ = st.write(home);
+    result
+}
+
+fn run_stages(home: &Path, close_desktop: bool, force: bool, st: &mut RunState) -> Result<()> {
+    // ---- PREFLIGHT ---------------------------------------------------------
+    st.stage("preflight", StageState::Active);
+    let _ = st.write(home);
+
     if !force {
         println!("\n-- PREFLIGHT GATE --");
 
@@ -19,11 +42,17 @@ pub fn run(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
         // unparseable answer (hermes is mid-update) counts as held.
         let (holders, vexit, parsed) = env::venv_holders_probe(home);
         if !parsed || !holders.is_empty() || vexit == 3 {
+            let msg = if !parsed {
+                format!("venv state UNKNOWN (probe exit {vexit}) - treat as held")
+            } else {
+                format!("venv held by {} (probe exit {vexit})", holders.join(", "))
+            };
+            st.blocker(&msg);
+            st.stage("preflight", StageState::Failed);
+            let _ = st.write(home);
             bail!(
-                "venv is held by: {} (probe exit {}, json={}) — update would refuse or strand the install. Stop them first.",
-                holders.join(", "),
-                vexit,
-                parsed
+                "{} — update would refuse or strand the install. Stop them first.",
+                msg
             );
         }
 
@@ -33,13 +62,22 @@ pub fn run(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
                 println!("  Desktop app running - closing it (forced)...");
                 let killed = env::kill_process("Hermes.exe");
                 if !killed {
+                    st.blocker("failed to stop the Desktop app");
+                    st.stage("preflight", StageState::Failed);
+                    let _ = st.write(home);
                     bail!("failed to stop the Desktop app - close it and re-run");
                 }
                 std::thread::sleep(std::time::Duration::from_secs(6));
                 if env::process_running("Hermes.exe") {
+                    st.blocker("Desktop app still running after kill");
+                    st.stage("preflight", StageState::Failed);
+                    let _ = st.write(home);
                     bail!("Desktop app still running after kill - close it and re-run");
                 }
             } else {
+                st.blocker("Desktop app is RUNNING (pass --close-desktop)");
+                st.stage("preflight", StageState::Failed);
+                let _ = st.write(home);
                 bail!("Desktop app is RUNNING - pass --close-desktop or close it manually");
             }
         } else {
@@ -51,38 +89,78 @@ pub fn run(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
             ".hermes-update-in-progress.lock",
         ] {
             if home.join(m).exists() {
-                eprintln!(
+                // A leftover marker is a warning, not a refusal: hermes quarantines
+                // these itself, and blocking on them strands an install forever.
+                println!(
                     "  [warn] stale marker {} present - previous update did not finish",
                     m
                 );
+                st.blocker(&format!("stale marker {m}"));
             }
         }
-        // an unfinished receipt means a real `hermes update` is still owed
         let stale = crate::preflight::stale_receipts(home);
         if !stale.is_empty() {
             for s in &stale {
-                eprintln!("  [warn] unfinished update receipt: {}", s);
+                println!("  [warn] unfinished update receipt: {}", s);
             }
-            eprintln!(
+            println!(
                 "  [warn] {} receipt(s) left running — finish the owed update before starting another",
                 stale.len()
             );
+            st.blocker(&format!("{} unfinished update receipt(s)", stale.len()));
         }
         println!("  preflight gate passed");
     } else {
         println!("  preflight gate SKIPPED (--force)");
+        st.blocker("preflight SKIPPED (--force)");
     }
+    st.stage("preflight", StageState::Done);
+    let _ = st.write(home);
 
+    // ---- EXPORT ------------------------------------------------------------
+    st.stage("export", StageState::Active);
+    let _ = st.write(home);
     println!("\n-- DRIFT EXPORT (pre-update) --");
     drift::export(home)?;
+    st.stage("export", StageState::Done);
+    let _ = st.write(home);
 
+    // ---- BACKUP ------------------------------------------------------------
+    st.stage("backup", StageState::Active);
+    let _ = st.write(home);
     println!("\n-- WAL-SAFE BACKUP --");
-    let backup_dir = backup::run(home, false)?;
+    let backup_dir = {
+        let mut on_db = |profile: &str, ok: bool| {
+            st.profile(
+                profile,
+                if ok {
+                    StageState::Done
+                } else {
+                    StageState::Failed
+                },
+                if ok {
+                    "state.db verified"
+                } else {
+                    "state.db FAILED"
+                },
+            );
+            let _ = st.write(home);
+        };
+        backup::run_with(home, false, &mut on_db)?
+    };
+    st.stage("backup", StageState::Done);
+    let _ = st.write(home);
 
+    // ---- UPDATE ------------------------------------------------------------
+    st.stage("update", StageState::Active);
+    let _ = st.write(home);
     println!("\n-- HERMES UPDATE --");
     let hermes = match env::resolve_hermes(home) {
         Some(p) => p,
         None => {
+            st.blocker("no hermes CLI found");
+            st.stage("update", StageState::Failed);
+            let _ = st.write(home);
             bail!("no hermes CLI found (venv, PATH, ~/.local/bin, /usr/local/bin) — cannot update")
         }
     };
@@ -96,6 +174,9 @@ pub fn run(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
         println!("\n*** UPDATE FAILED (exit {}) ***", code);
         println!("    backup retained at: {}", backup_dir.display());
         println!("    run `hermes-update-guard verify` only after you restore/harden");
+        st.blocker(&format!("hermes update failed (exit {code})"));
+        st.stage("update", StageState::Failed);
+        let _ = st.write(home);
         return Err(anyhow::anyhow!(
             "hermes update failed (exit {}) - backup at {} for restore",
             code,
@@ -103,13 +184,74 @@ pub fn run(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
         ));
     }
     println!("  hermes update exit 0");
+    st.stage("update", StageState::Done);
+    let _ = st.write(home);
 
+    // ---- VERIFY ------------------------------------------------------------
+    st.stage("verify", StageState::Active);
+    let _ = st.write(home);
     println!("\n-- POST-UPDATE VERIFY --");
-    crate::verify::run(home)?;
+    let verified = crate::verify::run(home);
+    match &verified {
+        Ok(()) => st.stage("verify", StageState::Done),
+        Err(e) => {
+            st.stage("verify", StageState::Failed);
+            st.blocker(&format!("verify: {e}"));
+        }
+    }
+    let _ = st.write(home);
+    verified?;
 
     println!(
         "\nUPDATE FLOW COMPLETE - backup at {}",
         backup_dir.display()
     );
+    Ok(())
+}
+
+/// Run the update in its own process, detached from this terminal.
+///
+/// Two of the historical update failures were finalisers killed by a caller's
+/// timeout, each leaving a marker that blocked every later command. A detached
+/// child outlives the shell that started it, so a closed lid or a timed-out agent
+/// call can no longer kill an update halfway through its build.
+fn spawn_detached(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe()?;
+    let log = home.join("backups").join("guard-update.log");
+    if let Some(dir) = log.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::fs::File::create(&log)?;
+
+    let mut cmd = Command::new(&exe);
+    cmd.arg("update");
+    cmd.arg("--home").arg(home);
+    if close_desktop {
+        cmd.arg("--close-desktop");
+    }
+    if force {
+        cmd.arg("--force");
+    }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::from(file.try_clone()?));
+    cmd.stderr(Stdio::from(file));
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+
+    let child = cmd.spawn()?;
+    crate::vibe::print_compact(env!("CARGO_PKG_VERSION"));
+    println!("== HERMES UPDATE GUARDIAN (detached) ==");
+    println!("  child pid : {}", child.id());
+    println!("  log       : {}", log.display());
+    println!("  state     : {}", crate::state::state_path(home).display());
+    println!("\n  watch it  : hermes-update-guard watch");
+    println!("  snapshot  : hermes-update-guard watch --no-tui");
     Ok(())
 }
