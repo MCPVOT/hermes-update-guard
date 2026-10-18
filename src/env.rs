@@ -60,6 +60,32 @@ fn default_home() -> Result<PathBuf> {
     }
 }
 
+/// Enumerate the profiles that actually exist in this home.
+///
+/// `PROFILES` is only a fallback. The guard runs on machines whose profile set is
+/// different (the droplet runs hoodbot/sentinel/solana/storemoat), and a hardcoded
+/// fleet there silently backs up and verifies the wrong things — or nothing at all.
+pub fn profiles(home: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if home.join("config.yaml").is_file() {
+        out.push("default".to_string());
+    }
+    if let Ok(rd) = std::fs::read_dir(home.join("profiles")) {
+        let mut names: Vec<String> = rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().join("config.yaml").is_file())
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .collect();
+        names.sort();
+        names.dedup();
+        out.extend(names);
+    }
+    if out.is_empty() {
+        out = PROFILES.iter().map(|s| s.to_string()).collect();
+    }
+    out
+}
+
 /// Profile home directory: default lives at hermes home root, others under profiles/.
 pub fn profile_dir(home: &Path, profile: &str) -> PathBuf {
     if profile == "default" {

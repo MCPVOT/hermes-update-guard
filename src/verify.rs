@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::env::{self, PROFILES};
+use crate::env;
 
 /// Post-update verification: HEAD advanced, version sane, every live db integrity ok,
 /// provider surface matches the pre-update export, gateway state present, and every
@@ -59,7 +59,7 @@ pub fn run(home: &Path) -> Result<()> {
     // ---- 3. database integrity ---------------------------------------------
     println!("  databases:");
     let mut checked = 0usize;
-    for p in PROFILES {
+    for p in env::profiles(home).iter().map(|s| s.as_str()) {
         let db = env::state_db(home, p);
         if !db.exists() {
             continue;

@@ -4,7 +4,7 @@ use rusqlite::OpenFlags;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::env::{self, PROFILES};
+use crate::env;
 
 /// WAL-safe backup of every profile: small files, content dirs (memories/skills/scripts/cron),
 /// and a STANDALONE state.db snapshot via the SQLite online-backup API (WAL folded in).
@@ -20,7 +20,7 @@ pub fn run(home: &Path, dry_run: bool) -> Result<PathBuf> {
     if dry_run {
         println!("[dry-run] plan only - nothing written");
         let mut expected = 0;
-        for p in PROFILES {
+        for p in env::profiles(home).iter().map(|s| s.as_str()) {
             if env::state_db(home, p).exists() {
                 expected += 1;
                 println!(
@@ -41,7 +41,7 @@ pub fn run(home: &Path, dry_run: bool) -> Result<PathBuf> {
     let mut total = 0usize;
 
     // 3a. small files + content dirs per profile
-    for p in PROFILES {
+    for p in env::profiles(home).iter().map(|s| s.as_str()) {
         let src = env::profile_dir(home, p);
         if !src.is_dir() {
             continue;
@@ -73,7 +73,7 @@ pub fn run(home: &Path, dry_run: bool) -> Result<PathBuf> {
 
     // 3b. databases via SQLite online backup -> standalone, verified
     let mut fails = 0usize;
-    for p in PROFILES {
+    for p in env::profiles(home).iter().map(|s| s.as_str()) {
         let src_db = env::state_db(home, p);
         if !src_db.exists() {
             continue;
@@ -96,10 +96,10 @@ pub fn run(home: &Path, dry_run: bool) -> Result<PathBuf> {
     }
 
     // 3c. COMPLETENESS GATE
-    let mut missing = Vec::new();
-    for p in PROFILES {
+    let mut missing: Vec<String> = Vec::new();
+    for p in env::profiles(home).iter().map(|s| s.as_str()) {
         if env::state_db(home, p).exists() && !dir.join(p).join("state.db").exists() {
-            missing.push(p);
+            missing.push(p.to_string());
         }
     }
     if !missing.is_empty() {
@@ -168,7 +168,7 @@ pub fn run(home: &Path, dry_run: bool) -> Result<PathBuf> {
 }
 
 fn db_count(home: &Path) -> usize {
-    PROFILES
+    env::profiles(home)
         .iter()
         .filter(|p| env::state_db(home, p).exists())
         .count()

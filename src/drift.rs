@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::env::{self, PROFILES};
+use crate::env;
 
 /// Surface keys — verbatim from hermes-provider-drift.ps1 (SURFACE_KEYS).
 /// Also protects the language keys the operator flagged (updates must never flip English away).
@@ -98,7 +98,7 @@ pub fn export(home: &Path) -> Result<()> {
     std::fs::create_dir_all(&stamp_dir)?;
 
     let mut manifest = Vec::new();
-    for p in PROFILES {
+    for p in env::profiles(home).iter().map(|s| s.as_str()) {
         let cfg = env::config_yaml(home, p);
         if !cfg.exists() {
             println!("  [skip] {} (no config.yaml)", p);
@@ -118,7 +118,7 @@ pub fn export(home: &Path) -> Result<()> {
     // advance last-known + pointer (PS1 semantics: -Export IS the operator saying this is known-good)
     let lk = surface.join("last-known");
     std::fs::create_dir_all(&lk)?;
-    for p in PROFILES {
+    for p in env::profiles(home).iter().map(|s| s.as_str()) {
         let f = stamp_dir.join(format!("{}.json", p));
         if f.exists() {
             std::fs::copy(&f, lk.join(format!("{}.json", p)))?;
@@ -138,7 +138,7 @@ pub fn export(home: &Path) -> Result<()> {
         );
     }
     let mut agg = serde_json::Map::new();
-    for p in PROFILES {
+    for p in env::profiles(home).iter().map(|s| s.as_str()) {
         let f = stamp_dir.join(format!("{}.json", p));
         if f.exists() {
             if let Ok(v) = read_json_file(&f) {
@@ -320,7 +320,7 @@ fn baseline_label(base: &Path) -> String {
 /// baseline can never read as "no drift".
 pub fn compare_against(home: &Path, base: &Path) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
-    for p in PROFILES {
+    for p in env::profiles(home).iter().map(|s| s.as_str()) {
         let cfg = env::config_yaml(home, p);
         if !cfg.exists() {
             continue;
