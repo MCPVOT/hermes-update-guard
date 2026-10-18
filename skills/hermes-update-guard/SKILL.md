@@ -1,7 +1,7 @@
 ---
 name: hermes-update-guard
 description: Use when running or verifying a `hermes update`, or after a failed update left a stale lock — drives the guarded pipeline (preflight, WAL-safe backup, provider-drift tripwire, post-verify) through the hermes-update-guard binary.
-version: 0.2.0
+version: 0.3.0
 author: MCPVOT
 license: MIT
 platforms: [macos, linux, windows]
@@ -35,6 +35,8 @@ tripwire — the whole scripted update ritual in one static binary.
 | Prove no drift | `hermes-update-guard diff --baseline last-known` |
 | WAL-safe backup | `hermes-update-guard backup` |
 | Guarded update (all-in-one) | `hermes-update-guard update --close-desktop` |
+| Unattended update (survives a closed shell) | `hermes-update-guard update --close-desktop --detached` |
+| Watch a run live | `hermes-update-guard watch` (or `watch --no-tui` for a snapshot) |
 | Verify after | `hermes-update-guard verify` |
 | Identity banner | `hermes-update-guard vibe` |
 
@@ -54,6 +56,12 @@ tripwire — the whole scripted update ritual in one static binary.
    $GUARD update --close-desktop           # preflight -> export -> backup -> update -> verify
    $GUARD verify                           # post-update integrity + drift
    ```
+
+   In an agent session (or anywhere the caller may time out), use
+   `update --close-desktop --detached`: it starts the update in its own process
+   group and returns immediately, then `$GUARD watch` renders progress. A
+   finaliser killed by a caller's timeout is what leaves the stale markers that
+   block every later update.
 
 3. **Apply the decision rules** (below) at each gate before continuing.
 
@@ -90,6 +98,13 @@ local build). If it is not installed:
   the Desktop app is running; pass `--close-desktop` only when the operator has
   already closed their session.
 - Backup FAIL → never update from an unverified backup.
+- `verify` is **fail-closed**: any check it cannot perform (unreadable HEAD,
+  missing hermes CLI, no database found, missing baseline) is a failure, and the
+  process exits `1`. Read the exit code, never just the last printed line.
+- The profile fleet is discovered from the home on disk, not hardcoded, so the
+  same binary works on a host with a different profile set (a droplet running
+  `hoodbot/sentinel/solana/storemoat`). The hermes CLI is resolved through the
+  venv, then `~/.local/bin` and `/usr/local/bin`, then `PATH`.
 
 ## Pitfalls
 
@@ -112,6 +127,12 @@ local build). If it is not installed:
 - **A baseline that fails to parse saying "no drift"** → the PowerShell exporter
   writes a UTF-8 BOM, and a silent skip reads as clean. Unreadable baselines are
   now reported and fail the check.
+- **Trusting `verify`'s last line instead of its exit code** → in versions before
+  0.3.0 `verify` printed `PASS` and exited `0` even with no `hermes-agent`, an
+  unreadable HEAD and no venv. The exit code is the verdict; a `grep PASS` is not.
+- **Reading a clean tree as "nothing was pinned"** → a clean tree with no stash
+  entries is also what a *dropped* patch looks like. `verify` now compares against
+  the file list in the newest `pre-update-*/working-tree.patch`.
 
 ## Manual restore (emergency)
 

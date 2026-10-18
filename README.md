@@ -65,7 +65,7 @@ the update runs — then verifies the result afterwards.
 
 ```bash
 # Linux / macOS — fetch, mark executable, put it on PATH
-VER=0.2.0
+VER=0.3.0
 curl -fsSL -o hermes-update-guard \
   "https://github.com/MCPVOT/hermes-update-guard/releases/download/v${VER}/hermes-update-guard-${VER}-x86_64-unknown-linux-gnu"
 chmod +x hermes-update-guard
@@ -87,8 +87,9 @@ cargo build --release         # or run target/release/hermes-update-guard
 | `export` | Snapshot each profile's provider surface into `backups/provider-surface/<stamp>/`, advance `last-known`, refresh the aggregate `golden.json` | none (read-only on live config) |
 | `diff` | Compare the live surface against **golden** (or `--baseline last-known` / a path) | **exit 1 on any drift or unreadable baseline** |
 | `backup` | WAL-safe SQLite backup of every profile's `state.db` plus config/env/auth/gateway/content dirs into `backups/pre-update-<stamp>/`; verifies integrity + message counts | **refuses on incomplete backup** |
-| `update` | Full guarded update: preflight gate → export → backup → `hermes update --yes` → verify | refuses while a venv is held (or its state is unknown) or the desktop app is running (add `--close-desktop`) |
-| `verify` | Post-update: HEAD advanced, DB integrity, **local-patch restoration**, drift-vs-export, gateway pid/state | reports FAIL on any bad DB or a parked patch |
+| `update` | Full guarded update: preflight gate → export → backup → `hermes update --yes` → verify. Add `--detached` to run it in its own process group so a closed terminal or a caller timeout cannot kill the build | refuses while a venv is held (or its state is unknown) or the desktop app is running (add `--close-desktop`) |
+| `verify` | Post-update: HEAD advanced, DB integrity, **local-patch restoration**, drift-vs-export, gateway pid/state | **exit 1 on any failed or unperformable check** |
+| `watch` | Live, read-only view of a run: stage rail, per-profile backup matrix, blockers, log tail (`--no-tui` for a one-shot snapshot) | none (read-only) |
 | `vibe` | Print the MCPVOT identity banner | none |
 
 ## Quick start

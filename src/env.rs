@@ -60,6 +60,32 @@ fn default_home() -> Result<PathBuf> {
     }
 }
 
+/// Enumerate the profiles that actually exist in this home.
+///
+/// `PROFILES` is only a fallback. The guard runs on machines whose profile set is
+/// different (the droplet runs hoodbot/sentinel/solana/storemoat), and a hardcoded
+/// fleet there silently backs up and verifies the wrong things — or nothing at all.
+pub fn profiles(home: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if home.join("config.yaml").is_file() {
+        out.push("default".to_string());
+    }
+    if let Ok(rd) = std::fs::read_dir(home.join("profiles")) {
+        let mut names: Vec<String> = rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().join("config.yaml").is_file())
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .collect();
+        names.sort();
+        names.dedup();
+        out.extend(names);
+    }
+    if out.is_empty() {
+        out = PROFILES.iter().map(|s| s.to_string()).collect();
+    }
+    out
+}
+
 /// Profile home directory: default lives at hermes home root, others under profiles/.
 pub fn profile_dir(home: &Path, profile: &str) -> PathBuf {
     if profile == "default" {
@@ -91,6 +117,87 @@ pub fn venv_hermes(home: &Path) -> PathBuf {
         .join("venv")
         .join("bin")
         .join("hermes")
+}
+
+/// Find the hermes CLI the way hermes itself does, instead of assuming a venv.
+///
+/// A venv-only assumption is wrong on every install that is not a source
+/// checkout: the ops node runs `/usr/local/bin/hermes` against
+/// `/usr/local/lib/hermes-agent`, and the droplet runs `~/.local/bin/hermes`.
+/// Returning `None` (rather than a path that cannot exist) lets callers fail
+/// closed with an honest message.
+pub fn resolve_hermes(home: &Path) -> Option<std::path::PathBuf> {
+    let venv = venv_hermes(home);
+    if venv.is_file() {
+        return Some(venv);
+    }
+    let bin = if cfg!(windows) {
+        "hermes.exe"
+    } else {
+        "hermes"
+    };
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    #[cfg(not(windows))]
+    {
+        if let Ok(h) = std::env::var("HOME") {
+            candidates.push(PathBuf::from(h).join(".local").join("bin").join(bin));
+        }
+        candidates.push(PathBuf::from("/usr/local/bin").join(bin));
+        candidates.push(PathBuf::from("/usr/bin").join(bin));
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(la) = std::env::var("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(la).join("Programs").join("hermes").join(bin));
+        }
+    }
+    for c in candidates {
+        if c.is_file() {
+            return Some(c);
+        }
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let c = dir.join(bin);
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// Run a command and treat a non-zero exit as an ERROR, returning trimmed stdout.
+/// stdout and stderr are kept separate: mixing them is how a `fatal: cannot change
+/// to ...` from git used to be counted as a "local modification" by verify.
+pub fn run_checked(program: &Path, args: &[&str], cwd: Option<&Path>) -> Result<(String, String)> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    if let Some(d) = cwd {
+        cmd.current_dir(d);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    let out = cmd
+        .output()
+        .with_context(|| format!("failed to spawn {}", program.display()))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let code = out.status.code().unwrap_or(-1);
+    if code != 0 {
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            stderr.trim().to_string()
+        };
+        bail!(
+            "{} {} exited {}: {}",
+            program.display(),
+            args.join(" "),
+            code,
+            truncated(&detail, 300)
+        );
+    }
+    Ok((stdout, stderr))
 }
 
 /// Capture stdout+stderr of a command (no stdin). Returns (exit_code, combined_output).
@@ -125,8 +232,16 @@ pub fn run_capture(program: &Path, args: &[&str], cwd: Option<&Path>) -> Result<
 /// exit...") instead of the JSON list, so the third flag lets callers say
 /// "venv state UNKNOWN — treat as held" rather than assuming free.
 pub fn venv_holders_probe(home: &Path) -> (Vec<String>, i32, bool) {
-    let hermes = venv_hermes(home);
-    let Ok((code, out)) = run_capture(&hermes, &["update", "--list-venv-holders"], None) else {
+    venv_holders_probe_with(resolve_hermes(home).as_deref())
+}
+
+/// Testable core of [`venv_holders_probe`]: `None` means no CLI was resolvable,
+/// which must read as UNKNOWN (parsed = false), never as "venv free".
+fn venv_holders_probe_with(cli: Option<&Path>) -> (Vec<String>, i32, bool) {
+    let Some(hermes) = cli else {
+        return (vec![], -1, false);
+    };
+    let Ok((code, out)) = run_capture(hermes, &["update", "--list-venv-holders"], None) else {
         return (vec![], -1, false);
     };
     let trimmed = out.trim();
@@ -232,4 +347,53 @@ pub fn kill_process(image: &str) -> bool {
         run_capture(Path::new("pkill"), &["-f", image], None),
         Ok((0, _))
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole fail-closed contract rests on run_checked: a non-zero exit must
+    /// be an Err, never a silently-empty String that callers read as "clean".
+    #[test]
+    fn run_checked_treats_nonzero_exit_as_error() {
+        let ok = run_checked(Path::new("git"), &["--version"], None);
+        assert!(ok.is_ok(), "git --version must succeed");
+        let bad = run_checked(
+            Path::new("git"),
+            &["rev-parse", "--verify", "refs/heads/definitely-not-a-ref"],
+            None,
+        );
+        assert!(
+            bad.is_err(),
+            "a non-zero exit must be an error, not Ok(\"\")"
+        );
+    }
+
+    /// A missing working directory must also be an error, not an empty stdout.
+    #[test]
+    fn run_checked_errors_on_missing_cwd() {
+        let missing = Path::new("C:/definitely-not-here-xyz");
+        assert!(run_checked(Path::new("git"), &["status"], Some(missing)).is_err());
+    }
+
+    /// venv_holders_probe must report "unknown" (parsed=false) when there is no
+    /// hermes CLI at all, so callers fail closed instead of assuming the venv free.
+    #[test]
+    fn venv_probe_unknown_without_hermes() {
+        let (holders, code, parsed) = venv_holders_probe_with(None);
+        assert!(!parsed, "no hermes CLI must mean UNKNOWN, not free");
+        assert_eq!(code, -1);
+        assert!(holders.is_empty());
+    }
+
+    /// An unparseable answer (hermes printing prose while an update is in flight)
+    /// must also read as UNKNOWN rather than being dropped on the floor.
+    #[test]
+    fn venv_probe_unknown_on_prose() {
+        // any CLI that prints prose instead of the documented JSON
+        let (_, code, parsed) = venv_holders_probe_with(Some(Path::new("git")));
+        assert!(!parsed, "prose output is not the documented JSON");
+        assert_ne!(code, 0, "git has no `update` subcommand");
+    }
 }
