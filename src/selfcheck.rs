@@ -215,7 +215,7 @@ pub fn run(home: &Path, repo: Option<&Path>) -> Result<()> {
         fleet.join(", "),
         fleet.len()
     );
-    let missing = env::profiles_gone_since_backup(home);
+    let missing = env::profiles_gone_since_backup(home, &crate::retire::retired(home));
     if !missing.is_empty() {
         println!(
             "  ! profile(s) present in an earlier backup but ABSENT now: {} - deleted, or never restored (recover from backups/pre-update-*)",

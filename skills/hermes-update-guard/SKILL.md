@@ -1,7 +1,7 @@
 ---
 name: hermes-update-guard
 description: Use when running or verifying a `hermes update`, or after a failed update left a stale lock — drives the guarded pipeline (preflight, WAL-safe backup, provider-drift tripwire, post-verify) through the hermes-update-guard binary.
-version: 0.3.2
+version: 0.3.3
 author: MCPVOT
 license: MIT
 platforms: [macos, linux, windows]
@@ -39,6 +39,7 @@ tripwire — the whole scripted update ritual in one static binary.
 | Unattended update (survives a closed shell) | `hermes-update-guard update --close-desktop --detached` |
 | Watch a run live | `hermes-update-guard watch` (or `watch --no-tui` for a snapshot) |
 | Verify after | `hermes-update-guard verify` |
+| Record a profile as gone on purpose | `hermes-update-guard retire <profile>` (undo: `--undo`) |
 | Transcript / context-health audit | `hermes-update-guard health` |
 | One profile in depth | `hermes-update-guard health --profile <name>` |
 | Is the binary I am running current? | `hermes-update-guard self-check` |
@@ -191,6 +192,11 @@ local build). If it is not installed:
   deleted half-restored profile just stops appearing. `self-check` compares against
   every `pre-update-*` backup and reports profiles that were there but are gone,
   with the newest stamp that saw them.
+- **Treating a deliberately deleted profile as an accident forever** → an
+  intentional deletion and an accidental one look identical on disk. If you removed
+  a profile on purpose, `retire <name>` it (recorded in
+  `backups/profile-retired.json`); otherwise `self-check` keeps flagging it. `retire`
+  refuses a profile that still exists, so it cannot be used to hide a live one.
 - **Running a stale guard** → `self-check` resolves the binary on PATH, compares it
   with the repo build and flags stale clones, because a stale guard reports a clean
   preflight for a version that no longer exists.

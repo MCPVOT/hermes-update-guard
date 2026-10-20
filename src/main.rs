@@ -12,6 +12,7 @@ mod env;
 mod guard;
 mod preflight;
 mod quarantine;
+mod retire;
 mod selfcheck;
 mod state;
 mod tui;
@@ -106,6 +107,15 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
+    /// Record that a profile is GONE ON PURPOSE, so self-check stops flagging it as
+    /// missing. Refuses if the profile still exists on disk.
+    Retire {
+        /// Profile name (the one self-check reported as absent).
+        profile: String,
+        /// Remove the record and let the flag come back.
+        #[arg(long)]
+        undo: bool,
+    },
     /// Is the guard I am running the one I think I am? PATH binary + version,
     /// stale clones under the Hermes home, repo comparison, fleet, health verdict.
     SelfCheck,
@@ -178,6 +188,7 @@ fn main() -> Result<()> {
             None => context_health::run(&home),
         },
         Cmd::Quarantine { apply } => quarantine::run(&home, apply),
+        Cmd::Retire { profile, undo } => retire::run(&home, &profile, undo),
         Cmd::SelfCheck => selfcheck::run(&home, cli.repo.as_deref()),
         Cmd::Vibe => {
             vibe::print_full();
