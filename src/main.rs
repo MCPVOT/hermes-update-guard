@@ -1,4 +1,4 @@
-// clang-as-linker on windows-gnu/gnullvm emits a harmless "-no-pie" argument-unused message.
+﻿// clang-as-linker on windows-gnu/gnullvm emits a harmless "-no-pie" argument-unused message.
 #![allow(linker_messages)]
 
 use anyhow::Result;
@@ -11,6 +11,7 @@ mod drift;
 mod env;
 mod guard;
 mod preflight;
+mod quarantine;
 mod selfcheck;
 mod state;
 mod tui;
@@ -98,6 +99,13 @@ enum Cmd {
         #[arg(long)]
         profile: Option<String>,
     },
+    /// Move stale update markers (.hermes-update-*) into a dated quarantine dir.
+    /// Refuses to touch a marker whose owner pid is still alive. Nothing is deleted.
+    Quarantine {
+        /// Actually move them (without this it only prints the plan).
+        #[arg(long)]
+        apply: bool,
+    },
     /// Is the guard I am running the one I think I am? PATH binary + version,
     /// stale clones under the Hermes home, repo comparison, fleet, health verdict.
     SelfCheck,
@@ -169,6 +177,7 @@ fn main() -> Result<()> {
             }
             None => context_health::run(&home),
         },
+        Cmd::Quarantine { apply } => quarantine::run(&home, apply),
         Cmd::SelfCheck => selfcheck::run(&home, cli.repo.as_deref()),
         Cmd::Vibe => {
             vibe::print_full();

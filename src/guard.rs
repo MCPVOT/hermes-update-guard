@@ -254,6 +254,50 @@ fn run_stages(
     st.stage("update", StageState::Done);
     let _ = st.write(home);
 
+    // ---- GATEWAY RECOVERY --------------------------------------------------
+    // The updater stops the gateway to swap the code, and it REFUSES to restart
+    // it when the checkout has a locally modified file ("git left half-written").
+    // The result is an install whose gateway is DOWN - the single most common
+    // post-update failure, and the reason "the update succeeded but Hermes is
+    // dead" kept happening. Recover it here, then verify.
+    println!("\n-- GATEWAY RECOVERY --");
+    match crate::verify::gateway_status(home) {
+        Some(g) => {
+            let alive = matches!(env::pid_running(g.pid), env::ProcState::Running);
+            if !alive {
+                println!(
+                    "  gateway pid {} is not running (state={:?}) - restarting it",
+                    g.pid, g.state
+                );
+                st.blocker(&format!("gateway pid {} was down after the update", g.pid));
+                if let Some(h) = env::resolve_hermes(home) {
+                    let (code, out) =
+                        env::run_capture(&h, &["gateway", "restart"], None).unwrap_or((-1, String::new()));
+                    for l in out.lines().take(8) {
+                        println!("    {}", l.trim());
+                    }
+                    if code != 0 {
+                        println!("  ! `hermes gateway restart` exited {}", code);
+                    }
+                }
+                // give it a moment to come up, then re-read the state
+                for _ in 0..15 {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if let Some(g2) = crate::verify::gateway_status(home) {
+                        if matches!(env::pid_running(g2.pid), env::ProcState::Running) {
+                            println!("  gateway back up: pid={} state={}", g2.pid, g2.state);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                println!("  gateway alive (pid={})", g.pid);
+            }
+        }
+        None => println!("  no gateway_state.json - nothing to recover"),
+    }
+    let _ = st.write(home);
+
     // ---- VERIFY ------------------------------------------------------------
     st.stage("verify", StageState::Active);
     let _ = st.write(home);

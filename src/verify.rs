@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+﻿use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::env;
@@ -144,17 +144,17 @@ pub fn run(home: &Path) -> Result<()> {
             .context("gateway_state.json unreadable")
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).context("bad json"))
         {
-            Ok(js) => {
-                let pid = js.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
-                let st = js.get("gateway_state")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
+            Ok(_js) => {
+                let g = gateway_status(home).unwrap_or_default();
+                let pid = g.pid;
+                let st = g.state.as_str();
+                let sha = g.code_sha.as_str();
                 println!("  gateway : pid={} state={}", pid, st);
                 // The state file can outlive the process it describes - a stale
                 // "running" gateway is indistinguishable from a healthy one
                 // unless the pid is checked. (It lied repeatedly in 2026-10.)
                 if pid > 0 && st == "running" {
-                    match env::pid_running(pid as u32) {
+                    match env::pid_running(pid) {
                         env::ProcState::Running => {}
                         env::ProcState::Absent => {
                             println!("  FAIL gateway_state.json claims pid {} is running, but that process is gone", pid);
@@ -162,6 +162,27 @@ pub fn run(home: &Path) -> Result<()> {
                         }
                         env::ProcState::Unknown(why) => {
                             println!("  ! could not determine whether gateway pid {} is alive ({}): treat as suspect", pid, why);
+                        }
+                    }
+                }
+                // A gateway serving a DIFFERENT commit than the install is running
+                // pre-update code. The old PowerShell wrapper checked this; the Rust
+                // port lost it, and a stale-code gateway looks perfectly healthy.
+                if !sha.is_empty() {
+                    if let Some(head) = head_sha(home) {
+                        if !sha.starts_with(&head) {
+                            println!(
+                                "  FAIL gateway runs code {} but the install is on {} - it is serving PRE-UPDATE code",
+                                sha.chars().take(10).collect::<String>(),
+                                head
+                            );
+                            failures.push(format!(
+                                "gateway runs sha {} but install is on {}",
+                                sha.chars().take(10).collect::<String>(),
+                                head
+                            ));
+                        } else {
+                            println!("  gateway code_sha matches HEAD ({})", head);
                         }
                     }
                 }
@@ -410,6 +431,57 @@ fn check_drift(home: &Path, failures: &mut Vec<String>) {
         }
         println!("  FAIL {} drift line(s) vs pre-update export", lines.len());
         failures.push(format!("{} provider drift line(s)", lines.len()));
+    }
+}
+
+/// What the gateway state file claims, and whether that claim is still true.
+#[derive(Debug, Clone, Default)]
+pub struct GatewayStatus {
+    pub pid: u32,
+    pub state: String,
+    pub code_sha: String,
+}
+
+/// Read the root gateway state file.
+pub fn gateway_status(home: &Path) -> Option<GatewayStatus> {
+    let gw = home.join("gateway_state.json");
+    if !gw.exists() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&gw).ok()?;
+    let js: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some(GatewayStatus {
+        pid: js.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        state: js
+            .get("gateway_state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        code_sha: js
+            .get("code_sha")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+/// The commit the install is on (short form), if it is a git install.
+pub fn head_sha(home: &Path) -> Option<String> {
+    let repo = home.join("hermes-agent");
+    let (code, out) = env::run_capture(
+        Path::new("git"),
+        &["-C", repo.to_str().unwrap_or("."), "rev-parse", "--short", "HEAD"],
+        None,
+    )
+    .ok()?;
+    if code != 0 {
+        return None;
+    }
+    let sha = out.trim().to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
     }
 }
 
