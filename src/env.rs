@@ -447,6 +447,12 @@ impl ProcState {
 
 /// Rows of `tasklist /FO CSV /NH`, as `(image, pid)`. Anything that is not a
 /// quoted CSV row (headers, headers in any locale, prose) is skipped.
+///
+/// Windows-only in production (POSIX uses `kill -0`), but kept compiled
+/// everywhere so the parser is testable on any host. Without the attribute,
+/// `clippy -D warnings` fails with `dead_code` on Linux/macOS and the whole CI
+/// matrix goes red.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn csv_rows(out: &str) -> Vec<(String, u32)> {
     out.lines()
         .filter_map(|line| {
@@ -464,6 +470,7 @@ pub fn csv_rows(out: &str) -> Vec<(String, u32)> {
 
 /// PIDs whose image name equals `image` (case-insensitive, as Windows itself
 /// compares image names). Pure, so the CSV shape is testable without Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn parse_tasklist_csv(out: &str, image: &str) -> Vec<u32> {
     csv_rows(out)
         .into_iter()

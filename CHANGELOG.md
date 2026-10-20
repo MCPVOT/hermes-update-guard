@@ -10,8 +10,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **CI was red:** `cargo fmt --all -- --check` failed across 25 positions left by
-  the 0.3.1 work, so every push would have failed the `check` job. Formatted.
+- **CI was red on Linux and macOS.** Two independent causes, both from 0.3.1:
+  `cargo fmt --all -- --check` failed across 25 positions, and the Windows-only
+  helpers `csv_rows` / `parse_tasklist_csv` were unconditionally compiled, so
+  `clippy -D warnings` reported them as `dead_code` off Windows. Formatted, and
+  both parsers are now `#[cfg_attr(not(windows), allow(dead_code))]` — still
+  compiled everywhere so their tests run on any host.
 - **`quarantine` could move a live update's marker.** Only a marker that carries a
   pid could be judged live, and an empty `.lock` (the most common leftover) has no
   pid at all — so it was always movable. Markers are now treated as a SET: if any
