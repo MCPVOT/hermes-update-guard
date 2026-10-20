@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-19
+
+### Fixed
+
+- **The process probe failed open.** `process_running() -> bool` answered `false`
+  when `tasklist` could not run, exited non-zero, or printed anything it did not
+  understand — so a broken probe read as "the Desktop app is closed" and the
+  update proceeded against a locked `state.db`. The probe is now tri-state
+  (`Running` / `Absent` / `Unknown`) and `Unknown` blocks the preflight.
+- **`--close-desktop` gave up after one forced kill and a fixed 6 s sleep.**
+  It now asks gracefully, waits, escalates to a forced stop, waits again, and on
+  failure reports the surviving PIDs instead of "still running after kill".
+- **`PROFILES` shipped one operator's profile names** (including client names) in
+  a public binary. The fallback is now `["default"]`.
+
+### Added
+
+- `preflight` prints the guard's own version and binary path, so a stale
+  `~/.cargo/bin` copy cannot masquerade as the current build.
+- Unit tests for the CSV parser (exact image match, prose rejection) and for the
+  bounded wait (unknown, timeout, exit).
+
 ## [0.3.0] - 2026-10-17
 
 ### Added
