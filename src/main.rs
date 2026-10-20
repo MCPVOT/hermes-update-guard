@@ -1,4 +1,4 @@
-﻿// clang-as-linker on windows-gnu/gnullvm emits a harmless "-no-pie" argument-unused message.
+// clang-as-linker on windows-gnu/gnullvm emits a harmless "-no-pie" argument-unused message.
 #![allow(linker_messages)]
 
 use anyhow::Result;
