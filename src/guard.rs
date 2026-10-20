@@ -10,9 +10,15 @@ use crate::state::{RunState, StageState};
 ///
 /// Writes `backups/guard-run.json` at every stage transition so `watch` can render
 /// the run live without touching the updater.
-pub fn run(home: &Path, close_desktop: bool, force: bool, detached: bool) -> Result<()> {
+pub fn run(
+    home: &Path,
+    close_desktop: bool,
+    force: bool,
+    detached: bool,
+    channel: Option<&str>,
+) -> Result<()> {
     if detached {
-        return spawn_detached(home, close_desktop, force);
+        return spawn_detached(home, close_desktop, force, channel);
     }
 
     crate::vibe::print_compact(env!("CARGO_PKG_VERSION"));
@@ -22,14 +28,20 @@ pub fn run(home: &Path, close_desktop: bool, force: bool, detached: bool) -> Res
     st.seed_profiles(&env::profiles(home));
     let _ = st.write(home);
 
-    let result = run_stages(home, close_desktop, force, &mut st);
+    let result = run_stages(home, close_desktop, force, &mut st, channel);
 
     st.finish(if result.is_ok() { 0 } else { 1 });
     let _ = st.write(home);
     result
 }
 
-fn run_stages(home: &Path, close_desktop: bool, force: bool, st: &mut RunState) -> Result<()> {
+fn run_stages(
+    home: &Path,
+    close_desktop: bool,
+    force: bool,
+    st: &mut RunState,
+    channel: Option<&str>,
+) -> Result<()> {
     // ---- PREFLIGHT ---------------------------------------------------------
     st.stage("preflight", StageState::Active);
     let _ = st.write(home);
@@ -51,37 +63,65 @@ fn run_stages(home: &Path, close_desktop: bool, force: bool, st: &mut RunState) 
             st.stage("preflight", StageState::Failed);
             let _ = st.write(home);
             bail!(
-                "{} — update would refuse or strand the install. Stop them first.",
+                "{} â€” update would refuse or strand the install. Stop them first.",
                 msg
             );
         }
 
-        let desktop = env::process_running("Hermes.exe");
-        if desktop {
-            if close_desktop {
-                println!("  Desktop app running - closing it (forced)...");
-                let killed = env::kill_process("Hermes.exe");
-                if !killed {
-                    st.blocker("failed to stop the Desktop app");
-                    st.stage("preflight", StageState::Failed);
-                    let _ = st.write(home);
-                    bail!("failed to stop the Desktop app - close it and re-run");
-                }
-                std::thread::sleep(std::time::Duration::from_secs(6));
-                if env::process_running("Hermes.exe") {
-                    st.blocker("Desktop app still running after kill");
-                    st.stage("preflight", StageState::Failed);
-                    let _ = st.write(home);
-                    bail!("Desktop app still running after kill - close it and re-run");
-                }
-            } else {
+        // Tri-state: `Unknown` (tasklist broken) is NOT "closed". The old bool
+        // probe answered false on any error, so a broken tool let the update run
+        // while the app still held every profile's state.db.
+        const DESKTOP: &str = "Hermes.exe";
+        match env::process_state(DESKTOP) {
+            env::ProcState::Absent => println!("  Desktop app not running"),
+            env::ProcState::Unknown(why) => {
+                let msg = format!(
+                    "cannot verify whether the Desktop app is running ({why}) - treating it as RUNNING"
+                );
+                st.blocker(&msg);
+                st.stage("preflight", StageState::Failed);
+                let _ = st.write(home);
+                bail!("{}", msg);
+            }
+            env::ProcState::Running if !close_desktop => {
                 st.blocker("Desktop app is RUNNING (pass --close-desktop)");
                 st.stage("preflight", StageState::Failed);
                 let _ = st.write(home);
                 bail!("Desktop app is RUNNING - pass --close-desktop or close it manually");
             }
-        } else {
-            println!("  Desktop app not running");
+            env::ProcState::Running => {
+                println!("  Desktop app running - closing it (graceful, then forced)...");
+                let report = match env::close_process(
+                    DESKTOP,
+                    std::time::Duration::from_secs(8),
+                    std::time::Duration::from_secs(12),
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let msg = format!("failed to close the Desktop app: {e}");
+                        st.blocker(&msg);
+                        st.stage("preflight", StageState::Failed);
+                        let _ = st.write(home);
+                        bail!("{}", msg);
+                    }
+                };
+                if !report.closed {
+                    let pids = if report.survivors.is_empty() {
+                        "pids unknown".to_string()
+                    } else {
+                        format!("pids {:?}", report.survivors)
+                    };
+                    let msg = format!(
+                        "Desktop app {} ({}) - close it from the tray and re-run; an app that respawns itself cannot be killed from here",
+                        report.detail, pids
+                    );
+                    st.blocker(&msg);
+                    st.stage("preflight", StageState::Failed);
+                    let _ = st.write(home);
+                    bail!("{}", msg);
+                }
+                println!("  Desktop app {}", report.detail);
+            }
         }
 
         for m in [
@@ -98,21 +138,39 @@ fn run_stages(home: &Path, close_desktop: bool, force: bool, st: &mut RunState) 
                 st.blocker(&format!("stale marker {m}"));
             }
         }
+        let no_cfg = env::profiles_without_config(home);
+        if !no_cfg.is_empty() {
+            println!(
+                "  [warn] {} profile dir(s) have no config.yaml: {}",
+                no_cfg.len(),
+                no_cfg.join(", ")
+            );
+            st.blocker(&format!("{} profile(s) without config.yaml", no_cfg.len()));
+        }
+
         let stale = crate::preflight::stale_receipts(home);
         if !stale.is_empty() {
             for s in &stale {
                 println!("  [warn] unfinished update receipt: {}", s);
             }
-            println!(
-                "  [warn] {} receipt(s) left running — finish the owed update before starting another",
-                stale.len()
-            );
+            let live = stale.iter().filter(|l| l.contains("pid LIVE")).count();
+            if live == 0 {
+                println!(
+                    "  [warn] {} stale receipt(s) with dead pids - history, not an update in flight",
+                    stale.len()
+                );
+            } else {
+                println!(
+                    "  [warn] {} receipt(s) with a LIVE pid - an update is in flight; finish it first",
+                    live
+                );
+            }
             st.blocker(&format!("{} unfinished update receipt(s)", stale.len()));
         }
         println!("  preflight gate passed");
     } else {
-        println!("  preflight gate SKIPPED (--force)");
-        st.blocker("preflight SKIPPED (--force)");
+        println!("  preflight gate SKIPPED (--skip-preflight)");
+        st.blocker("preflight SKIPPED (--skip-preflight)");
     }
     st.stage("preflight", StageState::Done);
     let _ = st.write(home);
@@ -152,6 +210,16 @@ fn run_stages(home: &Path, close_desktop: bool, force: bool, st: &mut RunState) 
     let _ = st.write(home);
 
     // ---- UPDATE ------------------------------------------------------------
+    // Capture the fleet's context health BEFORE the update. `verify` compares
+    // against it, so a transcript that was already broken is reported as
+    // pre-existing instead of being blamed on the update.
+    st.health_before = Some(crate::context_health::summarize(home));
+    if let Some(hb) = &st.health_before {
+        println!(
+            "  context health before update: dup_uids={} max_bloat={:.1}x stuck={} at_risk={}",
+            hb.dup_uids, hb.max_bloat, hb.stuck, hb.at_risk
+        );
+    }
     st.stage("update", StageState::Active);
     let _ = st.write(home);
     println!("\n-- HERMES UPDATE --");
@@ -161,11 +229,22 @@ fn run_stages(home: &Path, close_desktop: bool, force: bool, st: &mut RunState) 
             st.blocker("no hermes CLI found");
             st.stage("update", StageState::Failed);
             let _ = st.write(home);
-            bail!("no hermes CLI found (venv, PATH, ~/.local/bin, /usr/local/bin) — cannot update")
+            bail!(
+                "no hermes CLI found (venv, PATH, ~/.local/bin, /usr/local/bin) â€” cannot update"
+            )
         }
     };
     println!("  using {}", hermes.display());
-    let (code, out) = env::run_capture(&hermes, &["update", "--yes"], None)?;
+    // --channel is a TRANSIENT override for this run only (hermes keeps the
+    // persisted channel untouched), so a guarded run can pull the newest main
+    // without silently moving the install off its release channel.
+    let mut upd_args: Vec<&str> = vec!["update", "--yes"];
+    if let Some(ch) = channel {
+        println!("  channel override for this run only: {}", ch);
+        upd_args.push("--channel");
+        upd_args.push(ch);
+    }
+    let (code, out) = env::run_capture(&hermes, &upd_args, None)?;
 
     if !out.is_empty() {
         println!("{}", out);
@@ -185,6 +264,50 @@ fn run_stages(home: &Path, close_desktop: bool, force: bool, st: &mut RunState) 
     }
     println!("  hermes update exit 0");
     st.stage("update", StageState::Done);
+    let _ = st.write(home);
+
+    // ---- GATEWAY RECOVERY --------------------------------------------------
+    // The updater stops the gateway to swap the code, and it REFUSES to restart
+    // it when the checkout has a locally modified file ("git left half-written").
+    // The result is an install whose gateway is DOWN - the single most common
+    // post-update failure, and the reason "the update succeeded but Hermes is
+    // dead" kept happening. Recover it here, then verify.
+    println!("\n-- GATEWAY RECOVERY --");
+    match crate::verify::gateway_status(home) {
+        Some(g) => {
+            let alive = matches!(env::pid_running(g.pid), env::ProcState::Running);
+            if !alive {
+                println!(
+                    "  gateway pid {} is not running (state={:?}) - restarting it",
+                    g.pid, g.state
+                );
+                st.blocker(&format!("gateway pid {} was down after the update", g.pid));
+                if let Some(h) = env::resolve_hermes(home) {
+                    let (code, out) = env::run_capture(&h, &["gateway", "restart"], None)
+                        .unwrap_or((-1, String::new()));
+                    for l in out.lines().take(8) {
+                        println!("    {}", l.trim());
+                    }
+                    if code != 0 {
+                        println!("  ! `hermes gateway restart` exited {}", code);
+                    }
+                }
+                // give it a moment to come up, then re-read the state
+                for _ in 0..15 {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if let Some(g2) = crate::verify::gateway_status(home) {
+                        if matches!(env::pid_running(g2.pid), env::ProcState::Running) {
+                            println!("  gateway back up: pid={} state={}", g2.pid, g2.state);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                println!("  gateway alive (pid={})", g.pid);
+            }
+        }
+        None => println!("  no gateway_state.json - nothing to recover"),
+    }
     let _ = st.write(home);
 
     // ---- VERIFY ------------------------------------------------------------
@@ -215,7 +338,12 @@ fn run_stages(home: &Path, close_desktop: bool, force: bool, st: &mut RunState) 
 /// timeout, each leaving a marker that blocked every later command. A detached
 /// child outlives the shell that started it, so a closed lid or a timed-out agent
 /// call can no longer kill an update halfway through its build.
-fn spawn_detached(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
+fn spawn_detached(
+    home: &Path,
+    close_desktop: bool,
+    force: bool,
+    channel: Option<&str>,
+) -> Result<()> {
     use std::process::{Command, Stdio};
 
     let exe = std::env::current_exe()?;
@@ -233,6 +361,9 @@ fn spawn_detached(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
     }
     if force {
         cmd.arg("--force");
+    }
+    if let Some(ch) = channel {
+        cmd.arg("--channel").arg(ch);
     }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::from(file.try_clone()?));

@@ -23,6 +23,36 @@ pub fn run_with(home: &Path, dry_run: bool, on_db: &mut dyn FnMut(&str, bool)) -
     let dir = backup_root.join(format!("pre-update-{}", stamp));
 
     println!("== PRE-UPDATE BACKUP ({}) ==", dir.display());
+    // ---- disk-space gate -------------------------------------------------
+    // The fleet's databases are large (one measured at 2.0 GB, the whole fleet
+    // at ~2.9 GB). A backup needs that much again, plus room for the WAL that
+    // lands while it runs. Refuse BEFORE copying rather than fill the volume.
+    let mut needed: u64 = 0;
+    for p in env::profiles(home).iter().map(|s| s.as_str()) {
+        let db = env::state_db(home, p);
+        if db.exists() {
+            needed += env::dir_size_bytes(&db);
+        }
+    }
+    let needed_with_headroom = needed + needed / 2 + 512 * 1024 * 1024; // 1.5x + 512MB
+    match env::free_space_bytes(&backup_root) {
+        Some(free) if free < needed_with_headroom => {
+            println!(
+                "  [FAIL] not enough disk for the backup: need ~{:.1} GB, {} GB free",
+                needed_with_headroom as f64 / 1_073_741_856.0,
+                free / 1_073_741_856
+            );
+            anyhow::bail!("insufficient disk space for a verified backup");
+        }
+        Some(free) => println!(
+            "  disk: {} GB free, backup needs ~{:.1} GB",
+            free / 1_073_741_856,
+            needed_with_headroom as f64 / 1_073_741_856.0
+        ),
+        None => println!(
+            "  disk: free space unknown - proceeding (cannot prove the volume can take it)"
+        ),
+    }
     if dry_run {
         println!("[dry-run] plan only - nothing written");
         let mut expected = 0;
@@ -83,6 +113,17 @@ pub fn run_with(home: &Path, dry_run: bool, on_db: &mut dyn FnMut(&str, bool)) -
         let src_db = env::state_db(home, p);
         if !src_db.exists() {
             continue;
+        }
+        // Hermes' OWN pre-update snapshot skips any state.db over 1 GB
+        // ("Quick snapshot skipped oversized DB file(s)"). Say so: this guard's
+        // copy is then the only restore point that has the file.
+        let bytes = crate::context_health::db_size(home, p);
+        if bytes > 1_073_741_824 {
+            println!(
+                "  note {} state.db is {:.1} MB - Hermes' built-in snapshot SKIPS files over 1 GB; this backup is the only copy",
+                p,
+                bytes as f64 / 1_048_576.0
+            );
         }
         let dst_db = dir.join(p).join("state.db");
         fs::create_dir_all(dst_db.parent().unwrap())?;

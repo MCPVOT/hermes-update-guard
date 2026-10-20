@@ -6,6 +6,60 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-21
+
+### Fixed
+
+- **CI was red on Linux and macOS.** Two independent causes, both from 0.3.1:
+  `cargo fmt --all -- --check` failed across 25 positions, and the Windows-only
+  helpers `csv_rows` / `parse_tasklist_csv` were unconditionally compiled, so
+  `clippy -D warnings` reported them as `dead_code` off Windows. Formatted, and
+  both parsers are now `#[cfg_attr(not(windows), allow(dead_code))]` — still
+  compiled everywhere so their tests run on any host.
+- **`quarantine` could move a live update's marker.** Only a marker that carries a
+  pid could be judged live, and an empty `.lock` (the most common leftover) has no
+  pid at all — so it was always movable. Markers are now treated as a SET: if any
+  owner in the home is live *or unverifiable*, nothing is moved. `ProcState::Unknown`
+  is a hold, not a pass.
+- **A profile could vanish without a word.** The fleet is discovered from disk, so a
+  deleted or half-restored profile simply stops appearing and every command still
+  reports success. `self-check` now scans every `pre-update-*` backup and reports
+  profiles that were present then but are absent now, with the newest stamp that
+  saw them. Measured on the live install: `elevate (last seen 20261016-135956)`.
+- **Profile directories without `config.yaml` were dropped from the fleet**, so a
+  half-restored profile was backed up by nobody and verified by nobody. They are
+  now part of the fleet (their `state.db` is still backed up) and reported as an
+  anomaly by `self-check` and by `update`'s preflight.
+
+### Notes
+
+- `PROFILES` is now `["default"]` — a last-resort fallback only. The binary ships
+  publicly and must not carry one operator's profile names; the real fleet is
+  enumerated from disk.
+- 34 tests (was 29).
+
+## [0.3.1] - 2026-10-19
+
+### Fixed
+
+- **The process probe failed open.** `process_running() -> bool` answered `false`
+  when `tasklist` could not run, exited non-zero, or printed anything it did not
+  understand — so a broken probe read as "the Desktop app is closed" and the
+  update proceeded against a locked `state.db`. The probe is now tri-state
+  (`Running` / `Absent` / `Unknown`) and `Unknown` blocks the preflight.
+- **`--close-desktop` gave up after one forced kill and a fixed 6 s sleep.**
+  It now asks gracefully, waits, escalates to a forced stop, waits again, and on
+  failure reports the surviving PIDs instead of "still running after kill".
+- **`PROFILES` shipped one operator's profile names** (including client names) in
+  a public binary. The fallback is now `["default"]`.
+
+### Added
+
+- `preflight` prints the guard's own version and binary path, so a stale
+  `~/.cargo/bin` copy cannot masquerade as the current build.
+- Unit tests for the CSV parser (exact image match, prose rejection) and for the
+  bounded wait (unknown, timeout, exit).
+
 ## [0.3.0] - 2026-10-17
 
 ### Added
