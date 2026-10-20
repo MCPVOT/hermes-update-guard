@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-21
+
+### Added
+
+- `retire <profile>` (and `--undo`): records that a profile is **gone on purpose**
+  in `backups/profile-retired.json`, with the date and the last backup that saw it.
+  `self-check` stops flagging it as missing.
+
+  This is the counterpart to the vanished-profile check added in 0.3.2. An
+  intentional deletion and an accidental one look identical on disk, and a checker
+  that keeps reporting a decision the operator already made is a checker people
+  learn to ignore. Like `bless`, the reference moves only on an explicit operator
+  action, never as a side effect of a check.
+
+  It refuses to retire a profile that still exists on disk — hiding a live profile
+  from the fleet checks is the exact failure this tool exists to prevent.
+
+### Notes
+
+- 36 tests (was 34).
+
 ## [0.3.2] - 2026-10-21
 
 ### Fixed

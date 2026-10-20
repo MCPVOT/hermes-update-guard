@@ -93,6 +93,7 @@ cargo build --release         # or run target/release/hermes-update-guard
 | `bless` | Approve the **current** live provider surface as the golden reference (an explicit operator decision, not a side effect of a check) | none |
 | `health` | Transcript / context-health audit per profile — live-vs-duplicate rows, bloat, stuck sessions (`--profile <name>` for one) | `exit 1` when a profile is problematic |
 | `quarantine` | Move stale `.hermes-update*` markers into `backups/update-state-quarantine/<stamp>/`. Prints the plan; `--apply` moves. Treats the markers as a *set* and refuses everything if any owner pid is live or unverifiable | none unless `--apply` |
+| `retire <profile>` | Record that a profile is **gone on purpose**, so `self-check` stops flagging it as missing (`--undo` restores the flag). Refuses if the profile still exists on disk | none |
 | `self-check` | Is the binary you are running the one you think? PATH resolution, stale clones, repo vs installed build, the fleet, **profiles that vanished since an earlier backup**, context health | `exit 1` when something needs attention |
 | `vibe` | Print the MCPVOT identity banner | none |
 

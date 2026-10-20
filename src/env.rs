@@ -89,10 +89,26 @@ pub fn profiles(home: &Path) -> Vec<String> {
 /// list. A profile that disappears between two updates (deleted, half-restored,
 /// moved aside) used to vanish from the fleet silently — it simply stopped
 /// appearing — and every command still reported success.
-pub fn profiles_gone_since_backup(home: &Path) -> Vec<String> {
+pub fn profiles_gone_since_backup(
+    home: &Path,
+    retired: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let now = profiles(home);
+    last_seen_in_backups(home)
+        .into_iter()
+        .filter(|(n, _)| !now.iter().any(|x| x == n) && !retired.contains(n))
+        .map(|(n, s)| format!("{} (last seen {})", n, s.trim_start_matches("pre-update-")))
+        .collect()
+}
+
+/// Newest `pre-update-*` backup stamp in which each profile directory appears.
+///
+/// A profile can disappear between two updates, and if it is already gone from the
+/// newest backup a latest-only comparison never sees it, so every backup is scanned.
+pub fn last_seen_in_backups(home: &Path) -> std::collections::BTreeMap<String, String> {
     let backups = home.join("backups");
     let Ok(rd) = std::fs::read_dir(&backups) else {
-        return Vec::new();
+        return Default::default();
     };
     let mut dirs: Vec<(String, PathBuf)> = rd
         .flatten()
@@ -128,12 +144,7 @@ pub fn profiles_gone_since_backup(home: &Path) -> Vec<String> {
         }
     }
 
-    let now = profiles(home);
     last_seen
-        .into_iter()
-        .filter(|(n, _)| !now.iter().any(|x| x == n))
-        .map(|(n, s)| format!("{} (last seen {})", n, s.trim_start_matches("pre-update-")))
-        .collect()
 }
 
 /// Profile directories that exist but have NO `config.yaml`.
@@ -862,8 +873,9 @@ mod tests {
         std::fs::create_dir_all(old.join("elevate")).unwrap();
         std::fs::write(old.join("elevate/state.db"), "x").unwrap();
 
+        let none = std::collections::BTreeSet::new();
         assert_eq!(
-            profiles_gone_since_backup(&home),
+            profiles_gone_since_backup(&home, &none),
             vec![
                 "ancient (last seen 20250101-000000)".to_string(),
                 "elevate (last seen 20260101-000000)".to_string(),
@@ -871,11 +883,19 @@ mod tests {
             "every backup is scanned, and the newest sighting wins"
         );
 
+        // a RETIRED profile is an operator decision, not an anomaly
+        let retired: std::collections::BTreeSet<String> =
+            ["elevate".to_string()].into_iter().collect();
+        assert_eq!(
+            profiles_gone_since_backup(&home, &retired),
+            vec!["ancient (last seen 20250101-000000)".to_string()]
+        );
+
         // no backups at all -> nothing claimed
         let bare = std::env::temp_dir().join(format!("hug-bare-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&bare);
         std::fs::create_dir_all(&bare).unwrap();
-        assert!(profiles_gone_since_backup(&bare).is_empty());
+        assert!(profiles_gone_since_backup(&bare, &none).is_empty());
 
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&bare);
