@@ -73,7 +73,13 @@ pub fn run(home: &Path) -> Result<()> {
         // Ask for the branch first, and never let an error string become a number.
         let (_, branch_raw) = env::run_capture(
             Path::new("git"),
-            &["-C", repo.to_str().unwrap(), "rev-parse", "--abbrev-ref", "HEAD"],
+            &[
+                "-C",
+                repo.to_str().unwrap(),
+                "rev-parse",
+                "--abbrev-ref",
+                "HEAD",
+            ],
             None,
         )
         .unwrap_or((-1, "?".into()));
@@ -99,7 +105,11 @@ pub fn run(home: &Path) -> Result<()> {
         println!("  HEAD     : {}", head.trim());
         println!(
             "  branch   : {}",
-            if branch == "HEAD" { "(detached)" } else { branch.as_str() }
+            if branch == "HEAD" {
+                "(detached)"
+            } else {
+                branch.as_str()
+            }
         );
         println!("  behind   : {}", behind);
         println!("  stashes  : {}", stashes.lines().count());
@@ -212,7 +222,10 @@ pub fn run(home: &Path) -> Result<()> {
     let mut custom = false;
     for p in env::profiles(home) {
         if let Some(e) = crate::context_health::custom_compression_engine(home, &p) {
-            println!("  ! {}: custom engine '{}' (built-in summariser bypassed)", p, e);
+            println!(
+                "  ! {}: custom engine '{}' (built-in summariser bypassed)",
+                p, e
+            );
             custom = true;
         }
     }

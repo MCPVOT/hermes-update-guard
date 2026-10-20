@@ -137,13 +137,22 @@ pub fn run(home: &Path, repo: Option<&Path>) -> Result<()> {
             if let Some(v) = read_repo_version(&rp) {
                 println!("  repo version: {}", v);
                 if v != env!("CARGO_PKG_VERSION") {
-                    println!("  ! repo version differs from this build ({})", env!("CARGO_PKG_VERSION"));
+                    println!(
+                        "  ! repo version differs from this build ({})",
+                        env!("CARGO_PKG_VERSION")
+                    );
                     problems = true;
                 }
             }
             let (code, head) = env::run_capture(
                 Path::new("git"),
-                &["-C", rp.to_str().unwrap_or("."), "rev-parse", "--short", "HEAD"],
+                &[
+                    "-C",
+                    rp.to_str().unwrap_or("."),
+                    "rev-parse",
+                    "--short",
+                    "HEAD",
+                ],
                 None,
             )
             .unwrap_or((-1, "?".into()));
@@ -165,12 +174,19 @@ pub fn run(home: &Path, repo: Option<&Path>) -> Result<()> {
             }
             // Is the INSTALLED binary older than the repo's own build?
             let repo_bin = if cfg!(windows) {
-                rp.join("target").join("release").join("hermes-update-guard.exe")
+                rp.join("target")
+                    .join("release")
+                    .join("hermes-update-guard.exe")
             } else {
-                rp.join("target").join("release").join("hermes-update-guard")
+                rp.join("target")
+                    .join("release")
+                    .join("hermes-update-guard")
             };
             if repo_bin.is_file() {
-                if let (Some(inst), Some(rep)) = (on_path.as_ref().and_then(|b| mtime_of(b)), mtime_of(&repo_bin)) {
+                if let (Some(inst), Some(rep)) = (
+                    on_path.as_ref().and_then(|b| mtime_of(b)),
+                    mtime_of(&repo_bin),
+                ) {
                     if rep > inst {
                         println!(
                             "  ! the repo's build is NEWER than the installed binary - reinstall before trusting a preflight"
@@ -182,7 +198,10 @@ pub fn run(home: &Path, repo: Option<&Path>) -> Result<()> {
                 }
             }
         } else {
-            println!("  repo        : {} (not a directory - ignored)", rp.display());
+            println!(
+                "  repo        : {} (not a directory - ignored)",
+                rp.display()
+            );
         }
     } else {
         println!("  repo        : (not set - pass --repo or set HERMES_GUARD_REPO to compare against a checkout)");
@@ -191,7 +210,28 @@ pub fn run(home: &Path, repo: Option<&Path>) -> Result<()> {
     // 4. the fleet and the health verdict
     println!("  hermes home : {}", home.display());
     let fleet = env::profiles(home);
-    println!("  fleet       : {} ({} profiles)", fleet.join(", "), fleet.len());
+    println!(
+        "  fleet       : {} ({} profiles)",
+        fleet.join(", "),
+        fleet.len()
+    );
+    let missing = env::profiles_gone_since_backup(home);
+    if !missing.is_empty() {
+        println!(
+            "  ! profile(s) present in an earlier backup but ABSENT now: {} - deleted, or never restored (recover from backups/pre-update-*)",
+            missing.join(", ")
+        );
+        problems = true;
+    }
+    let no_cfg = env::profiles_without_config(home);
+    if !no_cfg.is_empty() {
+        println!(
+            "  ! {} profile dir(s) have NO config.yaml: {} - no drift protection, and a half-restored profile looks like this",
+            no_cfg.len(),
+            no_cfg.join(", ")
+        );
+        problems = true;
+    }
     println!();
     if crate::context_health::report(home)? {
         problems = true;

@@ -1,4 +1,4 @@
-﻿use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::env;
@@ -122,14 +122,17 @@ pub fn run(home: &Path) -> Result<()> {
             } else if now.same_as(b) {
                 println!("  ! context health unchanged - PRE-EXISTING condition, not caused by this update");
             } else {
-                println!("  ok   context health improved (or unchanged) since the pre-update baseline");
+                println!(
+                    "  ok   context health improved (or unchanged) since the pre-update baseline"
+                );
             }
         }
         None => {
             if crate::context_health::report(home)? {
                 println!("  FAIL context health problems (see table above) - no pre-update baseline to attribute them to");
                 failures.push(
-                    "context health: duplicate live rows / archive bloat / stuck sessions".to_string(),
+                    "context health: duplicate live rows / archive bloat / stuck sessions"
+                        .to_string(),
                 );
             } else {
                 println!("  ok   context health clean");
@@ -158,7 +161,10 @@ pub fn run(home: &Path) -> Result<()> {
                         env::ProcState::Running => {}
                         env::ProcState::Absent => {
                             println!("  FAIL gateway_state.json claims pid {} is running, but that process is gone", pid);
-                            failures.push(format!("gateway pid {} is dead but recorded as running", pid));
+                            failures.push(format!(
+                                "gateway pid {} is dead but recorded as running",
+                                pid
+                            ));
                         }
                         env::ProcState::Unknown(why) => {
                             println!("  ! could not determine whether gateway pid {} is alive ({}): treat as suspect", pid, why);
@@ -470,7 +476,13 @@ pub fn head_sha(home: &Path) -> Option<String> {
     let repo = home.join("hermes-agent");
     let (code, out) = env::run_capture(
         Path::new("git"),
-        &["-C", repo.to_str().unwrap_or("."), "rev-parse", "--short", "HEAD"],
+        &[
+            "-C",
+            repo.to_str().unwrap_or("."),
+            "rev-parse",
+            "--short",
+            "HEAD",
+        ],
         None,
     )
     .ok()?;

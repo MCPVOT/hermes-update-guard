@@ -1,7 +1,7 @@
 ---
 name: hermes-update-guard
 description: Use when running or verifying a `hermes update`, or after a failed update left a stale lock — drives the guarded pipeline (preflight, WAL-safe backup, provider-drift tripwire, post-verify) through the hermes-update-guard binary.
-version: 0.3.1
+version: 0.3.2
 author: MCPVOT
 license: MIT
 platforms: [macos, linux, windows]
@@ -184,6 +184,16 @@ local build). If it is not installed:
 - **Reading a clean tree as "nothing was pinned"** → a clean tree with no stash
   entries is also what a *dropped* patch looks like. `verify` now compares against
   the file list in the newest `pre-update-*/working-tree.patch`.
+- **Quarantining an empty `.lock` while an update is live** → the empty lock has no
+  pid, so judging it on its own says "dead". `quarantine` treats the markers as a
+  SET: if any owner is live *or the probe cannot answer*, nothing is moved.
+- **Trusting the fleet to show a missing profile** → the fleet comes from disk, so a
+  deleted half-restored profile just stops appearing. `self-check` compares against
+  every `pre-update-*` backup and reports profiles that were there but are gone,
+  with the newest stamp that saw them.
+- **Running a stale guard** → `self-check` resolves the binary on PATH, compares it
+  with the repo build and flags stale clones, because a stale guard reports a clean
+  preflight for a version that no longer exists.
 - **Assuming `export` approved the surface** → it does not. `export` only
   snapshots; the approved reference moves on `bless` alone. An export that
   re-blessed golden would quietly adopt a rogue rewrite as the new approved state.

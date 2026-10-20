@@ -176,8 +176,14 @@ pub fn bless(home: &Path) -> Result<()> {
         );
     }
     let n = agg.len();
-    std::fs::write(&golden_path, serde_json::to_string_pretty(&Value::Object(agg))?)?;
-    println!("golden.json blessed from live surface ({} profiles aggregated)", n);
+    std::fs::write(
+        &golden_path,
+        serde_json::to_string_pretty(&Value::Object(agg))?,
+    )?;
+    println!(
+        "golden.json blessed from live surface ({} profiles aggregated)",
+        n
+    );
     println!("  previous golden kept as golden.json.bak-{}", stamp);
     Ok(())
 }
@@ -470,7 +476,8 @@ mod tests {
     /// The aggregate golden.json shape ({profile: {surface}}) must resolve to
     /// that profile's surface, not to the wrapper object.
     #[test]
-    fn baseline_surface_resolves_aggregate_and_flat() {        let dir = std::env::temp_dir().join("hug-test-baseline");
+    fn baseline_surface_resolves_aggregate_and_flat() {
+        let dir = std::env::temp_dir().join("hug-test-baseline");
         std::fs::create_dir_all(&dir).unwrap();
         let agg = dir.join("golden.json");
         std::fs::write(

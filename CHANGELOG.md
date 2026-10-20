@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-21
+
+### Fixed
+
+- **CI was red:** `cargo fmt --all -- --check` failed across 25 positions left by
+  the 0.3.1 work, so every push would have failed the `check` job. Formatted.
+- **`quarantine` could move a live update's marker.** Only a marker that carries a
+  pid could be judged live, and an empty `.lock` (the most common leftover) has no
+  pid at all — so it was always movable. Markers are now treated as a SET: if any
+  owner in the home is live *or unverifiable*, nothing is moved. `ProcState::Unknown`
+  is a hold, not a pass.
+- **A profile could vanish without a word.** The fleet is discovered from disk, so a
+  deleted or half-restored profile simply stops appearing and every command still
+  reports success. `self-check` now scans every `pre-update-*` backup and reports
+  profiles that were present then but are absent now, with the newest stamp that
+  saw them. Measured on the live install: `elevate (last seen 20261016-135956)`.
+- **Profile directories without `config.yaml` were dropped from the fleet**, so a
+  half-restored profile was backed up by nobody and verified by nobody. They are
+  now part of the fleet (their `state.db` is still backed up) and reported as an
+  anomaly by `self-check` and by `update`'s preflight.
+
+### Notes
+
+- `PROFILES` is now `["default"]` — a last-resort fallback only. The binary ships
+  publicly and must not carry one operator's profile names; the real fleet is
+  enumerated from disk.
+- 34 tests (was 29).
+
 ## [0.3.1] - 2026-10-19
 
 ### Fixed

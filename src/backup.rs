@@ -49,7 +49,9 @@ pub fn run_with(home: &Path, dry_run: bool, on_db: &mut dyn FnMut(&str, bool)) -
             free / 1_073_741_856,
             needed_with_headroom as f64 / 1_073_741_856.0
         ),
-        None => println!("  disk: free space unknown - proceeding (cannot prove the volume can take it)"),
+        None => println!(
+            "  disk: free space unknown - proceeding (cannot prove the volume can take it)"
+        ),
     }
     if dry_run {
         println!("[dry-run] plan only - nothing written");

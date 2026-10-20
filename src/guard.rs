@@ -1,4 +1,4 @@
-﻿use anyhow::{bail, Result};
+use anyhow::{bail, Result};
 use std::path::Path;
 
 use crate::backup;
@@ -138,6 +138,16 @@ fn run_stages(
                 st.blocker(&format!("stale marker {m}"));
             }
         }
+        let no_cfg = env::profiles_without_config(home);
+        if !no_cfg.is_empty() {
+            println!(
+                "  [warn] {} profile dir(s) have no config.yaml: {}",
+                no_cfg.len(),
+                no_cfg.join(", ")
+            );
+            st.blocker(&format!("{} profile(s) without config.yaml", no_cfg.len()));
+        }
+
         let stale = crate::preflight::stale_receipts(home);
         if !stale.is_empty() {
             for s in &stale {
@@ -219,7 +229,9 @@ fn run_stages(
             st.blocker("no hermes CLI found");
             st.stage("update", StageState::Failed);
             let _ = st.write(home);
-            bail!("no hermes CLI found (venv, PATH, ~/.local/bin, /usr/local/bin) â€” cannot update")
+            bail!(
+                "no hermes CLI found (venv, PATH, ~/.local/bin, /usr/local/bin) â€” cannot update"
+            )
         }
     };
     println!("  using {}", hermes.display());
@@ -271,8 +283,8 @@ fn run_stages(
                 );
                 st.blocker(&format!("gateway pid {} was down after the update", g.pid));
                 if let Some(h) = env::resolve_hermes(home) {
-                    let (code, out) =
-                        env::run_capture(&h, &["gateway", "restart"], None).unwrap_or((-1, String::new()));
+                    let (code, out) = env::run_capture(&h, &["gateway", "restart"], None)
+                        .unwrap_or((-1, String::new()));
                     for l in out.lines().take(8) {
                         println!("    {}", l.trim());
                     }

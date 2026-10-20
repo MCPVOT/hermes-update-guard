@@ -67,8 +67,10 @@ pub fn profiles(home: &Path) -> Vec<String> {
     if let Ok(rd) = std::fs::read_dir(home.join("profiles")) {
         let mut names: Vec<String> = rd
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().join("config.yaml").is_file())
+            .filter(|e| e.path().is_dir())
             .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            // `.deleted` is Hermes' tombstone directory, not a profile
+            .filter(|n| !n.starts_with('.'))
             .collect();
         names.sort();
         names.dedup();
@@ -78,6 +80,73 @@ pub fn profiles(home: &Path) -> Vec<String> {
         out = PROFILES.iter().map(|s| s.to_string()).collect();
     }
     out
+}
+
+/// Profiles that were present in the newest pre-update backup but are ABSENT now.
+///
+/// Operator-agnostic on purpose: the public binary carries no profile names, so
+/// this compares the home against the guard's own history instead of a hardcoded
+/// list. A profile that disappears between two updates (deleted, half-restored,
+/// moved aside) used to vanish from the fleet silently — it simply stopped
+/// appearing — and every command still reported success.
+pub fn profiles_gone_since_backup(home: &Path) -> Vec<String> {
+    let backups = home.join("backups");
+    let Ok(rd) = std::fs::read_dir(&backups) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<(String, PathBuf)> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter_map(|p| {
+            let name = p.file_name()?.to_str()?.to_string();
+            name.starts_with("pre-update-").then_some((name, p))
+        })
+        .collect();
+    dirs.sort();
+
+    // Newest stamp per profile, across EVERY backup — not just the latest one.
+    // A profile can disappear between two updates, and if it is already gone from
+    // the newest backup the latest-only comparison never sees it.
+    let mut last_seen: std::collections::BTreeMap<String, String> = Default::default();
+    for (stamp, dir) in &dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if !(p.is_dir() && (p.join("state.db").exists() || p.join("config.yaml").exists())) {
+                continue;
+            }
+            let Some(name) = e.file_name().to_str().map(|s| s.to_string()) else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            last_seen.insert(name, stamp.clone()); // sorted, so this ends at the newest
+        }
+    }
+
+    let now = profiles(home);
+    last_seen
+        .into_iter()
+        .filter(|(n, _)| !now.iter().any(|x| x == n))
+        .map(|(n, s)| format!("{} (last seen {})", n, s.trim_start_matches("pre-update-")))
+        .collect()
+}
+
+/// Profile directories that exist but have NO `config.yaml`.
+///
+/// A directory-only filter used to decide the fleet, so a half-deleted or
+/// half-restored profile vanished from it: nobody backed it up, nobody verified
+/// it, and every command still reported success. Those profiles are now part of
+/// the fleet (their `state.db` still gets backed up) and reported here.
+pub fn profiles_without_config(home: &Path) -> Vec<String> {
+    profiles(home)
+        .into_iter()
+        .filter(|p| !config_yaml(home, p).is_file())
+        .collect()
 }
 
 /// Profile home directory: default lives at hermes home root, others under profiles/.
@@ -128,12 +197,8 @@ pub fn free_space_bytes(path: &Path) -> Option<u64> {
     }
     #[cfg(not(windows))]
     {
-        let (code, out) = run_capture(
-            Path::new("df"),
-            &["-Pk", &path.to_string_lossy()],
-            None,
-        )
-        .ok()?;
+        let (code, out) =
+            run_capture(Path::new("df"), &["-Pk", &path.to_string_lossy()], None).ok()?;
         if code != 0 {
             return None;
         }
@@ -542,7 +607,11 @@ fn request_close(image: &str, force: bool) -> Result<()> {
 
 /// Poll `probe` until it stops reporting `Running`, or `timeout` elapses.
 /// `Unknown` ends the wait immediately: continuing would mean guessing.
-pub fn wait_gone<F: FnMut() -> ProcState>(mut probe: F, timeout: std::time::Duration, step: std::time::Duration) -> ProcState {
+pub fn wait_gone<F: FnMut() -> ProcState>(
+    mut probe: F,
+    timeout: std::time::Duration,
+    step: std::time::Duration,
+) -> ProcState {
     let start = std::time::Instant::now();
     loop {
         let state = probe();
@@ -583,9 +652,9 @@ pub fn close_process(
                 survivors: Vec::new(),
             })
         }
-        ProcState::Unknown(why) => bail!(
-            "cannot verify whether {image} is running ({why}) - treating it as running"
-        ),
+        ProcState::Unknown(why) => {
+            bail!("cannot verify whether {image} is running ({why}) - treating it as running")
+        }
         ProcState::Running => {}
     }
 
@@ -737,6 +806,72 @@ mod tests {
             std::time::Duration::from_millis(1),
         );
         assert_eq!(state, ProcState::Absent);
+    }
+
+    /// A profile directory without config.yaml must stay in the fleet (its
+    /// state.db still needs backing up) and be reported as an anomaly. Dropping
+    /// it made a half-deleted profile invisible to backup and verify alike.
+    #[test]
+    fn profiles_include_dirs_without_config_and_flag_them() {
+        let root = std::env::temp_dir().join(format!("hug-fleet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("profiles/alpha")).unwrap();
+        std::fs::create_dir_all(root.join("profiles/beta")).unwrap();
+        std::fs::create_dir_all(root.join("profiles/.deleted")).unwrap();
+        std::fs::write(root.join("profiles/alpha/config.yaml"), "model: {}\n").unwrap();
+
+        let fleet = profiles(&root);
+        assert_eq!(
+            fleet,
+            vec!["alpha".to_string(), "beta".to_string()],
+            ".deleted excluded, beta kept despite no config"
+        );
+        assert_eq!(profiles_without_config(&root), vec!["beta".to_string()]);
+        // no root config.yaml => no "default" entry
+        assert!(!fleet.contains(&"default".to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A profile present in the last backup but gone now must be reported, and
+    /// a home with no backup history must stay quiet (no false alarms).
+    #[test]
+    fn missing_profile_detected_from_backup_history() {
+        let home = std::env::temp_dir().join(format!("hug-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("profiles/mcpvot")).unwrap();
+        std::fs::write(home.join("config.yaml"), "model: {}\n").unwrap();
+
+        let bk = home.join("backups/pre-update-20260101-000000");
+        for p in ["default", "elevate", "mcpvot"] {
+            std::fs::create_dir_all(bk.join(p)).unwrap();
+            std::fs::write(bk.join(p).join("state.db"), "x").unwrap();
+        }
+        // newest backup wins: an older one must not be consulted
+        let old = home.join("backups/pre-update-20250101-000000");
+        std::fs::create_dir_all(old.join("ancient")).unwrap();
+        std::fs::write(old.join("ancient/state.db"), "x").unwrap();
+
+        // elevate appears in BOTH backups: the report must carry the NEWEST stamp
+        std::fs::create_dir_all(old.join("elevate")).unwrap();
+        std::fs::write(old.join("elevate/state.db"), "x").unwrap();
+
+        assert_eq!(
+            profiles_gone_since_backup(&home),
+            vec![
+                "ancient (last seen 20250101-000000)".to_string(),
+                "elevate (last seen 20260101-000000)".to_string(),
+            ],
+            "every backup is scanned, and the newest sighting wins"
+        );
+
+        // no backups at all -> nothing claimed
+        let bare = std::env::temp_dir().join(format!("hug-bare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(profiles_gone_since_backup(&bare).is_empty());
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&bare);
     }
 
     /// venv_holders_probe must report "unknown" (parsed=false) when there is no

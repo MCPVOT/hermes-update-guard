@@ -193,9 +193,8 @@ pub fn audit_profile(home: &Path, profile: &str) -> Health {
         "SELECT id, COALESCE(compression_failure_error,'') FROM sessions \
          WHERE compression_failure_error IS NOT NULL AND compression_failure_error <> ''",
     ) {
-        if let Ok(rows) = st.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        }) {
+        if let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
             for r in rows.flatten() {
                 h.stuck_sessions.push(r);
             }
@@ -277,11 +276,7 @@ pub fn report(home: &Path) -> Result<bool> {
             );
         }
         for (sid, est, msgs) in &h.largest {
-            let flag = if h
-                .at_risk
-                .iter()
-                .any(|(s, _, _)| s == sid)
-            {
+            let flag = if h.at_risk.iter().any(|(s, _, _)| s == sid) {
                 "  AT RISK - compact it"
             } else {
                 ""
@@ -442,7 +437,11 @@ pub fn readiness(home: &Path, profile: &str) -> Readiness {
     }
 
     // fallback chain (top-level list, or model.fallback list)
-    let fb_top = doc.get("fallback_providers").and_then(|v| v.as_sequence()).map(|s| s.len()).unwrap_or(0);
+    let fb_top = doc
+        .get("fallback_providers")
+        .and_then(|v| v.as_sequence())
+        .map(|s| s.len())
+        .unwrap_or(0);
     let fb_model = doc
         .get("model")
         .and_then(|m| m.get("fallback"))
@@ -531,7 +530,10 @@ pub fn readiness(home: &Path, profile: &str) -> Readiness {
 pub fn report_readiness(home: &Path, profile: &str) -> Result<bool> {
     let r = readiness(home, profile);
     println!("== PROFILE READINESS: {} ==", r.profile);
-    println!("  model           : {}/{}", r.model_provider, r.model_default);
+    println!(
+        "  model           : {}/{}",
+        r.model_provider, r.model_default
+    );
     if !r.base_url.is_empty() {
         println!("  base_url        : {}", r.base_url);
     }
