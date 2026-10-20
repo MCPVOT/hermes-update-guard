@@ -1,7 +1,7 @@
 ---
 name: hermes-update-guard
 description: Use when running or verifying a `hermes update`, or after a failed update left a stale lock — drives the guarded pipeline (preflight, WAL-safe backup, provider-drift tripwire, post-verify) through the hermes-update-guard binary.
-version: 0.3.0
+version: 0.3.1
 author: MCPVOT
 license: MIT
 platforms: [macos, linux, windows]
@@ -31,13 +31,17 @@ tripwire — the whole scripted update ritual in one static binary.
 | Task | Command |
 |---|---|
 | Peek before updating | `hermes-update-guard preflight` |
-| Pin the known-good surface | `hermes-update-guard export` |
+| Snapshot the current surface | `hermes-update-guard export` |
+| **Approve** the current surface as the golden reference | `hermes-update-guard bless` |
 | Prove no drift | `hermes-update-guard diff --baseline last-known` |
 | WAL-safe backup | `hermes-update-guard backup` |
 | Guarded update (all-in-one) | `hermes-update-guard update --close-desktop` |
 | Unattended update (survives a closed shell) | `hermes-update-guard update --close-desktop --detached` |
 | Watch a run live | `hermes-update-guard watch` (or `watch --no-tui` for a snapshot) |
 | Verify after | `hermes-update-guard verify` |
+| Transcript / context-health audit | `hermes-update-guard health` |
+| One profile in depth | `hermes-update-guard health --profile <name>` |
+| Is the binary I am running current? | `hermes-update-guard self-check` |
 | Identity banner | `hermes-update-guard vibe` |
 
 ## Procedure
@@ -49,13 +53,21 @@ tripwire — the whole scripted update ritual in one static binary.
    ```bash
    GUARD=hermes-update-guard
 
-   $GUARD preflight                        # read-only: any surprises?
-   $GUARD export                           # pin known-good provider surface
-   $GUARD diff --baseline last-known       # prove clean (exit 0)
-   $GUARD backup                           # WAL-safe snapshot of every profile
-   $GUARD update --close-desktop           # preflight -> export -> backup -> update -> verify
-   $GUARD verify                           # post-update integrity + drift
+   $GUARD self-check                      # is the binary I am running the current one?
+   $GUARD preflight                       # read-only: any surprises?
+   $GUARD health                          # transcript health: duplicate live rows, bloat, at-risk sessions
+   $GUARD export                          # snapshot the surface (does NOT move the approved baseline)
+   $GUARD diff --baseline last-known      # prove clean (exit 0)
+   $GUARD backup                          # WAL-safe snapshot of every profile
+   $GUARD update --close-desktop          # preflight -> export -> backup -> update -> verify
+   $GUARD verify                          # post-update integrity + drift
    ```
+
+   **`export` does NOT bless.** It snapshots the surface, advances `last-known/` and
+   writes the `last-export.txt` pointer. The APPROVED reference (`golden.json`) moves
+   only when a human runs `bless` — a routine export must never adopt whatever the
+   surface happened to be, or a silent rewrite becomes the new approved state (that is
+   exactly how the 2026-10-11/12 unknown-writer rewrite went unnoticed for two days).
 
    In an agent session (or anywhere the caller may time out), use
    `update --close-desktop --detached`: it starts the update in its own process
@@ -80,8 +92,35 @@ local build). If it is not installed:
   entries still present is a FAIL (the patched file was parked, not restored).
   `hermes_cli/models_catalog_static.py` is the usual such patch.
 - `preflight` → `[update receipts]` shows an unfinished receipt (`running` /
-  `interrupted`, `finished_at=null`) → **an update is already mid-flight**; a real
-  `hermes update` is owed before anything else. Never start a second one.
+  `interrupted`, `finished_at=null`): check the **pid**. `pid dead` = a stale receipt,
+  history, nothing in flight — the real update it owed was completed later, so it
+  does NOT block. `pid LIVE` = an update is genuinely running; never start a second.
+- `health --profile <name>` is the **readiness** view for one profile: model/provider,
+  the credential that provider actually uses (resolved through the profile's own
+  `providers.<name>.api_key_env` when it is a custom provider), fallback-chain
+  length, the compression engine, enabled MCP servers (and which are OAuth — the
+  v0.22.2 CLI-startup hang class), and the transcript's duplicate/bloat/stuck
+  counters. **A profile with `fallbacks: 0` has no resilience** — a rate-limited
+  or dead primary ends the turn, which is exactly how `default` and `polloriko`
+  went down on 402/429.
+- `health` reports **`dupUIDs > 0`** (the same logical message stored twice as live
+  rows) or a **bloat ratio** ≫ 1 → the transcript sent to the model is inflated, so
+  sessions hit the context wall early. `at risk` / `largest live` lines show which
+  sessions are closest to a 1M-token window. Report it; do not "fix" it by deleting
+  rows — repairing a transcript needs the gateway stopped and a verified backup.
+- `preflight` prints the **resolved update TARGET**. `TARGET : none - this update
+  would be a NO-OP` means the channel's newest release is already installed: the
+  repo can still be N commits behind origin/main, but on a release channel that
+  does not mean an update is pending.
+- `health` reports a **stuck session** (a recorded `compression_failure_error`) → that
+  session's summariser route is dead (quota/credits). Compaction cannot summarise
+  until the route works; a custom `context.engine` that does not summarise makes it
+  worse.
+- `self-check` flags a **stale installed binary** (PATH binary older than the repo
+  build, or a version mismatch) or a **clone under the Hermes `tools/` dir** → a
+  `cargo install` from that clone reinstalls the stale build, and a stale guard
+  reports a clean preflight for a version that no longer exists. Reinstall before
+  trusting any verdict.
 - `preflight` → `[venv holders]`:
   - `probe exit 3` = holders present, with pid/kind/exe listed. Wait for them.
   - `venv state UNKNOWN` = hermes answered the probe with prose instead of the
@@ -101,6 +140,18 @@ local build). If it is not installed:
 - `verify` is **fail-closed**: any check it cannot perform (unreadable HEAD,
   missing hermes CLI, no database found, missing baseline) is a failure, and the
   process exits `1`. Read the exit code, never just the last printed line.
+- `verify` **attributes** context-health problems: the run captures a health
+  snapshot before the update, so an unchanged condition is reported as
+  PRE-EXISTING (a warning) and only a regression fails the verdict. A standalone
+  `verify` with no baseline in the run state reports the full table instead.
+- `verify` also surfaces the newest **update receipt** (kind, outcome, pid) and
+  says plainly whether a recorded "interrupted" attempt is still live or is
+  history superseded by a later successful run.
+- `backup` has a **disk-space gate**: it measures the fleet's databases, asks for
+  1.5x + 512 MB, and refuses before copying if the volume cannot take it. The
+  fleet's DBs are large (one profile was measured at 2.0 GB; the fleet at
+  ~2.9 GB), so a backup is not a small operation.
+- `gateway_state.json` is not proof of life — `verify` checks the pid.
 - The profile fleet is discovered from the home on disk, not hardcoded, so the
   same binary works on a host with a different profile set (a droplet running
   `hoodbot/sentinel/solana/storemoat`). The hermes CLI is resolved through the
@@ -133,6 +184,16 @@ local build). If it is not installed:
 - **Reading a clean tree as "nothing was pinned"** → a clean tree with no stash
   entries is also what a *dropped* patch looks like. `verify` now compares against
   the file list in the newest `pre-update-*/working-tree.patch`.
+- **Assuming `export` approved the surface** → it does not. `export` only
+  snapshots; the approved reference moves on `bless` alone. An export that
+  re-blessed golden would quietly adopt a rogue rewrite as the new approved state.
+- **Trusting a guard you did not check the version of** → a stale binary on PATH
+  (older than the repo build, or a different version) will happily print a clean
+  preflight. Run `self-check` first; it is the check that would have caught the
+  2026-10-19 "the tool guarding it was not the one you were running" incident.
+- **Reading `gateway_state.json` as proof the gateway is alive** → the file
+  outlives the process it describes. `verify` now checks the pid; a recorded
+  "running" gateway with a dead pid is a FAIL, not a warning to ignore.
 
 ## Manual restore (emergency)
 

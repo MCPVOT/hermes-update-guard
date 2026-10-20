@@ -30,7 +30,26 @@ pub fn run(home: &Path) -> Result<()> {
     let (ccode, cout) = env::run_capture(&hermes, &["update", "--check"], None)
         .unwrap_or((-1, "cannot run hermes update --check".into()));
     println!("\n[update --check] (exit {})", ccode);
-    println!("  {}", cout.trim().lines().next().unwrap_or("(empty)"));
+    for l in cout.trim().lines().take(4) {
+        println!("  {}", l);
+    }
+    // What will the update actually install? "Up to date" is ambiguous: the
+    // channel decides the target, and the repo can still be N commits behind
+    // origin/main without that mattering (stable tracks releases, not main).
+    let target = cout
+        .lines()
+        .find(|l| l.contains("Selected release available") || l.contains("Update available"))
+        .map(|l| l.trim().to_string());
+    match target {
+        Some(t) => println!("  TARGET : {}", t),
+        None => {
+            if cout.contains("Up to date") || cout.contains("No newer release") {
+                println!(
+                    "  TARGET : none - this update would be a NO-OP (already on the newest release)"
+                );
+            }
+        }
+    }
 
     // git state
     let repo = home.join("hermes-agent");
@@ -177,6 +196,29 @@ pub fn run(home: &Path) -> Result<()> {
     // provider drift status (read-only)
     println!("\n[provider surface drift]");
     drift_summary(home)?;
+
+    // ---- context health -----------------------------------------------------
+    // The transcript is a first-class health signal: a healthy DB can still be a
+    // dying session. On 2026-10-19 the fleet carried 1,785 duplicate live rows
+    // (2 active rows per message_uid) and 5.2x archive bloat - the actual cause
+    // of the five-week "context too long" incident, invisible to a surface-only
+    // tripwire.
+    println!();
+    let _ = crate::context_health::report(home)?;
+
+    // A custom compression engine bypasses the built-in summariser. If the
+    // summariser's route is also dead, the fleet cannot compress at all.
+    println!("\n[compression engine]");
+    let mut custom = false;
+    for p in env::profiles(home) {
+        if let Some(e) = crate::context_health::custom_compression_engine(home, &p) {
+            println!("  ! {}: custom engine '{}' (built-in summariser bypassed)", p, e);
+            custom = true;
+        }
+    }
+    if !custom {
+        println!("  (built-in everywhere)");
+    }
 
     // gateway state (root)
     let gw = home.join("gateway_state.json");

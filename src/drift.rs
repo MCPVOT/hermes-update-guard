@@ -8,11 +8,16 @@ use crate::env;
 
 /// Surface keys — verbatim from hermes-provider-drift.ps1 (SURFACE_KEYS).
 /// Also protects the language keys the operator flagged (updates must never flip English away).
-pub const SURFACE_KEYS: [&str; 12] = [
+pub const SURFACE_KEYS: [&str; 13] = [
     "model.provider",
     "model.default",
     "model.base_url",
     "model.api_key",
+    // The fallback CHAIN. Profiles use two different shapes for it: a `model.fallback`
+    // list inside the model block, and the top-level `fallback_providers` /
+    // `fallback_model` keys. Watching only the latter left a whole fallback
+    // chain unwatched - a silent rewrite of it would never be reported.
+    "model.fallback",
     "auxiliary",
     "fallback_providers",
     "fallback_model",
@@ -127,9 +132,42 @@ pub fn export(home: &Path) -> Result<()> {
     std::fs::write(surface.join("last-export.txt"), &stamp)?;
     println!("last-known advanced to {}; pointer written", stamp);
 
-    // Refresh the aggregate golden.json (the shape the PS1 exporter writes too)
-    // so `--baseline golden` stays current; the previous one is kept as a .bak
-    // rather than dropped.
+    // NOTE: export does NOT touch golden.json.
+    //
+    // golden.json is the OPERATOR-APPROVED reference - the state every drift
+    // verdict is measured against. Refreshing it here (as an earlier version
+    // did) means a routine pre-update snapshot silently moves the approved
+    // baseline to whatever the surface happened to be, which is exactly how the
+    // 2026-10-11/12 "unknown writer" rewrite went unnoticed for two days: the
+    // baseline followed the rewrite instead of catching it. The approved
+    // baseline moves only via the explicit `bless` command.
+    println!("golden.json untouched (approved baseline moves only via `bless`)");
+    Ok(())
+}
+
+/// Move the APPROVED baseline (golden.json) to the current live surface.
+///
+/// Deliberate operator action - this is the only thing that should ever
+/// re-bless the reference. The previous golden is kept as a .bak.
+pub fn bless(home: &Path) -> Result<()> {
+    let surface = home.join("backups").join("provider-surface");
+    let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let stamp_dir = surface.join(&stamp);
+    std::fs::create_dir_all(&stamp_dir)?;
+
+    let mut agg = serde_json::Map::new();
+    for p in env::profiles(home).iter().map(|s| s.as_str()) {
+        let cfg = env::config_yaml(home, p);
+        if !cfg.exists() {
+            continue;
+        }
+        let surface_val = extract_surface(&cfg)?;
+        std::fs::write(
+            stamp_dir.join(format!("{}.json", p)),
+            serde_json::to_string_pretty(&surface_val)?,
+        )?;
+        agg.insert(p.to_string(), surface_val);
+    }
     let golden_path = surface.join("golden.json");
     if golden_path.exists() {
         let _ = std::fs::copy(
@@ -137,21 +175,10 @@ pub fn export(home: &Path) -> Result<()> {
             surface.join(format!("golden.json.bak-{}", stamp)),
         );
     }
-    let mut agg = serde_json::Map::new();
-    for p in env::profiles(home).iter().map(|s| s.as_str()) {
-        let f = stamp_dir.join(format!("{}.json", p));
-        if f.exists() {
-            if let Ok(v) = read_json_file(&f) {
-                agg.insert(p.to_string(), v);
-            }
-        }
-    }
-    let n_profiles = agg.len();
-    std::fs::write(
-        &golden_path,
-        serde_json::to_string_pretty(&Value::Object(agg))?,
-    )?;
-    println!("golden.json refreshed ({} profiles aggregated)", n_profiles);
+    let n = agg.len();
+    std::fs::write(&golden_path, serde_json::to_string_pretty(&Value::Object(agg))?)?;
+    println!("golden.json blessed from live surface ({} profiles aggregated)", n);
+    println!("  previous golden kept as golden.json.bak-{}", stamp);
     Ok(())
 }
 
@@ -331,9 +358,16 @@ pub fn compare_against(home: &Path, base: &Path) -> Vec<String> {
         match baseline_surface(base, p) {
             Ok(None) => continue,
             Ok(Some(basev)) => {
+                // Normalize missing <-> null on BOTH sides before comparing. The live extract
+                // always emits every watched key (null when absent); a baseline written before
+                // a key was watched simply has no such key. serde treats Some(Null) != None, so
+                // without this every profile false-flags the moment a key is added to the set.
                 let profile_drift: Vec<&str> = SURFACE_KEYS
                     .iter()
-                    .filter(|k| live.get(*k) != basev.get(*k))
+                    .filter(|k| {
+                        live.get(*k).cloned().unwrap_or(Value::Null)
+                            != basev.get(*k).cloned().unwrap_or(Value::Null)
+                    })
                     .copied()
                     .collect();
                 if profile_drift.is_empty() {
@@ -377,9 +411,84 @@ mod tests {
 
     #[test]
     fn surface_keys_stable() {
-        assert_eq!(SURFACE_KEYS.len(), 12);
+        assert_eq!(SURFACE_KEYS.len(), 13);
         assert!(SURFACE_KEYS.contains(&"model.provider"));
         assert!(SURFACE_KEYS.contains(&"display.language"));
+        // The fallback chain must be watched in BOTH shapes profiles use.
+        assert!(SURFACE_KEYS.contains(&"model.fallback"));
+        assert!(SURFACE_KEYS.contains(&"fallback_providers"));
+    }
+
+    /// `export` must NEVER move the approved baseline. A routine pre-update
+    /// snapshot that re-blesses golden.json lets a rogue rewrite become the
+    /// new approved state - the 2026-10-11/12 "unknown writer" pattern, which
+    /// the drift tripwire then stayed quiet about. Only `bless` may move it.
+    #[test]
+    fn export_does_not_touch_golden() {
+        let home = std::env::temp_dir().join("hug-test-export-golden");
+        let _ = std::fs::remove_dir_all(&home);
+        let surface = home.join("backups").join("provider-surface");
+        std::fs::create_dir_all(&surface).unwrap();
+        let golden = surface.join("golden.json");
+        let before = r#"{"default":{"model.provider":"openrouter"}}"#;
+        std::fs::write(&golden, before).unwrap();
+        // a home with a config.yaml so a profile is discovered
+        std::fs::write(
+            home.join("config.yaml"),
+            "model:\n  provider: nvidia\n  default: x\n",
+        )
+        .unwrap();
+
+        export(&home).unwrap();
+
+        let after = std::fs::read_to_string(&golden).unwrap();
+        assert_eq!(
+            after, before,
+            "export moved the approved baseline - drift could be silently adopted"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A baseline written BEFORE a key was watched has no such key; the live
+    /// extract always emits it (null). serde compares Some(Null) != None, so
+    /// without normalisation every profile false-flags the moment the key set
+    /// grows. Regression test for the 2026-10-19 false drift.
+    #[test]
+    fn missing_baseline_key_is_not_drift() {
+        let live: Value = serde_json::json!({
+            "model.provider": "openrouter",
+            "model.fallback": Value::Null,
+        });
+        let baseline: Value = serde_json::json!({ "model.provider": "openrouter" });
+        for k in SURFACE_KEYS {
+            let l = live.get(k).cloned().unwrap_or(Value::Null);
+            let b = baseline.get(k).cloned().unwrap_or(Value::Null);
+            assert_eq!(l, b, "key {} false-flags as drift", k);
+        }
+    }
+
+    /// The aggregate golden.json shape ({profile: {surface}}) must resolve to
+    /// that profile's surface, not to the wrapper object.
+    #[test]
+    fn baseline_surface_resolves_aggregate_and_flat() {        let dir = std::env::temp_dir().join("hug-test-baseline");
+        std::fs::create_dir_all(&dir).unwrap();
+        let agg = dir.join("golden.json");
+        std::fs::write(
+            &agg,
+            r#"{"alpha":{"model.provider":"openrouter"},"beta":{"model.provider":"nvidia"}}"#,
+        )
+        .unwrap();
+        let got = baseline_surface(&agg, "alpha").unwrap().unwrap();
+        assert_eq!(got["model.provider"], "openrouter");
+
+        let flat = dir.join("flat.json");
+        std::fs::write(&flat, r#"{"model.provider":"nvidia"}"#).unwrap();
+        let got = baseline_surface(&flat, "alpha").unwrap().unwrap();
+        assert_eq!(got["model.provider"], "nvidia");
+
+        // a profile the aggregate does not list has no baseline (not an error)
+        assert!(baseline_surface(&agg, "gamma").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

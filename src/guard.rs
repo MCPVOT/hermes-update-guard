@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+﻿use anyhow::{bail, Result};
 use std::path::Path;
 
 use crate::backup;
@@ -10,9 +10,15 @@ use crate::state::{RunState, StageState};
 ///
 /// Writes `backups/guard-run.json` at every stage transition so `watch` can render
 /// the run live without touching the updater.
-pub fn run(home: &Path, close_desktop: bool, force: bool, detached: bool) -> Result<()> {
+pub fn run(
+    home: &Path,
+    close_desktop: bool,
+    force: bool,
+    detached: bool,
+    channel: Option<&str>,
+) -> Result<()> {
     if detached {
-        return spawn_detached(home, close_desktop, force);
+        return spawn_detached(home, close_desktop, force, channel);
     }
 
     crate::vibe::print_compact(env!("CARGO_PKG_VERSION"));
@@ -22,14 +28,20 @@ pub fn run(home: &Path, close_desktop: bool, force: bool, detached: bool) -> Res
     st.seed_profiles(&env::profiles(home));
     let _ = st.write(home);
 
-    let result = run_stages(home, close_desktop, force, &mut st);
+    let result = run_stages(home, close_desktop, force, &mut st, channel);
 
     st.finish(if result.is_ok() { 0 } else { 1 });
     let _ = st.write(home);
     result
 }
 
-fn run_stages(home: &Path, close_desktop: bool, force: bool, st: &mut RunState) -> Result<()> {
+fn run_stages(
+    home: &Path,
+    close_desktop: bool,
+    force: bool,
+    st: &mut RunState,
+    channel: Option<&str>,
+) -> Result<()> {
     // ---- PREFLIGHT ---------------------------------------------------------
     st.stage("preflight", StageState::Active);
     let _ = st.write(home);
@@ -51,7 +63,7 @@ fn run_stages(home: &Path, close_desktop: bool, force: bool, st: &mut RunState) 
             st.stage("preflight", StageState::Failed);
             let _ = st.write(home);
             bail!(
-                "{} — update would refuse or strand the install. Stop them first.",
+                "{} â€” update would refuse or strand the install. Stop them first.",
                 msg
             );
         }
@@ -147,8 +159,8 @@ fn run_stages(home: &Path, close_desktop: bool, force: bool, st: &mut RunState) 
         }
         println!("  preflight gate passed");
     } else {
-        println!("  preflight gate SKIPPED (--force)");
-        st.blocker("preflight SKIPPED (--force)");
+        println!("  preflight gate SKIPPED (--skip-preflight)");
+        st.blocker("preflight SKIPPED (--skip-preflight)");
     }
     st.stage("preflight", StageState::Done);
     let _ = st.write(home);
@@ -188,6 +200,16 @@ fn run_stages(home: &Path, close_desktop: bool, force: bool, st: &mut RunState) 
     let _ = st.write(home);
 
     // ---- UPDATE ------------------------------------------------------------
+    // Capture the fleet's context health BEFORE the update. `verify` compares
+    // against it, so a transcript that was already broken is reported as
+    // pre-existing instead of being blamed on the update.
+    st.health_before = Some(crate::context_health::summarize(home));
+    if let Some(hb) = &st.health_before {
+        println!(
+            "  context health before update: dup_uids={} max_bloat={:.1}x stuck={} at_risk={}",
+            hb.dup_uids, hb.max_bloat, hb.stuck, hb.at_risk
+        );
+    }
     st.stage("update", StageState::Active);
     let _ = st.write(home);
     println!("\n-- HERMES UPDATE --");
@@ -197,11 +219,20 @@ fn run_stages(home: &Path, close_desktop: bool, force: bool, st: &mut RunState) 
             st.blocker("no hermes CLI found");
             st.stage("update", StageState::Failed);
             let _ = st.write(home);
-            bail!("no hermes CLI found (venv, PATH, ~/.local/bin, /usr/local/bin) — cannot update")
+            bail!("no hermes CLI found (venv, PATH, ~/.local/bin, /usr/local/bin) â€” cannot update")
         }
     };
     println!("  using {}", hermes.display());
-    let (code, out) = env::run_capture(&hermes, &["update", "--yes"], None)?;
+    // --channel is a TRANSIENT override for this run only (hermes keeps the
+    // persisted channel untouched), so a guarded run can pull the newest main
+    // without silently moving the install off its release channel.
+    let mut upd_args: Vec<&str> = vec!["update", "--yes"];
+    if let Some(ch) = channel {
+        println!("  channel override for this run only: {}", ch);
+        upd_args.push("--channel");
+        upd_args.push(ch);
+    }
+    let (code, out) = env::run_capture(&hermes, &upd_args, None)?;
 
     if !out.is_empty() {
         println!("{}", out);
@@ -251,7 +282,12 @@ fn run_stages(home: &Path, close_desktop: bool, force: bool, st: &mut RunState) 
 /// timeout, each leaving a marker that blocked every later command. A detached
 /// child outlives the shell that started it, so a closed lid or a timed-out agent
 /// call can no longer kill an update halfway through its build.
-fn spawn_detached(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
+fn spawn_detached(
+    home: &Path,
+    close_desktop: bool,
+    force: bool,
+    channel: Option<&str>,
+) -> Result<()> {
     use std::process::{Command, Stdio};
 
     let exe = std::env::current_exe()?;
@@ -269,6 +305,9 @@ fn spawn_detached(home: &Path, close_desktop: bool, force: bool) -> Result<()> {
     }
     if force {
         cmd.arg("--force");
+    }
+    if let Some(ch) = channel {
+        cmd.arg("--channel").arg(ch);
     }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::from(file.try_clone()?));

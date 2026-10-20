@@ -93,24 +93,152 @@ pub fn run(home: &Path) -> Result<()> {
     println!("  provider surface vs last export:");
     check_drift(home, &mut failures);
 
-    // ---- 6. gateway state ---------------------------------------------------
+    // ---- 6. context health --------------------------------------------------
+    // A guarded update must not report "VERIFY: PASS" over a transcript that
+    // is duplicated: duplicate live rows double the prompt, so the next
+    // session dies on "context length exceeded" hours later.
+    //
+    // Attribution: if the run captured a health baseline BEFORE the update, a
+    // condition that is unchanged is PRE-EXISTING (a warning, not a failure);
+    // only a regression the update introduced fails the verdict.
+    println!("  context health:");
+    let before = crate::state::RunState::read(home)
+        .ok()
+        .and_then(|st| st.health_before);
+    let now = crate::context_health::summarize(home);
+    println!(
+        "    now: dup_uids={} max_bloat={:.1}x stuck={} at_risk={}",
+        now.dup_uids, now.max_bloat, now.stuck, now.at_risk
+    );
+    match &before {
+        Some(b) => {
+            println!(
+                "    before update: dup_uids={} max_bloat={:.1}x stuck={} at_risk={}",
+                b.dup_uids, b.max_bloat, b.stuck, b.at_risk
+            );
+            if now.is_worse_than(b) {
+                println!("  FAIL context health got WORSE during the update");
+                failures.push("context health regressed during the update".to_string());
+            } else if now.same_as(b) {
+                println!("  ! context health unchanged - PRE-EXISTING condition, not caused by this update");
+            } else {
+                println!("  ok   context health improved (or unchanged) since the pre-update baseline");
+            }
+        }
+        None => {
+            if crate::context_health::report(home)? {
+                println!("  FAIL context health problems (see table above) - no pre-update baseline to attribute them to");
+                failures.push(
+                    "context health: duplicate live rows / archive bloat / stuck sessions".to_string(),
+                );
+            } else {
+                println!("  ok   context health clean");
+            }
+        }
+    }
+
+    // ---- 7. gateway state ---------------------------------------------------
     let gw = home.join("gateway_state.json");
     if gw.exists() {
         match std::fs::read_to_string(&gw)
             .context("gateway_state.json unreadable")
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).context("bad json"))
         {
-            Ok(js) => println!(
-                "  gateway : pid={} state={}",
-                js.get("pid").and_then(|v| v.as_u64()).unwrap_or(0),
-                js.get("gateway_state")
+            Ok(js) => {
+                let pid = js.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+                let st = js.get("gateway_state")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("?")
-            ),
+                    .unwrap_or("?");
+                println!("  gateway : pid={} state={}", pid, st);
+                // The state file can outlive the process it describes - a stale
+                // "running" gateway is indistinguishable from a healthy one
+                // unless the pid is checked. (It lied repeatedly in 2026-10.)
+                if pid > 0 && st == "running" {
+                    match env::pid_running(pid as u32) {
+                        env::ProcState::Running => {}
+                        env::ProcState::Absent => {
+                            println!("  FAIL gateway_state.json claims pid {} is running, but that process is gone", pid);
+                            failures.push(format!("gateway pid {} is dead but recorded as running", pid));
+                        }
+                        env::ProcState::Unknown(why) => {
+                            println!("  ! could not determine whether gateway pid {} is alive ({}): treat as suspect", pid, why);
+                        }
+                    }
+                }
+            }
             Err(e) => {
                 println!("  FAIL gateway_state.json: {}", e);
                 failures.push(format!("gateway state: {}", e));
             }
+        }
+    }
+
+    // ---- 8. the updater's own receipt ---------------------------------------
+    // verify proves HEAD/DBs/drift, but not whether the UPDATER reported success.
+    // The receipts are the operator's audit trail; surface the newest one.
+    let receipts = home.join("logs").join("update_receipts");
+    if receipts.is_dir() {
+        let mut newest: Option<(String, String, String, String)> = None; // (file, outcome, pid, started)
+        if let Ok(rd) = std::fs::read_dir(&receipts) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if !name.starts_with("update_") {
+                    continue;
+                }
+                let Ok(txt) = std::fs::read_to_string(e.path()) else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+                    continue;
+                };
+                let started = v
+                    .get("started_at")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let outcome = v
+                    .get("outcome")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let pid = v
+                    .get("pid")
+                    .and_then(|x| x.as_u64())
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "?".into());
+                let better = match &newest {
+                    None => true,
+                    Some((_, _, _, s)) => started > *s,
+                };
+                if better {
+                    newest = Some((name, outcome, pid, started));
+                }
+            }
+        }
+        match newest {
+            Some((name, outcome, pid, started)) => {
+                println!(
+                    "  receipt  : {} outcome={} pid={} started={}",
+                    name, outcome, pid, started
+                );
+                if outcome == "interrupted" || outcome == "running" {
+                    // A dead pid means history, not an update in flight - the work it owed
+                    // was completed by a later run. Say so instead of leaving it ambiguous.
+                    let state = pid
+                        .parse::<u32>()
+                        .map(env::pid_running)
+                        .unwrap_or(env::ProcState::Unknown("pid unreadable".into()));
+                    match state {
+                        env::ProcState::Running => {
+                            println!("  ! that update's pid is ALIVE - an update is genuinely in flight");
+                        }
+                        _ => println!(
+                            "    (pid dead - that attempt was superseded; the work it owed was completed later)"
+                        ),
+                    }
+                }
+            }
+            None => println!("  receipt  : none found (no update receipt in logs/update_receipts)"),
         }
     }
 

@@ -48,6 +48,10 @@ pub struct RunState {
     pub child_pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub finished_at: Option<String>,
+    /// Context health captured BEFORE the update, so `verify` can tell a
+    /// regression from a pre-existing condition.
+    #[serde(default)]
+    pub health_before: Option<crate::context_health::Summary>,
 }
 
 fn now() -> String {
@@ -83,6 +87,7 @@ impl RunState {
             guard_pid: std::process::id(),
             child_pid: None,
             exit_code: None,
+            health_before: None,
             finished_at: None,
         }
     }

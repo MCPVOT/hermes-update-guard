@@ -97,6 +97,69 @@ pub fn config_yaml(home: &Path, profile: &str) -> PathBuf {
     profile_dir(home, profile).join("config.yaml")
 }
 
+/// Free space on the volume that holds `path`, in bytes.
+///
+/// The fleet's state.db files are large (one profile was measured at 2.0 GB and the
+/// whole fleet at ~2.9 GB), so a backup can fill a disk. The gate needs real
+/// numbers, not a guess: `df -Pk` on POSIX, and the Windows shell's drive query.
+pub fn free_space_bytes(path: &Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        let drive = path
+            .components()
+            .next()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .unwrap_or_else(|| "C:".into());
+        let letter = drive.trim_end_matches(['\\', '/']).trim_end_matches(':');
+        if letter.is_empty() {
+            return None;
+        }
+        let script = format!("(Get-PSDrive -Name {}).Free", letter);
+        let (code, out) = run_capture(
+            Path::new("powershell"),
+            &["-NoProfile", "-Command", &script],
+            None,
+        )
+        .ok()?;
+        if code != 0 {
+            return None;
+        }
+        out.trim().parse::<f64>().ok().map(|f| f as u64)
+    }
+    #[cfg(not(windows))]
+    {
+        let (code, out) = run_capture(
+            Path::new("df"),
+            &["-Pk", &path.to_string_lossy()],
+            None,
+        )
+        .ok()?;
+        if code != 0 {
+            return None;
+        }
+        // df -Pk: Filesystem 1024-blocks Used Available Capacity Mounted
+        let line = out.lines().nth(1)?;
+        let avail_kb: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
+        Some(avail_kb * 1024)
+    }
+}
+
+/// Sum of the sizes of the files a backup would copy.
+pub fn dir_size_bytes(path: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(md) = std::fs::symlink_metadata(path) {
+        if md.is_file() {
+            return md.len();
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(path) {
+        for e in rd.flatten() {
+            total += dir_size_bytes(&e.path());
+        }
+    }
+    total
+}
+
 #[cfg(windows)]
 pub fn venv_hermes(home: &Path) -> PathBuf {
     home.join("hermes-agent")
