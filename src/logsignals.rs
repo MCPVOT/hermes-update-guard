@@ -1,0 +1,338 @@
+//! Log-signal signatures: what the fleet is actually logging, and whether an
+//! UPDATE caused it.
+//!
+//! WHY
+//!   The tripwires watch the provider surface and the transcript. Nobody was
+//!   watching the LOGS, and that is where the real damage shows: a
+//!   classic-PAT copilot probe logged ~5,900 warnings across four profiles in
+//!   16 hours, and two OAuth MCP servers logged ~1,200 failures because a
+//!   headless gateway cannot complete an interactive authorisation. Both were
+//!   invisible to every existing check.
+//!
+//! WHAT IT DOES
+//!   - `signatures()` groups every ERROR/WARNING/exception in the fleet's logs
+//!     into stable signatures (so a repeated failure counts once, not per line).
+//!   - `snapshot()` writes the counts to disk BEFORE an update, and
+//!     `diff_against()` reports which signatures are NEW afterwards, so the
+//!     verdict can attribute a regression to the update instead of guessing.
+//!   - `report()` prints the fleet's top noise sources.
+//!
+//! Read-only. It never writes to the Hermes home except the snapshot file
+//! (which lives under backups/, next to the other guard artefacts).
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// One grouped error/warning signature.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Signal {
+    pub label: String,
+    pub signature: String,
+    pub count: i64,
+    pub last_seen: String,
+}
+
+/// The fleet's log signature set: key = "<profile>|<signature>".
+pub type Signals = BTreeMap<String, Signal>;
+
+fn parse_ts(line: &str) -> Option<String> {
+    // "2026-10-21 14:36:00,123" or "2026-10-21T14:36:00Z" at the start of a line.
+    // Index 10 is the date/time separator: a SPACE or 'T', never ':'. Requiring ':'
+    // there (as an earlier version did) meant no timestamp ever parsed, so every
+    // signature reported an empty `last_seen`.
+    let s: String = line.chars().take(19).collect();
+    let c: Vec<char> = s.chars().collect();
+    if c.len() < 19 {
+        return None;
+    }
+    let ok = c[4] == '-'
+        && c[7] == '-'
+        && (c[10] == ' ' || c[10] == 'T')
+        && c[13] == ':'
+        && c[16] == ':'
+        && c.iter()
+            .all(|ch| ch.is_ascii_digit() || "-: T".contains(*ch));
+    ok.then_some(s)
+}
+
+/// Normalise a line into a stable signature: the shape of the problem, not its
+/// ids/timestamps/paths.
+fn normalise(line: &str) -> String {
+    let mut s = line.to_string();
+    // hex ids
+    let mut out = String::new();
+    let mut word = String::new();
+    let flush = |w: &str, out: &mut String| {
+        let wl = w.to_ascii_lowercase();
+        if wl.len() >= 8 && wl.chars().all(|c| c.is_ascii_hexdigit()) {
+            out.push_str("<hex>");
+        } else if w.len() >= 3 && w.chars().all(|c| c.is_ascii_digit()) {
+            out.push_str("<n>");
+        } else {
+            out.push_str(w);
+        }
+    };
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            flush(&word, &mut out);
+            out.push(' ');
+            word.clear();
+        } else {
+            word.push(ch);
+        }
+    }
+    flush(&word, &mut out);
+    s = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    // truncate by CHARS: String::truncate panics on a non-char boundary, and a log
+    // line is arbitrary UTF-8 (a CJK or emoji line made the guard crash).
+    if s.chars().count() > 140 {
+        s = s.chars().take(140).collect();
+    }
+    s
+}
+
+/// Is this line a problem? Matched on whole tokens so `ERROR:`, `[ERROR]` and
+/// `level=ERROR` all count — requiring the literal " ERROR " (spaces both sides)
+/// missed every structured-log format.
+fn is_errorish(line: &str) -> bool {
+    if line.starts_with("Traceback (most recent call last)") {
+        return true;
+    }
+    let up = line.to_ascii_uppercase();
+    up.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| {
+        matches!(
+            tok,
+            "ERROR" | "CRITICAL" | "WARNING" | "WARN" | "EXCEPTION" | "FATAL"
+        )
+    }) || line.contains("Error:")
+        || line.contains("Exception")
+}
+
+/// Scan one log file, folding it into the signal map.
+fn scan(path: &Path, label: &str, out: &mut Signals) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut in_tb = false;
+    let mut last_ts = String::new();
+    for line in text.lines() {
+        if let Some(t) = parse_ts(line) {
+            last_ts = t;
+        }
+        if line.starts_with("Traceback (most recent call last)") {
+            in_tb = true;
+            continue;
+        }
+        if in_tb {
+            // the exception line carries the identity
+            if line.starts_with(char::is_whitespace) {
+                let sig = normalise(line.trim());
+                if sig.contains("Error") || sig.contains("Exception") || sig.contains("Error:") {
+                    bump(out, label, &format!("EXC {}", sig), &last_ts);
+                    in_tb = false;
+                }
+                continue;
+            }
+            in_tb = false;
+        }
+        if is_errorish(line) {
+            let sig = normalise(line.trim());
+            bump(out, label, &sig, &last_ts);
+        }
+    }
+}
+
+fn bump(out: &mut Signals, label: &str, sig: &str, ts: &str) {
+    let key = format!("{}|{}", label, sig);
+    let e = out.entry(key).or_insert_with(|| Signal {
+        label: label.to_string(),
+        signature: sig.to_string(),
+        count: 0,
+        last_seen: String::new(),
+    });
+    e.count += 1;
+    if !ts.is_empty() && ts > e.last_seen.as_str() {
+        e.last_seen = ts.to_string();
+    }
+}
+
+/// Every log the guard watches: the main logs plus each profile's logs.
+fn log_files(home: &Path) -> Vec<(PathBuf, String)> {
+    let mut files = Vec::new();
+    let logs = home.join("logs");
+    if let Ok(rd) = std::fs::read_dir(&logs) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().map(|x| x == "log").unwrap_or(false) {
+                let name = p
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                files.push((p, format!("main/{}", name)));
+            }
+        }
+    }
+    let profiles = home.join("profiles");
+    if let Ok(rd) = std::fs::read_dir(&profiles) {
+        for e in rd.flatten() {
+            let dir = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            let plogs = dir.join("logs");
+            if let Ok(rd2) = std::fs::read_dir(&plogs) {
+                for e2 in rd2.flatten() {
+                    let p = e2.path();
+                    if p.extension().map(|x| x == "log").unwrap_or(false) {
+                        let stem = p
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        files.push((p, format!("{}/{}", name, stem)));
+                    }
+                }
+            }
+        }
+    }
+    files
+}
+
+/// Build the fleet's signal set.
+pub fn signals(home: &Path) -> Signals {
+    let mut out = Signals::new();
+    for (path, label) in log_files(home) {
+        scan(&path, &label, &mut out);
+    }
+    out
+}
+
+/// Where the pre-update snapshot lives.
+pub fn snapshot_path(home: &Path) -> PathBuf {
+    home.join("backups").join("guard-logsignals.json")
+}
+
+/// Write the current signal counts (call BEFORE an update).
+pub fn snapshot(home: &Path) -> Result<PathBuf> {
+    let sigs = signals(home);
+    let p = snapshot_path(home);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&p, serde_json::to_string_pretty(&sigs)?)?;
+    Ok(p)
+}
+
+/// Read the stored snapshot, if any.
+pub fn load_snapshot(home: &Path) -> Option<Signals> {
+    let p = snapshot_path(home);
+    let text = std::fs::read_to_string(p).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Signatures that appeared (or grew) since the snapshot.
+pub fn diff_against(home: &Path, before: &Signals) -> Vec<Signal> {
+    let now = signals(home);
+    let mut out = Vec::new();
+    for (key, s) in &now {
+        let prev = before.get(key).map(|p| p.count).unwrap_or(0);
+        if s.count > prev {
+            let mut d = s.clone();
+            d.count = s.count - prev;
+            out.push(d);
+        }
+    }
+    out.sort_by_key(|b| std::cmp::Reverse(b.count));
+    out
+}
+
+/// Print the fleet's top log-noise sources.
+pub fn report(home: &Path, top: usize) -> Result<()> {
+    let sigs = signals(home);
+    let mut v: Vec<&Signal> = sigs.values().collect();
+    v.sort_by_key(|b| std::cmp::Reverse(b.count));
+    println!("== LOG SIGNALS (fleet) ==");
+    println!("  {} distinct signatures across the fleet's logs", v.len());
+    for s in v.iter().take(top) {
+        println!("  [{} x{} last {}]", s.label, s.count, s.last_seen);
+        println!("       {}", s.signature);
+    }
+    Ok(())
+}
+
+/// Compare against the stored snapshot and report NEW signals.
+pub fn report_diff(home: &Path) -> Result<bool> {
+    let Some(before) = load_snapshot(home) else {
+        println!("  no log-signal snapshot on disk - nothing to compare against");
+        return Ok(false);
+    };
+    let new = diff_against(home, &before);
+    if new.is_empty() {
+        println!("  no new log signatures since the pre-update snapshot");
+        return Ok(false);
+    }
+    println!("== LOG SIGNATURES INTRODUCED SINCE THE PRE-UPDATE SNAPSHOT ==");
+    for s in &new {
+        println!("  [{} +{} last {}]", s.label, s.count, s.last_seen);
+        println!("       {}", s.signature);
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this replaced: index 10 is a space or 'T', never ':', so no
+    /// timestamp ever parsed and every signature reported an empty last_seen.
+    #[test]
+    fn parse_ts_accepts_space_and_t_and_rejects_junk() {
+        assert_eq!(
+            parse_ts("2026-10-21 14:36:00,123 ERROR boom"),
+            Some("2026-10-21 14:36:00".to_string())
+        );
+        assert_eq!(
+            parse_ts("2026-10-21T14:36:00Z ERROR boom"),
+            Some("2026-10-21T14:36:00".to_string())
+        );
+        assert_eq!(parse_ts("no timestamp here at all"), None);
+        assert_eq!(parse_ts("2026/10/21 14:36:00"), None);
+    }
+
+    /// A line starting with multi-byte UTF-8 must not panic. The previous version
+    /// byte-sliced a char-built String (`s[4..5]`), which panics off a boundary.
+    #[test]
+    fn non_ascii_lines_do_not_panic() {
+        let _ = parse_ts("日本語のログ ERROR 発生");
+        let long = "错误".repeat(200);
+        let sig = normalise(&long);
+        assert_eq!(sig.chars().count(), 140, "truncate must count chars");
+        let _ = parse_ts("🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨 ERROR");
+    }
+
+    /// Structured logs write `ERROR:`, `[ERROR]`, `level=ERROR` — the old check
+    /// required the literal " ERROR " and missed all of them.
+    #[test]
+    fn is_errorish_catches_structured_formats() {
+        assert!(is_errorish("2026-10-21 14:36:00,123 ERROR: nope"));
+        assert!(is_errorish("2026-10-21 14:36:00 [ERROR] nope"));
+        assert!(is_errorish("ts=1 level=ERROR msg=x"));
+        assert!(is_errorish("Traceback (most recent call last)"));
+        assert!(!is_errorish("2026-10-21 14:36:00,123 INFO all good"));
+        assert!(
+            !is_errorish("no errors were reported"),
+            "plural is not ERROR"
+        );
+    }
+
+    /// Same shape, different ids/numbers => one signature, not one per line.
+    #[test]
+    fn normalise_folds_ids_and_numbers() {
+        let a = normalise("ERROR session 12a4f9bc failed after 333 msgs");
+        let b = normalise("ERROR session deadbeef failed after 777 msgs");
+        assert_eq!(a, b);
+        assert!(a.contains("<hex>"));
+        assert!(a.contains("<n>"));
+    }
+}

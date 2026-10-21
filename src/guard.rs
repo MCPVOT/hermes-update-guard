@@ -209,6 +209,15 @@ fn run_stages(
     st.stage("backup", StageState::Done);
     let _ = st.write(home);
 
+    // Snapshot the fleet's log signatures BEFORE the update. The verify step then
+    // reports which error signatures are NEW, so a regression is attributed to this
+    // update instead of guessed at afterwards (the same trick that made the
+    // context-health verdict honest).
+    match crate::logsignals::snapshot(home) {
+        Ok(p) => println!("  log-signal snapshot: {}", p.display()),
+        Err(e) => println!("  ! log-signal snapshot failed: {}", e),
+    }
+
     // ---- UPDATE ------------------------------------------------------------
     // Capture the fleet's context health BEFORE the update. `verify` compares
     // against it, so a transcript that was already broken is reported as

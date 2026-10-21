@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "hermes-guard-dashboard",
+  "version": "0.1.0",
+  "identifier": "io.mcpvot.hermes-guard-dashboard",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "hermes-update-guard",
+        "width": 1060,
+        "height": 660,
+        "minWidth": 780,
+        "minHeight": 420,
+        "resizable": true,
+        "theme": "Dark",
+        "backgroundColor": "#0d0d0e",
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}

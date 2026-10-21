@@ -309,9 +309,16 @@ pub fn report(home: &Path) -> Result<bool> {
     Ok(problems)
 }
 
-/// Exit-code entry point for `hermes-update-guard health`.
-pub fn run(home: &Path) -> Result<()> {
+/// Run the context-health audit, optionally adding the fleet's log-noise report.
+pub fn run_with(home: &Path, logs: bool) -> Result<()> {
     let problems = report(home)?;
+    // Print the log report BEFORE exiting: `--logs` asked for it, and an exit
+    // first meant the flag silently produced nothing whenever health had a problem
+    // — which is exactly when the logs are most interesting.
+    if logs {
+        println!();
+        let _ = crate::logsignals::report(home, 12);
+    }
     if problems {
         std::process::exit(1);
     }

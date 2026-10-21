@@ -269,6 +269,12 @@ pub fn run(home: &Path) -> Result<()> {
         }
     }
 
+    // ---- log signatures introduced by this update ------------------------
+    // The snapshot taken before the update is the baseline: anything that appeared
+    // afterwards is a candidate regression, and the pre-existing noise stays noise.
+    println!("  log signatures since the pre-update snapshot:");
+    let _ = crate::logsignals::report_diff(home);
+
     // ---- verdict ------------------------------------------------------------
     if failures.is_empty() {
         println!("\nVERIFY: PASS");

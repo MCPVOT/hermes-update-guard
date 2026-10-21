@@ -246,6 +246,13 @@ pub fn run(home: &Path) -> Result<()> {
         }
     }
 
+    // MCP readiness: an OAuth server whose token is expired or unregistered cannot
+    // authenticate in a headless gateway, so every call to it fails. That was
+    // ~1,200 error lines in one afternoon and it reads as a slow profile, not a
+    // broken credential.
+    println!("\n[mcp readiness]");
+    let _ = crate::mcpcheck::report(home);
+
     println!("\nPREFLIGHT DONE — see flags above.");
     Ok(())
 }

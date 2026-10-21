@@ -1,6 +1,6 @@
 [package]
 name = "hermes-update-guard"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "Guardian orchestrator for safe Hermes Agent updates: preflight, WAL-safe backup, provider-drift tripwire, update, post-verify, restore."
 license = "MIT"
@@ -9,6 +9,10 @@ repository = "https://github.com/MCPVOT/hermes-update-guard"
 homepage = "https://github.com/MCPVOT/hermes-update-guard"
 keywords = ["hermes", "agent", "update", "backup", "guard"]
 categories = ["command-line-utilities", "development-tools"]
+# The Tauri dashboard is a separate, optional crate: it needs WebView2 and pulls
+# a GUI toolchain that the CLI must never require. Excluded so `cargo package`
+# and the CLI's CI stay lean.
+exclude = ["dashboard"]
 
 [dependencies]
 anyhow = "1"
