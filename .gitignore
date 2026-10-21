@@ -8,3 +8,5 @@ auth.json
 config.yaml
 *.local
 backups/
+# tauri-build regenerates these on every compile
+dashboard/gen/
