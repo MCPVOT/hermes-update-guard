@@ -8,8 +8,49 @@ permissions:
   contents: write
 
 jobs:
+  # A tag push used to go straight to building binaries: no tests ran, and a tag
+  # on a side branch released just as happily as one on master. This job is the
+  # gate, and `release` needs it.
+  #
+  # Injection note: every shell value below is a GitHub-provided environment
+  # variable ($GITHUB_SHA, $GITHUB_REF_NAME) or a literal from this file's own
+  # matrix, never an event payload, so there is nothing attacker-controlled to
+  # interpolate.
+  gate:
+    name: gate (tag on master, tests green)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Refuse a tag that is not on origin/master
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "::error::tag ${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on origin/master"
+            exit 1
+          fi
+          echo "ok: ${GITHUB_REF_NAME} (${GITHUB_SHA}) is on origin/master"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --all-targets
+
   release:
     name: Release ${{ matrix.os }}
+    needs: gate
     strategy:
       fail-fast: false
       matrix:

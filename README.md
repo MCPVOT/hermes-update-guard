@@ -97,7 +97,7 @@ watched live without the viewer being able to touch it:
 
 ```bash
 # Linux / macOS — fetch, mark executable, put it on PATH
-VER=0.3.0
+VER=0.3.4
 curl -fsSL -o hermes-update-guard \
   "https://github.com/MCPVOT/hermes-update-guard/releases/download/v${VER}/hermes-update-guard-${VER}-x86_64-unknown-linux-gnu"
 chmod +x hermes-update-guard
@@ -116,7 +116,7 @@ cargo build --release         # or run target/release/hermes-update-guard
 | Command | What it does | Gate |
 |---|---|---|
 | `preflight` | Read-only state check: version, git HEAD/behind/dirty/stashes, venv holders, **unfinished update receipts**, stale locks, desktop app running, provider drift summary, gateway state | none (read-only) |
-| `export` | Snapshot each profile's provider surface into `backups/provider-surface/<stamp>/`, advance `last-known`, refresh the aggregate `golden.json` | none (read-only on live config) |
+| `export` | Snapshot each profile's provider surface into `backups/provider-surface/<stamp>/` and advance `last-known`. It does **not** move `golden.json` — that is the approved reference `bless` moves | none (read-only on live config) |
 | `diff` | Compare the live surface against **golden** (or `--baseline last-known` / a path) | **exit 1 on any drift or unreadable baseline** |
 | `backup` | WAL-safe SQLite backup of every profile's `state.db` plus config/env/auth/gateway/content dirs into `backups/pre-update-<stamp>/`; verifies integrity + message counts | **refuses on incomplete backup** |
 | `update` | Full guarded update: preflight gate → export → backup → `hermes update --yes` → verify. Add `--detached` to run it in its own process group so a closed terminal or a caller timeout cannot kill the build | refuses while a venv is held (or its state is unknown) or the desktop app is running (add `--close-desktop`) |
@@ -158,7 +158,7 @@ exist so you can inspect or stop at any stage.
 ## Provider-surface tripwire
 
 `export` / `diff` protect exactly the config an update must never silently
-change — the same twelve keys the original drift script guarded:
+change — the same thirteen keys the original drift script guarded:
 
 `model.provider`, `model.default`, `model.base_url`, `model.api_key`,
 `auxiliary`, `fallback_providers`, `fallback_model`, `delegation`,
