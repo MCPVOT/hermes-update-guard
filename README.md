@@ -21,9 +21,41 @@ provider/model config that drifts without anyone noticing.
 `hermes-update-guard` makes each of those conditions **visible and gated before**
 the update runs — then verifies the result afterwards.
 
+## How a run is gated
+
+```mermaid
+flowchart TD
+    P["preflight<br/><small>venv holders · desktop app · stale markers<br/>unfinished receipts · profile fleet · MCP readiness</small>"]
+    E["export<br/><small>provider-surface snapshot per profile</small>"]
+    B["backup<br/><small>WAL-safe state.db · config · .env · content dirs</small>"]
+    U["hermes update --yes"]
+    V["verify<br/><small>HEAD · DB integrity · pinned patch · drift · gateway code_sha</small>"]
+
+    P -->|gate passes| E
+    P -.->|refuses| X["stop<br/><small>nothing is touched</small>"]
+    E --> B
+    B -->|completeness gate| U
+    U --> V
+    V -->|PASS| OK["exit 0"]
+    V -->|FAIL| BAD["exit 1<br/><small>backup retained for restore</small>"]
+
+    E -.->|baseline| G[("golden.json<br/>last-known/")]
+    V -.->|compare| G
+    B -.->|restore point| R[("pre-update-&lt;stamp&gt;/")]
+```
+
+Every stage writes its progress to `backups/guard-run.json`, so a run can be
+watched live without the viewer being able to touch it:
+
+- `hermes-update-guard watch` — full-screen terminal view (ratatui)
+- `hermes-update-guard watch --no-tui` — one-shot snapshot for scripts/CI
+- [`dashboard/`](dashboard/) — a pop-up Tauri window in the Hermes desktop palette,
+  for when the Hermes app itself is closed by the update
+
 ## Contents
 
 - [Why a Rust tool?](#why-a-rust-tool)
+- [How a run is gated](#how-a-run-is-gated)
 - [Install](#install)
 - [Commands](#commands)
 - [Quick start](#quick-start)

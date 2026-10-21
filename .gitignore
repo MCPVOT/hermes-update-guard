@@ -1,4 +1,5 @@
 /target
+/dashboard/target
 *.log
 
 # never commit live Hermes state or credentials

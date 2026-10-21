@@ -1,0 +1,394 @@
+/* Palette lifted from the Hermes desktop app's own dark skin
+   (apps/desktop/src/styles.css): chrome #0d0d0e, sidebar #0a0a0b, card #161618,
+   accent #0053fd, text at 94 / 74 / 54% of white, strokes at 9%.
+   Same look, same weight of border, same radii — this window should feel like a
+   panel of Hermes, not a different product. */
+
+:root {
+  color-scheme: dark;
+  --bg: #0d0d0e;
+  --bg-sidebar: #0a0a0b;
+  --card: #161618;
+  --elevated: #1c1c1f;
+  --text: rgba(255, 255, 255, 0.94);
+  --text-2: rgba(255, 255, 255, 0.74);
+  --text-3: rgba(255, 255, 255, 0.54);
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --accent: #0053fd;
+  --ok: #55a583;
+  --fail: #e75e78;
+  --warn: #d8a657;
+  --radius: 12px;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", "Consolas", monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: grid;
+  grid-template-rows: auto auto 1fr auto;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* ── bars ─────────────────────────────────────────────────────────────── */
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 16px;
+  background: var(--bg-sidebar);
+  border-bottom: 1px solid var(--border);
+  -webkit-app-region: drag;
+}
+
+.foot {
+  border-bottom: none;
+  border-top: 1px solid var(--border);
+  padding: 6px 16px;
+  font-size: 12px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.mark {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.name {
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.sep {
+  color: var(--text-3);
+}
+
+.run {
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.meta {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.pin {
+  -webkit-app-region: no-drag;
+  font: inherit;
+  font-size: 11px;
+  color: var(--text-2);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.pin:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.pin[aria-pressed="true"] {
+  color: #fff;
+  background: var(--accent);
+  border-color: transparent;
+}
+
+/* ── stage rail ───────────────────────────────────────────────────────── */
+/* Its own row: sharing the header row clipped VERIFY off the right edge as soon
+   as the run id got long. Chips wrap instead of disappearing. */
+.railrow {
+  padding: 0 16px 9px;
+  background: var(--bg-sidebar);
+  border-bottom: 1px solid var(--border);
+}
+
+.rail {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.stage {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.stage.done {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+}
+
+.stage.active {
+  color: #fff;
+  background: var(--accent);
+  border-color: transparent;
+  animation: pulse 1.8s ease-in-out infinite;
+}
+
+.stage.failed {
+  color: var(--fail);
+  border-color: color-mix(in srgb, var(--fail) 45%, transparent);
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 0%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stage.active {
+    animation: none;
+  }
+}
+
+/* ── panels ───────────────────────────────────────────────────────────── */
+.grid {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  gap: 12px;
+  padding: 12px;
+  min-height: 0;
+}
+
+.panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.panel > h2 {
+  margin: 0 0 10px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  font-weight: 600;
+  display: flex;
+  justify-content: space-between;
+}
+
+.count {
+  color: var(--text-3);
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* profiles */
+.plist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+}
+
+.plist li {
+  display: grid;
+  grid-template-columns: 10px 1fr auto;
+  gap: 9px;
+  align-items: baseline;
+  padding: 7px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+}
+
+.plist li:last-child {
+  border-bottom: none;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-3);
+  transform: translateY(-1px);
+}
+
+.dot.done {
+  background: var(--ok);
+}
+.dot.active {
+  background: var(--accent);
+}
+.dot.failed {
+  background: var(--fail);
+}
+
+.pname {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.pdetail {
+  color: var(--text-3);
+  font-size: 11px;
+  text-align: right;
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* blockers */
+.blockers {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.blockers h3 {
+  margin: 0 0 6px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--warn);
+}
+
+.blockers ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.blockers li {
+  color: var(--text-2);
+  font-size: 12px;
+  padding: 3px 0 3px 12px;
+  position: relative;
+}
+
+.blockers li::before {
+  content: "!";
+  position: absolute;
+  left: 0;
+  color: var(--warn);
+  font-weight: 700;
+}
+
+/* log */
+.log {
+  margin: 0;
+  flex: 1;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  user-select: text;
+  scrollbar-width: thin;
+  min-width: 0;
+}
+
+.log .l-fail {
+  color: var(--fail);
+}
+.log .l-warn {
+  color: var(--warn);
+}
+.log .l-ok {
+  color: var(--ok);
+}
+.log .l-dim {
+  color: var(--text-3);
+}
+
+.log .empty {
+  color: var(--text-3);
+}
+
+/* footer */
+.verdict {
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  padding: 2px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.verdict.running {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.verdict.pass {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 16%, transparent);
+}
+
+.verdict.fail {
+  color: var(--fail);
+  background: color-mix(in srgb, var(--fail) 16%, transparent);
+}
+
+.muted {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.spacer {
+  flex: 1;
+}
+
+/* narrow window: stack the panes */
+@media (max-width: 900px) {
+  .grid {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+  }
+  .rail {
+    display: none;
+  }
+}

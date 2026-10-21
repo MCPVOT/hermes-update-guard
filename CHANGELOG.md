@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`dashboard/` — a pop-up Tauri window** that shows a run while Hermes itself is
+  closed by the update. Same palette as the Hermes desktop (chrome `#0d0d0e`,
+  card `#161618`, accent `#0053fd`, text at 94/74/54% white). It has exactly two
+  commands — `snapshot()` and `set_always_on_top()` — so it is read-only by
+  construction, like the TUI. No Node toolchain: the UI is plain HTML/CSS/JS
+  served straight from `ui/`, and the crate is excluded from packaging so the
+  CLI's 3-OS CI never has to pull in `webkit2gtk`.
+- README: a mermaid diagram of how a run is gated, plus a live-view section
+  covering `watch`, `watch --no-tui` and the dashboard.
+
+### Fixed (dashboard, found by rendering it)
+
+- The stage rail lived in the header row and clipped **VERIFY** off the right edge
+  once the run id was long; it now has its own row and wraps.
+- Long log lines were cut off; the pane wraps anywhere now.
+
 ## [0.3.4] - 2026-10-21
 
 Completes and hardens the in-progress `logsignals` / `mcpcheck` work: the session

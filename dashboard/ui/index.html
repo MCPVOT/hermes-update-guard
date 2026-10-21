@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>hermes-update-guard</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <span class="name">hermes-update-guard</span>
+        <span class="sep">/</span>
+        <span id="run" class="run">waiting for a run</span>
+      </div>
+      <div class="meta">
+        <span id="clock" class="clock">--:--:--</span>
+        <span id="elapsed" class="elapsed">0s</span>
+        <button id="pin" class="pin" title="Keep this window on top">on top</button>
+      </div>
+    </header>
+
+    <div class="railrow">
+      <nav id="rail" class="rail" aria-label="update stages"></nav>
+    </div>
+
+    <main class="grid">
+      <section class="panel profiles">
+        <h2>Profiles <span id="pcount" class="count"></span></h2>
+        <ul id="plist" class="plist"></ul>
+        <div id="blockers" class="blockers" hidden>
+          <h3>Blockers</h3>
+          <ul id="blist"></ul>
+        </div>
+      </section>
+
+      <section class="panel logpane">
+        <h2>
+          Live log
+          <span id="lcount" class="count"></span>
+        </h2>
+        <pre id="log" class="log" tabindex="0"></pre>
+      </section>
+    </main>
+
+    <footer class="bar foot">
+      <span id="verdict" class="verdict running">RUNNING</span>
+      <span id="homenote" class="muted"></span>
+      <span class="spacer"></span>
+      <span class="muted">read-only · this window cannot alter an update</span>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>
