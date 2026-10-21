@@ -6,6 +6,59 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-10-21
+
+Fixes from a five-agent audit of the repo (workflows, README, skill, git history,
+log-signal quality). Every finding below was reproduced before it was changed.
+
+### Security
+
+- **Nested credentials were exported in clear.** `mask()` tested only the
+  top-level string, so `auxiliary.<role>.api_key`, `providers.<name>.api_key` and
+  `delegation.*.token` were written to `last-known/*.json` and echoed to the
+  terminal. It is now recursive, masking on two rules: a value that *looks* like a
+  key (`sk-`, `nvapi`, `ghp_`, `github_pat_`, `xox`, `AIza`, `AKIA`, `glpat-`)
+  wherever it appears, and a key that *names* a credential (`api_key`, `token`,
+  `secret`, `password`) even when its value carries no known prefix. `token_type`
+  and `max_tokens` stay readable.
+- **A personal path was committed** in `PUBLISH.md` (`C:/Users/<name>/...`).
+  Replaced with `<your checkout>`.
+
+### Fixed - log signals
+
+- **No grouping at all.** 93.5% of live signatures began with a literal
+  timestamp, so every occurrence was unique and `count` was always 1 (23,805
+  signatures, 99% singletons). The timestamp is stripped before normalising.
+- **One traceback produced three signatures** (the `raise` frame, an `EXC` line and
+  the exception line). A traceback is now exactly one event, identified by its
+  final exception line.
+- **Rotated logs were invisible** - only `extension() == "log"` was read, hiding
+  ~35 MB of `*.log.1/.2/.3` and making a rotated failure unable to register as
+  new. Rotations are read and labelled distinctly (`agent.log.2`), so an upgrade
+  does not relabel existing signals.
+
+Measured on the live fleet: 23,787 -> **20,888** distinct signatures, with the top
+entries now carrying real counts (`x5472`) instead of singletons.
+
+### Fixed - release workflow
+
+- **The release path had no test gate.** `release.yml` now has a `gate` job the
+  binaries `needs`: `cargo fmt --check`, `clippy -D warnings`, `cargo test
+  --all-targets`, and a refusal to release a tag whose commit is not on
+  `origin/master`. Previously a tag on any branch released untested code.
+
+### Fixed - docs that contradicted the code
+
+- README install snippet pinned `VER=0.3.0`, a binary without five documented
+  commands.
+- README said `export` refreshes `golden.json`; it deliberately does not - only
+  `bless` moves the approved reference.
+- README said "twelve keys"; `SURFACE_KEYS` has thirteen.
+
+### Notes
+
+- 47 tests (was 45).
+
 ### Added
 
 - **`dashboard/` — a pop-up Tauri window** that shows a run while Hermes itself is

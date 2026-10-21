@@ -57,10 +57,31 @@ fn parse_ts(line: &str) -> Option<String> {
     ok.then_some(s)
 }
 
+/// Drop a leading log timestamp (and its millisecond tail) so the same event
+/// logged at different times collapses into one signature.
+///
+/// Without this, 93.5% of live signatures began with a literal timestamp: every
+/// occurrence was unique, `count` was always 1, and "grouping" did not happen at
+/// all — 23,805 distinct signatures with 99% singletons.
+fn strip_leading_ts(line: &str) -> String {
+    let Some(ts) = parse_ts(line) else {
+        return line.to_string();
+    };
+    let mut rest = &line[ts.len()..];
+    // ",123" / ".123" / "Z" trailing the seconds
+    rest = rest.trim_start_matches('Z');
+    if let Some(after) = rest.strip_prefix(',') {
+        rest = after.trim_start_matches(|c: char| c.is_ascii_digit());
+    } else if let Some(after) = rest.strip_prefix('.') {
+        rest = after.trim_start_matches(|c: char| c.is_ascii_digit());
+    }
+    rest.trim_start().to_string()
+}
+
 /// Normalise a line into a stable signature: the shape of the problem, not its
 /// ids/timestamps/paths.
 fn normalise(line: &str) -> String {
-    let mut s = line.to_string();
+    let mut s = strip_leading_ts(line.trim());
     // hex ids
     let mut out = String::new();
     let mut word = String::new();
@@ -126,16 +147,20 @@ fn scan(path: &Path, label: &str, out: &mut Signals) {
             continue;
         }
         if in_tb {
-            // the exception line carries the identity
+            // A traceback is ONE event. Frames are indented and carry no identity;
+            // the first non-indented line IS the exception. Counting the `raise`
+            // frame as well produced three signatures for one failure.
             if line.starts_with(char::is_whitespace) {
-                let sig = normalise(line.trim());
-                if sig.contains("Error") || sig.contains("Exception") || sig.contains("Error:") {
-                    bump(out, label, &format!("EXC {}", sig), &last_ts);
-                    in_tb = false;
-                }
                 continue;
             }
+            if line.trim().is_empty() {
+                in_tb = false;
+                continue;
+            }
+            let sig = normalise(line.trim());
+            bump(out, label, &format!("EXC {sig}"), &last_ts);
             in_tb = false;
+            continue; // consumed: do not also count it as a plain ERROR line
         }
         if is_errorish(line) {
             let sig = normalise(line.trim());
@@ -158,6 +183,35 @@ fn bump(out: &mut Signals, label: &str, sig: &str, ts: &str) {
     }
 }
 
+/// Is this file one of the fleet's logs, including rotated ones?
+///
+/// Only `extension() == "log"` was read, so ~35 MB of `*.log.1/.2/.3` was
+/// invisible — which also meant a rotated log could not produce a "new" signal.
+fn is_log(p: &Path) -> bool {
+    if p.extension().map(|x| x == "log").unwrap_or(false) {
+        return true;
+    }
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.contains(".log."))
+        .unwrap_or(false)
+}
+
+/// Label for a log file: `agent.log` → `agent`, `agent.log.2` stays `agent.log.2`.
+/// Stable for the plain file, distinct for a rotation, so an upgrade does not
+/// relabel every existing signal as "new".
+fn log_label(p: &Path) -> String {
+    let n = p
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    match n.strip_suffix(".log") {
+        Some(base) => base.to_string(),
+        None => n,
+    }
+}
+
 /// Every log the guard watches: the main logs plus each profile's logs.
 fn log_files(home: &Path) -> Vec<(PathBuf, String)> {
     let mut files = Vec::new();
@@ -165,13 +219,8 @@ fn log_files(home: &Path) -> Vec<(PathBuf, String)> {
     if let Ok(rd) = std::fs::read_dir(&logs) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.extension().map(|x| x == "log").unwrap_or(false) {
-                let name = p
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                files.push((p, format!("main/{}", name)));
+            if is_log(&p) {
+                files.push((p.clone(), format!("main/{}", log_label(&p))));
             }
         }
     }
@@ -184,13 +233,8 @@ fn log_files(home: &Path) -> Vec<(PathBuf, String)> {
             if let Ok(rd2) = std::fs::read_dir(&plogs) {
                 for e2 in rd2.flatten() {
                     let p = e2.path();
-                    if p.extension().map(|x| x == "log").unwrap_or(false) {
-                        let stem = p
-                            .file_stem()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string();
-                        files.push((p, format!("{}/{}", name, stem)));
+                    if is_log(&p) {
+                        files.push((p.clone(), format!("{}/{}", name, log_label(&p))));
                     }
                 }
             }
@@ -324,6 +368,19 @@ mod tests {
             !is_errorish("no errors were reported"),
             "plural is not ERROR"
         );
+    }
+
+    #[test]
+    fn normalise_folds_timestamps() {
+        // the defect: 93.5% of signatures began with a literal timestamp
+        let a = normalise("2026-10-21 14:36:00,123 ERROR: upstream 500");
+        let b = normalise("2026-10-21 15:02:11,999 ERROR: upstream 500");
+        assert_eq!(a, b);
+        assert!(!a.contains("2026"), "timestamp must be stripped: {a}");
+        assert!(a.starts_with("ERROR"), "got: {a}");
+        // and the T-form / Z-form too
+        let c = normalise("2026-10-21T14:36:00Z ERROR: upstream 500");
+        assert_eq!(a, c);
     }
 
     /// Same shape, different ids/numbers => one signature, not one per line.

@@ -54,15 +54,71 @@ fn get_path(v: &Value, dotted: &str) -> Value {
     cur.clone()
 }
 
+/// Does this value look like a credential?
+fn looks_secret(s: &str) -> bool {
+    const PREFIXES: [&str; 8] = [
+        "sk-",
+        "nvapi",
+        "ghp_",
+        "github_pat_",
+        "xox",
+        "AIza",
+        "AKIA",
+        "glpat-",
+    ];
+    PREFIXES.iter().any(|p| s.starts_with(p))
+}
+
+/// Is this config key a credential slot? `token_type`/`max_tokens` are not.
+fn secret_key(k: &str) -> bool {
+    let k = k.to_ascii_lowercase();
+    if matches!(k.as_str(), "token_type" | "max_tokens" | "token_expires_at") {
+        return false;
+    }
+    k.contains("api_key")
+        || k.contains("apikey")
+        || k.contains("token")
+        || k.contains("secret")
+        || k.contains("password")
+}
+
+fn mask_str(s: &str) -> Value {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() > 12 {
+        let head: String = chars[..8].iter().collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        Value::String(format!("{}...{}", head, tail))
+    } else {
+        Value::String("***".to_string())
+    }
+}
+
+/// Recursively mask credentials.
+///
+/// The previous version tested only the TOP-LEVEL string, so every nested
+/// credential — `auxiliary.<role>.api_key`, `providers.<name>.api_key`,
+/// `delegation.*.token` — was written to `last-known/*.json` and echoed to the
+/// terminal in clear. Two rules instead of one: a value that LOOKS like a key is
+/// masked wherever it appears, and a key that NAMES a credential is masked even
+/// when its value does not carry a known prefix.
 fn mask(v: Value) -> Value {
     match v {
-        Value::String(s) if s.starts_with("sk-") || s.starts_with("nvapi") => {
-            let masked = if s.len() > 12 {
-                format!("{}...{}", &s[..8], &s[s.len() - 4..])
-            } else {
-                "***".to_string()
-            };
-            Value::String(masked)
+        Value::String(s) if looks_secret(&s) => mask_str(&s),
+        Value::Array(a) => Value::Array(a.into_iter().map(mask).collect()),
+        Value::Object(m) => {
+            let mut out = serde_json::Map::new();
+            for (k, x) in m {
+                let masked = if secret_key(&k) {
+                    match x {
+                        Value::String(s) => mask_str(&s),
+                        other => mask(other),
+                    }
+                } else {
+                    mask(x)
+                };
+                out.insert(k, masked);
+            }
+            Value::Object(out)
         }
         other => other,
     }
@@ -402,6 +458,22 @@ pub fn compare_against(home: &Path, base: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The defect this replaced: only TOP-LEVEL strings were masked, so every
+    /// nested credential was exported and printed in clear.
+    #[test]
+    fn mask_redacts_nested_credentials() {
+        let v = serde_json::json!({
+            "auxiliary": { "approval": { "api_key": "plainvalue123456" } },
+            "providers": { "x": { "api_key": "nvapi-abcdef123456" } },
+            "model": { "token_type": "Bearer", "default": "x" }
+        });
+        let m = mask(v);
+        assert_eq!(m["auxiliary"]["approval"]["api_key"], "plainval...3456");
+        assert_eq!(m["providers"]["x"]["api_key"], "nvapi-ab...3456");
+        assert_eq!(m["model"]["token_type"], "Bearer", "not a credential slot");
+        assert_eq!(m["model"]["default"], "x", "not a credential");
+    }
 
     #[test]
     fn mask_redacts_api_keys() {
