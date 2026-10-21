@@ -341,6 +341,33 @@ fn run_stages(
     Ok(())
 }
 
+/// Where the dashboard lives, if it has been built. The window is optional, so
+/// this never fails a run — it only decides what to print.
+fn dashboard_exe() -> Option<std::path::PathBuf> {
+    let name = if cfg!(windows) {
+        "hermes-guard-dashboard.exe"
+    } else {
+        "hermes-guard-dashboard"
+    };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let c = dir.join(name);
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for d in std::env::split_paths(&path) {
+            let c = d.join(name);
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
 /// Run the update in its own process, detached from this terminal.
 ///
 /// Two of the historical update failures were finalisers killed by a caller's
@@ -393,5 +420,11 @@ fn spawn_detached(
     println!("  state     : {}", crate::state::state_path(home).display());
     println!("\n  watch it  : hermes-update-guard watch");
     println!("  snapshot  : hermes-update-guard watch --no-tui");
+    match dashboard_exe() {
+        Some(p) => println!("  dashboard : \"{}\"  (pop-up window, survives the desktop closing)", p.display()),
+        None => println!(
+            "  dashboard : not built (cd dashboard && cargo build --release) - the terminal views above still work"
+        ),
+    }
     Ok(())
 }

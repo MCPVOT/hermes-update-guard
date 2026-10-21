@@ -124,11 +124,23 @@ fn set_always_on_top(window: tauri::Window, on: bool) -> Result<(), String> {
     window.set_always_on_top(on).map_err(|e| e.to_string())
 }
 
+/// The native title is the only status visible when the window is behind
+/// something. `document.title` does not change it, and the JS `setTitle` would
+/// need a capability file — so it goes through a command instead.
+#[tauri::command]
+fn set_window_title(window: tauri::Window, text: String) -> Result<(), String> {
+    window.set_title(&text).map_err(|e| e.to_string())
+}
+
 fn main() {
     let home = home_from_args();
     tauri::Builder::default()
         .manage(Home(home))
-        .invoke_handler(tauri::generate_handler![snapshot, set_always_on_top])
+        .invoke_handler(tauri::generate_handler![
+            snapshot,
+            set_always_on_top,
+            set_window_title
+        ])
         .run(tauri::generate_context!())
         .expect("failed to start the dashboard window");
 }

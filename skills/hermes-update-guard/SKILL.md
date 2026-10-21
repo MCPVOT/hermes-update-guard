@@ -42,6 +42,9 @@ tripwire — the whole scripted update ritual in one static binary.
 | Record a profile as gone on purpose | `hermes-update-guard retire <profile>` (undo: `--undo`) |
 | Transcript / context-health audit | `hermes-update-guard health` |
 | One profile in depth | `hermes-update-guard health --profile <name>` |
+| MCP readiness (OAuth tokens, headless auth) | `hermes-update-guard mcp` |
+| Fleet log-noise signatures | `hermes-update-guard health --logs` |
+| Snapshot log signatures before an update | `hermes-update-guard snapshot-logs` |
 | Is the binary I am running current? | `hermes-update-guard self-check` |
 | Identity banner | `hermes-update-guard vibe` |
 
@@ -109,6 +112,17 @@ local build). If it is not installed:
   sessions hit the context wall early. `at risk` / `largest live` lines show which
   sessions are closest to a 1M-token window. Report it; do not "fix" it by deleting
   rows — repairing a transcript needs the gateway stopped and a verified backup.
+- `mcp` is the **readiness** view (also printed at the end of `preflight`): per
+  profile, which servers are enabled, their auth type, and whether an OAuth token is
+  present, expired, or unreadable. Only `auth: oauth` servers can fail headlessly —
+  a gateway or cron job can never complete a browser authorisation, so an expired or
+  never-registered token fails every call and reads as a slow profile. `auth: none`
+  / stdio servers have no token file by design and must never be flagged.
+- `health --logs` and `snapshot-logs` add the **log-signal** view: errors grouped
+  into stable signatures by shape (ids and numbers folded), so a repeating failure
+  counts once. `update` snapshots the counts before the update and `verify` reports
+  only signatures that are NEW, which attributes a regression to that update instead
+  of guessing afterwards.
 - `preflight` prints the **resolved update TARGET**. `TARGET : none - this update
   would be a NO-OP` means the channel's newest release is already installed: the
   repo can still be N commits behind origin/main, but on a release channel that
@@ -210,6 +224,17 @@ local build). If it is not installed:
 - **Reading `gateway_state.json` as proof the gateway is alive** → the file
   outlives the process it describes. `verify` now checks the pid; a recorded
   "running" gateway with a dead pid is a FAIL, not a warning to ignore.
+
+## Maintaining the tool itself
+
+Nothing above is about changing the binary. Load:
+
+| Task | File |
+|---|---|
+| Fix / improve / release the guard: gates, CI matrix, branch protection, release + publish, version bumps, reviewing another agent's landing, how to record an operator decision instead of weakening a check | `references/repo-maintenance.md` |
+| What the update pipeline actually does underneath | `references/hermes-update-internals.md` |
+| The `watch` TUI: layout, palette, read-only contract | `references/tui-watch-view.md` |
+| The pop-up window (`dashboard/`, separate Tauri crate, excluded from packaging) | the `tauri-desktop-app` skill |
 
 ## Manual restore (emergency)
 

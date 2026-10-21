@@ -11,6 +11,8 @@ const $ = (id) => document.getElementById(id);
 
 let alwaysOnTop = false;
 let lastLogKey = "";
+let lastProfilesKey = "";
+let lastTitle = "";
 let mounted = false;
 
 function el(tag, cls, text) {
@@ -54,24 +56,35 @@ function logClass(line) {
 function renderRail(stages) {
   const rail = $("rail");
   rail.textContent = "";
+  // A glyph as well as a colour: status conveyed by colour alone is unreadable
+  // for a colour-blind operator and fails WCAG 1.4.1.
+  const MARK = { done: "✓", failed: "✕", active: "▸", waiting: "·" };
   for (const name of STAGES) {
     const s = stages?.find?.((x) => x.name === name);
     const state = s?.state || "waiting";
-    const chip = el("span", `stage ${state}`, name);
+    const chip = el("span", `stage ${state}`, `${MARK[state] || "·"} ${name}`);
+    chip.setAttribute("aria-label", `${name}: ${state}`);
+    chip.title = `${name}: ${state}`;
     rail.appendChild(chip);
   }
 }
 
 function renderProfiles(profiles) {
   const list = $("plist");
+  // Rebuilding this list every 600 ms throws away scroll position and forces a
+  // reflow even when nothing changed. Key it on content and skip the rebuild.
+  const key = (profiles || []).map((p) => `${p.name}:${p.state}:${p.detail || ""}`).join("|");
+  if (key === lastProfilesKey) return;
+  lastProfilesKey = key;
+
   list.textContent = "";
   $("pcount").textContent = profiles?.length ? `${profiles.length}` : "";
   if (!profiles?.length) {
-    list.appendChild(el("li", "", ""));
-    const li = list.lastElementChild;
+    const li = el("li");
     li.appendChild(el("span", "dot"));
     li.appendChild(el("span", "pname", "no profiles yet"));
     li.appendChild(el("span", "pdetail", ""));
+    list.appendChild(li);
     return;
   }
   for (const p of profiles) {
@@ -106,7 +119,13 @@ function renderLog(lines) {
   $("lcount").textContent = lines.length ? `${lines.length} lines` : "";
 
   if (!lines.length) {
-    pre.appendChild(el("span", "empty", "no log yet — the guard writes backups/guard-update.log"));
+    pre.appendChild(
+      el(
+        "span",
+        "empty",
+        "no log file — an attached run prints to its own terminal. Use `update --detached` to get one here."
+      )
+    );
     return;
   }
   const frag = document.createDocumentFragment();
@@ -121,17 +140,55 @@ function renderLog(lines) {
 
 function renderVerdict(state) {
   const v = $("verdict");
-  const code = state?.exit_code;
-  if (code === null || code === undefined) {
+  const raw = state?.exit_code;
+  // Coerce: a JSON "0" is not === 0, and the old code rendered that as
+  // "FAIL · exit 0".
+  const code = raw === null || raw === undefined ? null : Number(raw);
+
+  if (Number.isFinite(code)) {
+    if (code === 0) {
+      v.className = "verdict pass";
+      v.textContent = "PASS";
+    } else {
+      v.className = "verdict fail";
+      v.textContent = `FAIL · exit ${code}`;
+    }
+  } else if (code !== null) {
+    // present but not a number: it is not a success
+    v.className = "verdict fail";
+    v.textContent = `FAIL · exit ${raw}`;
+  } else if (state?.finished_at) {
+    // The run ended without recording an exit code. Claiming "RUNNING" forever
+    // would be a lie; claiming PASS would be worse.
+    v.className = "verdict warn";
+    v.textContent = "FINISHED · no exit code";
+  } else {
     v.className = "verdict running";
     v.textContent = "RUNNING";
-  } else if (code === 0) {
-    v.className = "verdict pass";
-    v.textContent = "PASS";
-  } else {
-    v.className = "verdict fail";
-    v.textContent = `FAIL · exit ${code}`;
   }
+
+  const run = state?.run_id ? `${state.run_id}` : "hermes-update-guard";
+  setWindowTitle(`${run} · ${v.textContent}`);
+}
+
+function setWindowTitle(text) {
+  if (text === lastTitle) return;
+  lastTitle = text;
+  document.title = text;
+  try {
+    invoke("set_window_title", { text });
+  } catch (_) {
+    /* not running under Tauri */
+  }
+}
+
+/** The poll broke: say so instead of leaving a stale PASS/FAIL on screen. */
+function renderStale(reason) {
+  const v = $("verdict");
+  v.className = "verdict warn";
+  v.textContent = "STALE · cannot read state";
+  $("run").textContent = String(reason).slice(0, 90);
+  setWindowTitle("hermes-update-guard · STALE");
 }
 
 function render(snap) {
@@ -150,6 +207,8 @@ function render(snap) {
     v.className = "verdict running";
     v.textContent = "IDLE";
     lastLogKey = "";
+    lastProfilesKey = "";
+    setWindowTitle("hermes-update-guard · IDLE");
     if (snap.error) $("run").textContent = "no run state yet";
     return;
   }
@@ -172,7 +231,7 @@ async function tick() {
   try {
     render(await invoke("snapshot"));
   } catch (e) {
-    $("run").textContent = `snapshot failed: ${e}`;
+    renderStale(e);
   }
   setTimeout(tick, POLL_MS);
 }
@@ -185,6 +244,18 @@ $("pin").addEventListener("click", async () => {
   } catch (e) {
     $("pin").setAttribute("aria-pressed", String(!alwaysOnTop));
     alwaysOnTop = !alwaysOnTop;
+  }
+});
+
+// Escape closes the window, like every other pop-up. It is the only key that
+// does anything: nothing here can touch a run.
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    try {
+      window.__TAURI__.window.getCurrentWindow().close();
+    } catch (_) {
+      /* not running under Tauri: leave the page alone */
+    }
   }
 });
 

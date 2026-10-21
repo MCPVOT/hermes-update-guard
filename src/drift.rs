@@ -66,31 +66,57 @@ fn looks_secret(s: &str) -> bool {
         "AKIA",
         "glpat-",
     ];
+    // `Authorization: Bearer <token>` puts the secret in the VALUE under a key
+    // name that says nothing, so the scheme prefix counts as well.
+    let lower = s.to_ascii_lowercase();
     PREFIXES.iter().any(|p| s.starts_with(p))
+        || lower.starts_with("bearer ")
+        || lower.starts_with("basic ")
 }
 
-/// Is this config key a credential slot? `token_type`/`max_tokens` are not.
+/// Is this config key a credential slot?
+///
+/// `token_type` / `max_tokens` are not, and neither are pointers TO a credential
+/// (`api_key_env`, `secret_name`, `*_id`) — masking those hides a useful name
+/// while protecting nothing.
 fn secret_key(k: &str) -> bool {
     let k = k.to_ascii_lowercase();
     if matches!(k.as_str(), "token_type" | "max_tokens" | "token_expires_at") {
         return false;
     }
-    k.contains("api_key")
+    if ["_env", "_name", "_url", "_id", "_file", "_path"]
+        .iter()
+        .any(|s| k.ends_with(s))
+    {
+        return false;
+    }
+    k == "key"
+        || k.ends_with("_key")
+        || k.contains("api_key")
         || k.contains("apikey")
         || k.contains("token")
         || k.contains("secret")
         || k.contains("password")
+        || k.contains("authorization")
+        || k == "auth"
+        || k.contains("bearer")
+        || k.contains("cookie")
 }
 
+/// Show at most 8 characters of a credential — and none at all below 32.
+///
+/// The earlier rule kept the first 8 and last 4 of anything over 12 chars, so a
+/// 13-character secret was 12/13 visible and a prefixed token was nearly
+/// recoverable. Short values are masked whole now.
 fn mask_str(s: &str) -> Value {
     let chars: Vec<char> = s.chars().collect();
-    if chars.len() > 12 {
-        let head: String = chars[..8].iter().collect();
-        let tail: String = chars[chars.len() - 4..].iter().collect();
-        Value::String(format!("{}...{}", head, tail))
-    } else {
-        Value::String("***".to_string())
+    let n = chars.len();
+    if n < 32 {
+        return Value::String("***".to_string());
     }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[n - 4..].iter().collect();
+    Value::String(format!("{}...{}", head, tail))
 }
 
 /// Recursively mask credentials.
@@ -463,24 +489,76 @@ mod tests {
     /// nested credential was exported and printed in clear.
     #[test]
     fn mask_redacts_nested_credentials() {
+        let long_a = "a".repeat(40);
+        let long_b = format!("nvapi-{}", "b".repeat(40));
         let v = serde_json::json!({
-            "auxiliary": { "approval": { "api_key": "plainvalue123456" } },
-            "providers": { "x": { "api_key": "nvapi-abcdef123456" } },
+            "auxiliary": { "approval": { "api_key": long_a } },
+            "providers": { "x": { "api_key": long_b } },
             "model": { "token_type": "Bearer", "default": "x" }
         });
         let m = mask(v);
-        assert_eq!(m["auxiliary"]["approval"]["api_key"], "plainval...3456");
-        assert_eq!(m["providers"]["x"]["api_key"], "nvapi-ab...3456");
+        assert_eq!(m["auxiliary"]["approval"]["api_key"], "aaaa...aaaa");
+        assert_eq!(m["providers"]["x"]["api_key"], "nvap...bbbb");
         assert_eq!(m["model"]["token_type"], "Bearer", "not a credential slot");
         assert_eq!(m["model"]["default"], "x", "not a credential");
     }
 
+    /// F4: an `Authorization: Bearer <token>` header and a bare `key:` slot leaked
+    /// because neither the key name nor the value prefix matched.
+    #[test]
+    fn mask_redacts_authorization_headers_and_bare_keys() {
+        let long = "z".repeat(40);
+        let v = serde_json::json!({
+            "auxiliary": { "approval": { "headers": { "Authorization": format!("Bearer {long}") } } },
+            "providers": { "x": { "key": long } }
+        });
+        let m = mask(v);
+        let auth = m["auxiliary"]["approval"]["headers"]["Authorization"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !auth.contains(&"z".repeat(40)),
+            "the bearer token leaked: {auth}"
+        );
+        let bare = m["providers"]["x"]["key"].as_str().unwrap();
+        assert_ne!(bare, "z".repeat(40), "the bare key leaked");
+        assert!(
+            bare == "***" || bare.contains("..."),
+            "expected a masked form, got {bare}"
+        );
+    }
+
+    /// F3: a 13-character secret used to leak 12 of its 13 characters.
+    #[test]
+    fn mask_hides_short_secrets_completely() {
+        let v = serde_json::json!({ "model": { "api_key": "sk-1234567890" } }); // 13 chars
+        let m = mask(v);
+        assert_eq!(m["model"]["api_key"], "***");
+    }
+
+    /// Pointers to a credential are not credentials: masking them hides a name
+    /// that an operator needs, e.g. which env var holds the key.
+    #[test]
+    fn mask_leaves_credential_pointers_readable() {
+        let v = serde_json::json!({ "providers": { "x": { "api_key_env": "OPENROUTER_KEY" } } });
+        let m = mask(v);
+        assert_eq!(m["providers"]["x"]["api_key_env"], "OPENROUTER_KEY");
+    }
+
     #[test]
     fn mask_redacts_api_keys() {
+        // Short: masked whole (a 13-char key used to leak 12 of 13).
         assert_eq!(
-            mask(Value::String("sk-abcdef1234567890".into())),
-            Value::String("sk-abcde...7890".into())
+            mask(Value::String("sk-1234567890".into())),
+            Value::String("***".into())
         );
+        // Long: 4 + 4 only.
+        let long = format!("sk-{}", "a".repeat(40));
+        assert_eq!(
+            mask(Value::String(long)),
+            Value::String("sk-a...aaaa".into())
+        );
+        // Not a credential.
         assert_eq!(
             mask(Value::String("plain".into())),
             Value::String("plain".into())
@@ -573,18 +651,22 @@ mod tests {
     #[test]
     fn extract_from_minimal_yaml() {
         let p = std::env::temp_dir().join("hug-test-extract.yaml");
+        let secret = format!("sk-{}", "b".repeat(40));
         std::fs::write(
             &p,
-            "model:\n  provider: openrouter\n  default: x\n  api_key: sk-1234567890123456\n",
+            format!("model:\n  provider: openrouter\n  default: x\n  api_key: {secret}\n"),
         )
         .unwrap();
         let v = extract_surface(&p).unwrap();
         assert_eq!(v["model.provider"], "openrouter");
         let masked = v["model.api_key"].as_str().unwrap();
         assert!(
-            masked.starts_with("sk-1234"),
-            "api key not masked: {}",
-            masked
+            !masked.contains(&"b".repeat(40)),
+            "the full key leaked through extract_surface: {masked}"
+        );
+        assert!(
+            masked.contains("..."),
+            "expected a masked form, got {masked}"
         );
         let _ = std::fs::remove_file(&p);
     }
