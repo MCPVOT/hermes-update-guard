@@ -10,6 +10,8 @@ mod context_health;
 mod drift;
 mod env;
 mod guard;
+mod logsignals;
+mod mcpcheck;
 mod preflight;
 mod quarantine;
 mod retire;
@@ -99,7 +101,15 @@ enum Cmd {
         /// Audit one profile in depth (readiness + transcript health) instead of the fleet.
         #[arg(long)]
         profile: Option<String>,
+        /// Also print the fleet's top log-noise signatures.
+        #[arg(long)]
+        logs: bool,
     },
+    /// MCP server readiness: enabled servers, token state, headless-auth failures.
+    Mcp,
+    /// Snapshot the fleet's log signatures so the next run can attribute NEW error
+    /// signatures to the update that introduced them.
+    SnapshotLogs,
     /// Move stale update markers (.hermes-update-*) into a dated quarantine dir.
     /// Refuses to touch a marker whose owner pid is still alive. Nothing is deleted.
     Quarantine {
@@ -177,15 +187,25 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Verify => verify::run(&home),
-        Cmd::Health { profile } => match profile {
+        Cmd::Mcp => mcpcheck::run(&home),
+        Cmd::SnapshotLogs => {
+            let sp = logsignals::snapshot(&home)?;
+            println!("log-signal snapshot written: {}", sp.display());
+            Ok(())
+        }
+        Cmd::Health { profile, logs } => match profile {
             Some(p) => {
                 let bad = crate::context_health::report_readiness(&home, &p)?;
+                if logs {
+                    println!();
+                    let _ = crate::logsignals::report(&home, 12);
+                }
                 if bad {
                     std::process::exit(1);
                 }
                 Ok(())
             }
-            None => context_health::run(&home),
+            None => context_health::run_with(&home, logs),
         },
         Cmd::Quarantine { apply } => quarantine::run(&home, apply),
         Cmd::Retire { profile, undo } => retire::run(&home, &profile, undo),
