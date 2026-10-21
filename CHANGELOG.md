@@ -23,6 +23,20 @@ log-signal quality). Every finding below was reproduced before it was changed.
   and `max_tokens` stay readable.
 - **A personal path was committed** in `PUBLISH.md` (`C:/Users/<name>/...`).
   Replaced with `<your checkout>`.
+- **Short secrets were nearly transparent.** `mask_str` kept the first 8 and last 4
+  characters of anything over 12, so a 13-character credential was 12/13 visible
+  and a prefixed token was close to recoverable. Below 32 characters a value is now
+  masked whole; above that, 4 + 4.
+- **Two nested shapes still exported in clear** (found by re-testing the first fix
+  against real provider shapes): `Authorization: Bearer <token>` — the key name says
+  nothing and the value starts with a scheme, so neither rule fired — and a bare
+  `key:` slot. `authorization`/`bearer`/`cookie` and a bare `key` are credential
+  slots now, a `Bearer`/`Basic` value counts as secret on sight, and pointers such
+  as `api_key_env` / `*_name` / `*_url` stay readable because they name a
+  credential rather than being one.
+
+  Verified end to end on a synthetic home containing all three shapes: the exported
+  `p1.json` contains no full token (`FULL TOKEN PRESENT IN FILE: False`).
 
 ### Fixed - log signals
 
@@ -365,7 +379,12 @@ reports a real `exp=2026-10-21` expiry; `health --logs` surfaces 204 ×
   `hermes-provider-drift.ps1` semantics; `hermes update --yes` is invoked via the
   official CLI, never reimplemented.
 
-[Unreleased]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.3.5...HEAD
+[0.3.5]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.3.4...v0.3.5
+[0.3.4]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.3.3...v0.3.4
+[0.3.3]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.3.2...v0.3.3
+[0.3.2]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/MCPVOT/hermes-update-guard/compare/v0.1.0...v0.1.1

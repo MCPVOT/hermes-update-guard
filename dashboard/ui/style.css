@@ -373,6 +373,12 @@ body {
   background: color-mix(in srgb, var(--fail) 16%, transparent);
 }
 
+/* Stale / finished-without-a-code: neither PASS nor FAIL is honest here. */
+.verdict.warn {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 16%, transparent);
+}
+
 .muted {
   color: var(--text-3);
   font-size: 11px;

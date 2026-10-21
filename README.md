@@ -123,7 +123,9 @@ cargo build --release         # or run target/release/hermes-update-guard
 | `verify` | Post-update: HEAD advanced, DB integrity, **local-patch restoration**, drift-vs-export, gateway pid/state | **exit 1 on any failed or unperformable check** |
 | `watch` | Live, read-only view of a run: stage rail, per-profile backup matrix, blockers, log tail (`--no-tui` for a one-shot snapshot) | none (read-only) |
 | `bless` | Approve the **current** live provider surface as the golden reference (an explicit operator decision, not a side effect of a check) | none |
-| `health` | Transcript / context-health audit per profile — live-vs-duplicate rows, bloat, stuck sessions (`--profile <name>` for one) | `exit 1` when a profile is problematic |
+| `health` | Transcript / context-health audit per profile — live-vs-duplicate rows, bloat, stuck sessions (`--profile <name>` for one). Add `--logs` for the fleet's log-noise signatures | `exit 1` when a profile is problematic |
+| `mcp` | MCP readiness per profile: which servers are enabled, their auth type, and whether an OAuth token is present, expired or unreadable. `auth: none` servers are never flagged | `exit 1` when an enabled OAuth server cannot authenticate headlessly |
+| `snapshot-logs` | Record the fleet's error-signature counts so a later `verify` can attribute only **new** signatures to the update | none (writes one file under `backups/`) |
 | `quarantine` | Move stale `.hermes-update*` markers into `backups/update-state-quarantine/<stamp>/`. Prints the plan; `--apply` moves. Treats the markers as a *set* and refuses everything if any owner pid is live or unverifiable | none unless `--apply` |
 | `retire <profile>` | Record that a profile is **gone on purpose**, so `self-check` stops flagging it as missing (`--undo` restores the flag). Refuses if the profile still exists on disk | none |
 | `self-check` | Is the binary you are running the one you think? PATH resolution, stale clones, repo vs installed build, the fleet, **profiles that vanished since an earlier backup**, context health | `exit 1` when something needs attention |
@@ -161,8 +163,8 @@ exist so you can inspect or stop at any stage.
 change — the same thirteen keys the original drift script guarded:
 
 `model.provider`, `model.default`, `model.base_url`, `model.api_key`,
-`auxiliary`, `fallback_providers`, `fallback_model`, `delegation`,
-`providers`, `moa`, `display.language`, `stt.language`
+`model.fallback`, `auxiliary`, `fallback_providers`, `fallback_model`,
+`delegation`, `providers`, `moa`, `display.language`, `stt.language`
 
 Secrets are **masked** (`sk-…` / `nvapi…` truncated) before anything is written,
 and the manifest records a SHA-256 of each snapshot. The tool never writes to
