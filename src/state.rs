@@ -42,7 +42,14 @@ pub struct RunState {
     pub updated_at: String,
     pub stages: Vec<Stage>,
     pub profiles: Vec<Profile>,
+    /// Reasons the run did NOT proceed. A non-empty `blockers` means failure.
     pub blockers: Vec<String>,
+    /// Problems noticed during a run that still proceeded: dead-pid receipts, a
+    /// recovered gateway, a skipped preflight. Kept out of `blockers` because a
+    /// PASS with `blockers: ["3 unfinished update receipt(s)"]` read as a lie -
+    /// the reader cannot tell whether the run was safe.
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub log_path: String,
     pub guard_pid: u32,
     pub child_pid: Option<u32>,
@@ -83,6 +90,7 @@ impl RunState {
                 .collect(),
             profiles: Vec::new(),
             blockers: Vec::new(),
+            warnings: Vec::new(),
             log_path: log_path.to_string_lossy().to_string(),
             guard_pid: std::process::id(),
             child_pid: None,
@@ -132,6 +140,14 @@ impl RunState {
     pub fn blocker(&mut self, msg: &str) {
         if !self.blockers.iter().any(|b| b == msg) {
             self.blockers.push(msg.to_string());
+        }
+        self.updated_at = now();
+    }
+
+    /// A problem the run noted and continued past. Never affects the verdict.
+    pub fn warn(&mut self, msg: &str) {
+        if !self.warnings.iter().any(|w| w == msg) {
+            self.warnings.push(msg.to_string());
         }
         self.updated_at = now();
     }
@@ -186,6 +202,48 @@ pub fn elapsed_since(stamp: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The defect from run 20261021-201542: a PASS wrote a dead receipt into
+    /// `blockers`, so the state file said "blocked" and "exit 0" at once.
+    #[test]
+    fn warnings_never_land_in_blockers() {
+        let root = std::env::temp_dir().join(format!("hug-warn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut s = RunState::new(&root, "0.3.7");
+        s.warn("3 unfinished update receipt(s)");
+        s.warn("3 unfinished update receipt(s)"); // deduped
+        s.blocker("venv held by pid 123");
+        s.finish(0);
+        s.write(&root).unwrap();
+
+        let back = RunState::read(&root).unwrap();
+        assert_eq!(back.warnings.len(), 1);
+        assert_eq!(back.blockers, vec!["venv held by pid 123"]);
+        assert_eq!(back.exit_code, Some(0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A state file written before `warnings` existed must still load: the field
+    /// is additive and defaults to empty rather than failing the read.
+    #[test]
+    fn old_state_without_warnings_still_reads() {
+        let root = std::env::temp_dir().join(format!("hug-compat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let s = RunState::new(&root, "0.3.7");
+        s.write(&root).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(state_path(&root)).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("warnings");
+        std::fs::write(state_path(&root), serde_json::to_string(&v).unwrap()).unwrap();
+
+        let back = RunState::read(&root).unwrap();
+        assert!(back.warnings.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn state_round_trips_and_tracks_stage_times() {

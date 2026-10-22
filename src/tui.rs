@@ -232,6 +232,19 @@ fn draw_profiles(f: &mut Frame, area: Rect, st: Option<&RunState>) {
                 )));
             }
         }
+        if !s.warnings.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " WARNINGS",
+                Style::default().fg(MUT).add_modifier(Modifier::BOLD),
+            )));
+            for w in s.warnings.iter().take(4) {
+                lines.push(Line::from(Span::styled(
+                    format!(" - {}", truncate(w, 34)),
+                    Style::default().fg(MUT),
+                )));
+            }
+        }
     }
 
     let p = Paragraph::new(lines)

@@ -6,6 +6,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-10-21
+
+Everything here comes from reading run `20261021-201542` back line by line. The
+run passed — and it still lied in three places.
+
+### Fixed - the state file
+
+- **`blockers` was a junk drawer.** A PASS wrote `blockers: ["3 unfinished
+  update receipt(s)"]` with `exit_code: 0`. Dead receipts, a recovered gateway
+  and `--skip-preflight` all landed there; none of them stops a run. There is a
+  `warnings` list now (additive — old state files load with it empty), the TUI
+  and the window render it separately, and `blockers` is non-empty only when the
+  run actually failed.
+- **Three dead receipts printed four lines every run, forever.** Collapsed to one
+  line plus a hint, and `quarantine --receipts [--apply]` moves them into the
+  dated quarantine dir. It refuses the whole batch if any receipt's pid cannot be
+  *proven* dead — that is either a live update or an unanswered probe.
+
+### Fixed - the gateway verdict
+
+- **A one-shot liveness probe called a gateway "alive" 18 seconds before its
+  replacement killed it.** The updater respawns its own gateway with `--replace`,
+  so the guard now requires the *same* pid alive on two probes 8 s apart.
+- **The restart wait was 15 s against a ~78 s boot**, which is why "gateway did
+  not come back" appeared even when it did. It is 120 s now, and it waits for a
+  new pid rather than the old one.
+- **`verify` passed things it could not prove.** An undeterminable pid was a
+  `!` note; a running gateway with no `code_sha` was skipped entirely; a
+  gateway recorded as not-running was not examined at all. All three are FAILs or
+  explicit notes now, because "cannot verify" is not "verified".
+
+### Changed - speed
+
+- **Database integrity checks run in parallel.** Six serial `PRAGMA
+  integrity_check` passes over ~4.7 GB were ~75 s of every verify. Output stays
+  in profile order.
+- **Tags are fetched during the backup**, not left to Hermes' 30 s budget inside
+  `update`. When that budget timed out, Hermes wrote a version label from stale
+  tags (`0.22.2+3030` while the tree *was* the v0.22.4 commit) and warned about
+  it. The backup takes minutes, so the prefetch has long finished by then.
+
+### Fixed - the log report
+
+- **One event was reported once per log file.** The snapshot key is
+  `"<profile>/<stream>|<signature>"`, so a single OAuth failure logged to
+  `agent`, `errors` and `gateway` read as three problems. Rows are merged by
+  signature for display; counts sum and the labels are listed.
+
 ## [0.3.6] - 2026-10-21
 
 The watch window is no longer a manual step — an update opens it — and three

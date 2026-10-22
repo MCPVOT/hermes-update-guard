@@ -1,7 +1,7 @@
 ---
 name: hermes-update-guard
 description: Use when running or verifying a `hermes update`, or after a failed update left a stale lock — drives the guarded pipeline (preflight, WAL-safe backup, provider-drift tripwire, post-verify) through the hermes-update-guard binary.
-version: 0.3.6
+version: 0.3.7
 author: MCPVOT
 license: MIT
 platforms: [macos, linux, windows]
@@ -40,6 +40,7 @@ tripwire — the whole scripted update ritual in one static binary.
 | Watch a run live | `hermes-update-guard watch` (or `watch --no-tui` for a snapshot) |
 | Watch it in a pop-up window | `update` opens it automatically; `hermes-update-guard dashboard` opens it on the last run; `--no-dashboard` suppresses it (cron/ssh) |
 | Verify after | `hermes-update-guard verify` |
+| Clear stale update markers | `hermes-update-guard quarantine` (plan) / `--apply`; add `--receipts` for dead receipt files |
 | Record a profile as gone on purpose | `hermes-update-guard retire <profile>` (undo: `--undo`) |
 | Transcript / context-health audit | `hermes-update-guard health` |
 | One profile in depth | `hermes-update-guard health --profile <name>` |
@@ -100,6 +101,7 @@ local build). If it is not installed:
   `interrupted`, `finished_at=null`): check the **pid**. `pid dead` = a stale receipt,
   history, nothing in flight — the real update it owed was completed later, so it
   does NOT block. `pid LIVE` = an update is genuinely running; never start a second.
+  Dead ones are a *warning* (0.3.7+) and `quarantine --receipts --apply` moves them.
 - `health --profile <name>` is the **readiness** view for one profile: model/provider,
   the credential that provider actually uses (resolved through the profile's own
   `providers.<name>.api_key_env` when it is a custom provider), fallback-chain
@@ -166,12 +168,48 @@ local build). If it is not installed:
 - `backup` has a **disk-space gate**: it measures the fleet's databases, asks for
   1.5x + 512 MB, and refuses before copying if the volume cannot take it. The
   fleet's DBs are large (one profile was measured at 2.0 GB; the fleet at
-  ~2.9 GB), so a backup is not a small operation.
+  4.7 GB, ~5.5 GB needed), so a backup is not a small operation.
 - `gateway_state.json` is not proof of life — `verify` checks the pid.
 - The profile fleet is discovered from the home on disk, not hardcoded, so the
   same binary works on a host with a different profile set (a droplet running
   `hoodbot/sentinel/solana/storemoat`). The hermes CLI is resolved through the
   venv, then `~/.local/bin` and `/usr/local/bin`, then `PATH`.
+
+### What a normal run looks like (measured, 6 profiles)
+
+Run `20261021-201542`, Windows, 4.7 GB of `state.db` across the fleet:
+
+| stage | time | note |
+|---|---|---|
+| preflight | 36 s | |
+| export | 0.2 s | |
+| backup | 2 m 31 s | 26 files + 6 DBs, integrity-checked; needs ~5.5 GB |
+| **update** | **25 m 21 s** | 78% of the run — `hermes update` itself |
+| verify | 3 m 41 s | |
+
+Inside those 25 minutes the budget is Hermes's, not the guard's: git
+fetch/stash/pull ≈5 min, node deps ≈4 min, **web UI + desktop build ≈14 min**.
+Expect ~30 minutes; a long UPDATE stage is not a hang.
+
+Expected noise on Windows that is **not** a fault:
+
+- `Windows gateway restart could not be verified … #48820` and
+  `Update follow-up 'gateway_restart' did not finish`. The updater respawns its
+  own gateway with `--replace`, killing the one it just started. The guard's
+  `-- GATEWAY RECOVERY --` block is the authority: it requires the same pid alive
+  on two probes and waits up to 120 s. Never restart the gateway in parallel.
+- `Quick snapshot skipped state.db: exceeds … limit` — Hermes' own snapshot
+  refuses any DB over 1 GB (hardcoded), so the guard's backup is the only restore
+  point for a profile like `vot`.
+
+### What exit 0 does and does not mean
+
+Without `--detached`, exit 0 means every stage ran and `verify` returned Ok.
+
+With `--detached`, exit 0 means **only that the child process spawned**. The real
+verdict is the child's: read `backups/guard-run.json` (`exit_code`, `blockers`,
+`warnings`) or run `verify` afterwards. Non-empty `blockers` = failure;
+non-empty `warnings` = noted-and-continued, still a PASS.
 
 ## Pitfalls
 
@@ -235,6 +273,7 @@ Nothing above is about changing the binary. Load:
 | Fix / improve / release the guard: gates, CI matrix, branch protection, release + publish, version bumps, reviewing another agent's landing, how to record an operator decision instead of weakening a check | `references/repo-maintenance.md` |
 | What the update pipeline actually does underneath | `references/hermes-update-internals.md` |
 | The `watch` TUI: layout, palette, read-only contract | `references/tui-watch-view.md` |
+| Reading a finished run: measured timings, where the minutes go, the gateway churn, a stale version label | `references/run-forensics.md` |
 | The pop-up window (`dashboard/`, separate Tauri crate, excluded from packaging) | the `tauri-desktop-app` skill |
 
 ## Manual restore (emergency)
