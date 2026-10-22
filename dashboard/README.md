@@ -16,14 +16,47 @@ build is how installs get stranded. That leaves two problems:
 This is that window. It is a separate process with its own WebView2 instance, so
 the desktop closing does not close it, and it can be pinned on top.
 
+## How it gets opened
+
+`hermes-update-guard update` opens it by itself, right after `backups/guard-run.json`
+is written for the current run — so the window shows *this* run, not the last one.
+It is spawned detached, which is what lets it outlive the desktop app the update
+closes. Opening it is optional in every direction: if it is missing, or dies on
+start, the update prints a note and continues.
+
+| You want | Do |
+|---|---|
+| the window during an update | nothing — it opens |
+| the window without an update | `hermes-update-guard dashboard` |
+| no window (cron, ssh, CI) | `update --no-dashboard` |
+
+## Installing it
+
+There are three files, not one. On Windows the executable needs the loader beside
+it or it dies instantly with `WebView2Loader.dll: cannot open shared object file`:
+
+```
+hermes-guard-dashboard.exe
+WebView2Loader.dll
+```
+
+Copy both next to `hermes-update-guard.exe` (the guard looks there first, then on
+`PATH`). `start_dashboard` waits ~900 ms and checks the child is still alive, so a
+broken install is reported instead of being mistaken for a running window.
+
 ## Read-only by construction
 
-The window has exactly two commands:
+The window has exactly three commands, none of which touch a run:
 
 | command | effect |
 |---|---|
 | `snapshot()` | reads `backups/guard-run.json` + tails `guard-update.log` |
 | `set_always_on_top(on)` | pins the window |
+| `close_window()` | closes the window (Esc) |
+
+`close_window` exists as an app command rather than `plugin:window|close` because
+this crate ships no `capabilities/` file: a plugin call would be ACL-denied and
+Esc would silently do nothing.
 
 It cannot start, stop or alter an update. The same rule the TUI follows: a viewer
 that can break an update is a liability, and a viewer crash must never strand an

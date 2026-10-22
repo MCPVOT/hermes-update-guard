@@ -175,11 +175,9 @@ function setWindowTitle(text) {
   if (text === lastTitle) return;
   lastTitle = text;
   document.title = text;
-  try {
-    invoke("set_window_title", { text });
-  } catch (_) {
-    /* not running under Tauri */
-  }
+  // invoke() returns a Promise, so a try/catch around it catches nothing — an
+  // ACL rejection would surface as an unhandled rejection on every title change.
+  Promise.resolve(invoke?.("set_window_title", { text })).catch(() => {});
 }
 
 /** The poll broke: say so instead of leaving a stale PASS/FAIL on screen. */
@@ -209,7 +207,11 @@ function render(snap) {
     lastLogKey = "";
     lastProfilesKey = "";
     setWindowTitle("hermes-update-guard · IDLE");
-    if (snap.error) $("run").textContent = "no run state yet";
+    // Show what actually failed (bad path, unreadable JSON) instead of hiding it
+    // behind a friendly "no run state yet".
+    $("run").textContent = snap.error
+      ? `no run state: ${String(snap.error).slice(0, 90)}`
+      : "no run state yet";
     return;
   }
 
@@ -249,13 +251,13 @@ $("pin").addEventListener("click", async () => {
 
 // Escape closes the window, like every other pop-up. It is the only key that
 // does anything: nothing here can touch a run.
+//
+// This goes through an app command rather than `plugin:window|close`: the crate
+// ships no capabilities file, so a plugin call would be ACL-denied and Escape
+// would silently do nothing.
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
-    try {
-      window.__TAURI__.window.getCurrentWindow().close();
-    } catch (_) {
-      /* not running under Tauri: leave the page alone */
-    }
+    Promise.resolve(invoke?.("close_window")).catch(() => {});
   }
 });
 

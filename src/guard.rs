@@ -16,9 +16,10 @@ pub fn run(
     force: bool,
     detached: bool,
     channel: Option<&str>,
+    dashboard: bool,
 ) -> Result<()> {
     if detached {
-        return spawn_detached(home, close_desktop, force, channel);
+        return spawn_detached(home, close_desktop, force, channel, dashboard);
     }
 
     crate::vibe::print_compact(env!("CARGO_PKG_VERSION"));
@@ -27,6 +28,18 @@ pub fn run(
     let mut st = RunState::new(home, env!("CARGO_PKG_VERSION"));
     st.seed_profiles(&env::profiles(home));
     let _ = st.write(home);
+
+    // Open the watch window only now: the state file exists, so it renders THIS
+    // run instead of the previous one. Optional by construction — an update must
+    // never depend on a GUI being present or startable.
+    if dashboard {
+        match start_dashboard(home) {
+            Some(p) => println!("  dashboard : \"{}\" - live view", p.display()),
+            None => println!(
+                "  dashboard : not built (cd dashboard && cargo build --release) - terminal views still work"
+            ),
+        }
+    }
 
     let result = run_stages(home, close_desktop, force, &mut st, channel);
 
@@ -368,6 +381,69 @@ fn dashboard_exe() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Open the watch window on demand (`hermes-update-guard dashboard`).
+pub fn open_dashboard(home: &Path) -> Result<()> {
+    match start_dashboard(home) {
+        Some(p) => {
+            println!("dashboard : \"{}\"", p.display());
+            Ok(())
+        }
+        None => bail!(
+            "dashboard did not start: build it with `cd dashboard && cargo build --release`, \
+             and keep WebView2Loader.dll next to the executable"
+        ),
+    }
+}
+
+/// Open the pop-up watch window for this run.
+///
+/// Detached, so it outlives the Hermes desktop app that `--close-desktop` stops —
+/// which is the whole reason it exists. Every failure path returns `None`: a
+/// window that will not open is a missing convenience, never a failed update.
+fn start_dashboard(home: &Path) -> Option<std::path::PathBuf> {
+    use std::process::{Command, Stdio};
+
+    let exe = dashboard_exe()?;
+    let mut cmd = Command::new(&exe);
+    cmd.arg("--home").arg(home);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    let spawned = {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        // A window that is still inside the shell's job object dies with the
+        // shell — and the shell IS what the update kills. Breakaway is what makes
+        // "outlives the desktop app" true. Not every job allows it, so fall back.
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
+        match cmd.spawn() {
+            Ok(c) => Ok(c),
+            Err(_) => {
+                cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+                cmd.spawn()
+            }
+        }
+    };
+    #[cfg(not(windows))]
+    let spawned = cmd.spawn();
+
+    let mut child = spawned.ok()?;
+
+    // A spawn that succeeds proves nothing: the window can die in milliseconds
+    // (missing WebView2Loader.dll, no desktop session). Claiming the window is up
+    // when it is not would send the operator looking for something that cannot
+    // exist, so the child has to survive a moment before it counts.
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    match child.try_wait() {
+        Ok(None) => Some(exe),
+        _ => None,
+    }
+}
+
 /// Run the update in its own process, detached from this terminal.
 ///
 /// Two of the historical update failures were finalisers killed by a caller's
@@ -379,6 +455,7 @@ fn spawn_detached(
     close_desktop: bool,
     force: bool,
     channel: Option<&str>,
+    dashboard: bool,
 ) -> Result<()> {
     use std::process::{Command, Stdio};
 
@@ -401,6 +478,10 @@ fn spawn_detached(
     if let Some(ch) = channel {
         cmd.arg("--channel").arg(ch);
     }
+    // The child opens the window, not this parent (two windows otherwise).
+    if !dashboard {
+        cmd.arg("--no-dashboard");
+    }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::from(file.try_clone()?));
     cmd.stderr(Stdio::from(file));
@@ -420,11 +501,15 @@ fn spawn_detached(
     println!("  state     : {}", crate::state::state_path(home).display());
     println!("\n  watch it  : hermes-update-guard watch");
     println!("  snapshot  : hermes-update-guard watch --no-tui");
-    match dashboard_exe() {
-        Some(p) => println!("  dashboard : \"{}\"  (pop-up window, survives the desktop closing)", p.display()),
-        None => println!(
+    match (dashboard, dashboard_exe()) {
+        (true, Some(p)) => println!(
+            "  dashboard : \"{}\"  (opens with the run, survives the desktop closing)",
+            p.display()
+        ),
+        (true, None) => println!(
             "  dashboard : not built (cd dashboard && cargo build --release) - the terminal views above still work"
         ),
+        (false, _) => println!("  dashboard : disabled by --no-dashboard"),
     }
     Ok(())
 }

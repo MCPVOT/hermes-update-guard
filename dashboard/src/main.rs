@@ -132,6 +132,13 @@ fn set_window_title(window: tauri::Window, text: String) -> Result<(), String> {
     window.set_title(&text).map_err(|e| e.to_string())
 }
 
+/// Escape closes the window. A command rather than `plugin:window|close`, which
+/// would need a capabilities file this crate deliberately does not ship.
+#[tauri::command]
+fn close_window(window: tauri::Window) -> Result<(), String> {
+    window.close().map_err(|e| e.to_string())
+}
+
 fn main() {
     let home = home_from_args();
     tauri::Builder::default()
@@ -139,7 +146,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             snapshot,
             set_always_on_top,
-            set_window_title
+            set_window_title,
+            close_window
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the dashboard window");

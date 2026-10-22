@@ -49,8 +49,14 @@ watched live without the viewer being able to touch it:
 
 - `hermes-update-guard watch` — full-screen terminal view (ratatui)
 - `hermes-update-guard watch --no-tui` — one-shot snapshot for scripts/CI
-- [`dashboard/`](dashboard/) — a pop-up Tauri window in the Hermes desktop palette,
-  for when the Hermes app itself is closed by the update
+- [`dashboard/`](dashboard/) — a pop-up Tauri window in the Hermes desktop palette.
+  **`update` opens it by itself** once the run's state file exists, spawned
+  detached so it outlives the Hermes app that `--close-desktop` stops. The
+  window is optional: if it is not built, or will not start, the run prints a
+  note and carries on. Open it without an update with
+  `hermes-update-guard dashboard`, or suppress it with `--no-dashboard`.
+  Installing it means **two** files on Windows: the `.exe` and `WebView2Loader.dll`
+  beside it.
 
 ## Contents
 
@@ -122,6 +128,7 @@ cargo build --release         # or run target/release/hermes-update-guard
 | `update` | Full guarded update: preflight gate → export → backup → `hermes update --yes` → verify. Add `--detached` to run it in its own process group so a closed terminal or a caller timeout cannot kill the build | refuses while a venv is held (or its state is unknown) or the desktop app is running (add `--close-desktop`) |
 | `verify` | Post-update: HEAD advanced, DB integrity, **local-patch restoration**, drift-vs-export, gateway pid/state | **exit 1 on any failed or unperformable check** |
 | `watch` | Live, read-only view of a run: stage rail, per-profile backup matrix, blockers, log tail (`--no-tui` for a one-shot snapshot) | none (read-only) |
+| `dashboard` | Open the pop-up window on the latest run — the same one `update` opens automatically (`--no-dashboard` suppresses it) | none (read-only) |
 | `bless` | Approve the **current** live provider surface as the golden reference (an explicit operator decision, not a side effect of a check) | none |
 | `health` | Transcript / context-health audit per profile — live-vs-duplicate rows, bloat, stuck sessions (`--profile <name>` for one). Add `--logs` for the fleet's log-noise signatures | `exit 1` when a profile is problematic |
 | `mcp` | MCP readiness per profile: which servers are enabled, their auth type, and whether an OAuth token is present, expired or unreadable. `auth: none` servers are never flagged | `exit 1` when an enabled OAuth server cannot authenticate headlessly |

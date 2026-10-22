@@ -1,7 +1,7 @@
 ---
 name: hermes-update-guard
 description: Use when running or verifying a `hermes update`, or after a failed update left a stale lock — drives the guarded pipeline (preflight, WAL-safe backup, provider-drift tripwire, post-verify) through the hermes-update-guard binary.
-version: 0.3.5
+version: 0.3.6
 author: MCPVOT
 license: MIT
 platforms: [macos, linux, windows]
@@ -38,6 +38,7 @@ tripwire — the whole scripted update ritual in one static binary.
 | Guarded update (all-in-one) | `hermes-update-guard update --close-desktop` |
 | Unattended update (survives a closed shell) | `hermes-update-guard update --close-desktop --detached` |
 | Watch a run live | `hermes-update-guard watch` (or `watch --no-tui` for a snapshot) |
+| Watch it in a pop-up window | `update` opens it automatically; `hermes-update-guard dashboard` opens it on the last run; `--no-dashboard` suppresses it (cron/ssh) |
 | Verify after | `hermes-update-guard verify` |
 | Record a profile as gone on purpose | `hermes-update-guard retire <profile>` (undo: `--undo`) |
 | Transcript / context-health audit | `hermes-update-guard health` |
