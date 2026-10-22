@@ -12,9 +12,20 @@ use crate::env;
 /// (no hermes-agent, unreadable HEAD, no venv) and even counted git's stderr as
 /// "1 local modification re-applied". A verifier that cannot fail is worse than no
 /// verifier, because it certifies a broken install.
+/// Print how long a section took, but only when `HUG_TIMING` is set. Verify is
+/// dominated by the DB integrity passes and it is easy to guess wrong about
+/// where the minutes go; this makes the answer measurable instead.
+fn mark(what: &str, since: &mut std::time::Instant) {
+    if std::env::var_os("HUG_TIMING").is_some() {
+        println!("  [timing] {what}: {:.1}s", since.elapsed().as_secs_f64());
+    }
+    *since = std::time::Instant::now();
+}
+
 pub fn run(home: &Path) -> Result<()> {
     println!("== POST-UPDATE VERIFY ==");
 
+    let mut t = std::time::Instant::now();
     let mut failures: Vec<String> = Vec::new();
     let repo = home.join("hermes-agent");
 
@@ -56,16 +67,37 @@ pub fn run(home: &Path) -> Result<()> {
         },
     }
 
+    mark("head+version", &mut t);
     // ---- 3. database integrity ---------------------------------------------
     println!("  databases:");
+    let names: Vec<String> = env::profiles(home)
+        .into_iter()
+        .filter(|p| env::state_db(home, p).exists())
+        .collect();
+    // Six serial `integrity_check` passes over ~4.7 GB cost about 75 s of the
+    // 3m41s verify, and the checks are independent reads. Run them together;
+    // print in profile order so the output stays diffable.
+    let results: Vec<(String, Result<(String, i64)>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = names
+            .iter()
+            .map(|p| {
+                let db = env::state_db(home, p);
+                let label = p.clone();
+                scope.spawn(move || (label, integrity(&db)))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| ("?".into(), Err(anyhow::anyhow!("panic"))))
+            })
+            .collect()
+    });
     let mut checked = 0usize;
-    for p in env::profiles(home).iter().map(|s| s.as_str()) {
-        let db = env::state_db(home, p);
-        if !db.exists() {
-            continue;
-        }
+    for (p, res) in results {
         checked += 1;
-        match integrity(&db) {
+        match res {
             Ok((ok, msgs)) => {
                 if ok != "ok" {
                     println!("  FAIL {} integrity={}", p, ok);
@@ -85,6 +117,7 @@ pub fn run(home: &Path) -> Result<()> {
         failures.push("no state.db found in any profile".into());
     }
 
+    mark("databases", &mut t);
     // ---- 4. local patch restoration ----------------------------------------
     println!("  local patch (stash/restore):");
     check_patch_restored(home, &repo, &mut failures);
@@ -93,6 +126,7 @@ pub fn run(home: &Path) -> Result<()> {
     println!("  provider surface vs last export:");
     check_drift(home, &mut failures);
 
+    mark("patch+drift", &mut t);
     // ---- 6. context health --------------------------------------------------
     // A guarded update must not report "VERIFY: PASS" over a transcript that
     // is duplicated: duplicate live rows double the prompt, so the next
@@ -140,6 +174,7 @@ pub fn run(home: &Path) -> Result<()> {
         }
     }
 
+    mark("context health", &mut t);
     // ---- 7. gateway state ---------------------------------------------------
     let gw = home.join("gateway_state.json");
     if gw.exists() {
@@ -167,14 +202,33 @@ pub fn run(home: &Path) -> Result<()> {
                             ));
                         }
                         env::ProcState::Unknown(why) => {
-                            println!("  ! could not determine whether gateway pid {} is alive ({}): treat as suspect", pid, why);
+                            // Fail closed: a gateway whose liveness cannot be
+                            // established is not a verified gateway. This used to
+                            // be a note, which let an unprovable state pass.
+                            println!(
+                                "  FAIL cannot determine whether gateway pid {} is alive ({}): unverifiable",
+                                pid, why
+                            );
+                            failures.push(format!("gateway pid {} liveness unverifiable", pid));
                         }
                     }
+                } else {
+                    println!(
+                        "  ! gateway is recorded as state={} (pid={}); nothing is serving - not a failure if you stopped it deliberately",
+                        st, pid
+                    );
                 }
                 // A gateway serving a DIFFERENT commit than the install is running
                 // pre-update code. The old PowerShell wrapper checked this; the Rust
                 // port lost it, and a stale-code gateway looks perfectly healthy.
-                if !sha.is_empty() {
+                if sha.is_empty() {
+                    // A live gateway that does not say which commit it serves is
+                    // indistinguishable from one running pre-update code.
+                    if pid > 0 {
+                        println!("  FAIL gateway is running but records no code_sha - cannot prove which code it serves");
+                        failures.push("gateway records no code_sha".to_string());
+                    }
+                } else {
                     if let Some(head) = head_sha(home) {
                         if !sha.starts_with(&head) {
                             println!(
@@ -269,12 +323,14 @@ pub fn run(home: &Path) -> Result<()> {
         }
     }
 
+    mark("gateway+receipt", &mut t);
     // ---- log signatures introduced by this update ------------------------
     // The snapshot taken before the update is the baseline: anything that appeared
     // afterwards is a candidate regression, and the pre-existing noise stays noise.
     println!("  log signatures since the pre-update snapshot:");
     let _ = crate::logsignals::report_diff(home);
 
+    mark("log signals", &mut t);
     // ---- verdict ------------------------------------------------------------
     if failures.is_empty() {
         println!("\nVERIFY: PASS");

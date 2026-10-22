@@ -148,7 +148,7 @@ fn run_stages(
                     "  [warn] stale marker {} present - previous update did not finish",
                     m
                 );
-                st.blocker(&format!("stale marker {m}"));
+                st.warn(&format!("stale marker {m}"));
             }
         }
         let no_cfg = env::profiles_without_config(home);
@@ -158,32 +158,37 @@ fn run_stages(
                 no_cfg.len(),
                 no_cfg.join(", ")
             );
-            st.blocker(&format!("{} profile(s) without config.yaml", no_cfg.len()));
+            st.warn(&format!("{} profile(s) without config.yaml", no_cfg.len()));
         }
 
         let stale = crate::preflight::stale_receipts(home);
         if !stale.is_empty() {
-            for s in &stale {
-                println!("  [warn] unfinished update receipt: {}", s);
-            }
             let live = stale.iter().filter(|l| l.contains("pid LIVE")).count();
             if live == 0 {
+                // One line, not one per receipt. Three dead receipts from a week
+                // ago are history; printing them in full every run teaches the
+                // reader to skip exactly the band that matters.
                 println!(
-                    "  [warn] {} stale receipt(s) with dead pids - history, not an update in flight",
+                    "  [warn] {} stale receipt(s), dead pids, history, not in flight",
                     stale.len()
                 );
+                println!("         clear with `hermes-update-guard quarantine --receipts --apply`");
             } else {
                 println!(
                     "  [warn] {} receipt(s) with a LIVE pid - an update is in flight; finish it first",
                     live
                 );
+                for s in stale.iter().filter(|l| l.contains("pid LIVE")).take(3) {
+                    println!("         {s}");
+                }
             }
-            st.blocker(&format!("{} unfinished update receipt(s)", stale.len()));
+            // A dead-pid receipt never stops the update, so it is a warning.
+            st.warn(&format!("{} unfinished update receipt(s)", stale.len()));
         }
         println!("  preflight gate passed");
     } else {
         println!("  preflight gate SKIPPED (--skip-preflight)");
-        st.blocker("preflight SKIPPED (--skip-preflight)");
+        st.warn("preflight SKIPPED (--skip-preflight)");
     }
     st.stage("preflight", StageState::Done);
     let _ = st.write(home);
@@ -199,6 +204,14 @@ fn run_stages(
     // ---- BACKUP ------------------------------------------------------------
     st.stage("backup", StageState::Active);
     let _ = st.write(home);
+    // ---- TAG PREFETCH ------------------------------------------------------
+    // Hermes refreshes its tags during `update` on a 30 s budget. On this machine
+    // that timed out, so it derived the version label from stale tags
+    // (v0.22.2+3030 while the tree WAS the v0.22.4 commit) and warned the label
+    // might be stale. The backup below takes minutes; fetching tags now makes
+    // Hermes' own refresh a no-op.
+    prefetch_tags(home);
+
     println!("\n-- WAL-SAFE BACKUP --");
     let backup_dir = {
         let mut on_db = |profile: &str, ok: bool| {
@@ -295,40 +308,36 @@ fn run_stages(
     // post-update failure, and the reason "the update succeeded but Hermes is
     // dead" kept happening. Recover it here, then verify.
     println!("\n-- GATEWAY RECOVERY --");
-    match crate::verify::gateway_status(home) {
-        Some(g) => {
-            let alive = matches!(env::pid_running(g.pid), env::ProcState::Running);
-            if !alive {
-                println!(
-                    "  gateway pid {} is not running (state={:?}) - restarting it",
-                    g.pid, g.state
-                );
-                st.blocker(&format!("gateway pid {} was down after the update", g.pid));
-                if let Some(h) = env::resolve_hermes(home) {
-                    let (code, out) = env::run_capture(&h, &["gateway", "restart"], None)
-                        .unwrap_or((-1, String::new()));
-                    for l in out.lines().take(8) {
-                        println!("    {}", l.trim());
-                    }
-                    if code != 0 {
-                        println!("  ! `hermes gateway restart` exited {}", code);
-                    }
-                }
-                // give it a moment to come up, then re-read the state
-                for _ in 0..15 {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    if let Some(g2) = crate::verify::gateway_status(home) {
-                        if matches!(env::pid_running(g2.pid), env::ProcState::Running) {
-                            println!("  gateway back up: pid={} state={}", g2.pid, g2.state);
-                            break;
-                        }
-                    }
-                }
-            } else {
-                println!("  gateway alive (pid={})", g.pid);
+    // The updater restarts the gateway asynchronously, and its own `--replace`
+    // can kill the process it just started: a single "alive" read was true at
+    // 20:44:33 and stale 18 seconds later. One pid has to survive two probes.
+    if crate::verify::gateway_status(home).is_none() {
+        println!("  no gateway_state.json - nothing to recover");
+    } else if let Some(pid) = settle_gateway(home, std::time::Duration::from_secs(90)) {
+        println!("  gateway stable (pid={})", pid);
+    } else {
+        let down = crate::verify::gateway_status(home)
+            .map(|g| g.pid)
+            .unwrap_or(0);
+        println!("  gateway pid {} did not settle - restarting it", down);
+        // Down then recovered is a warning: the run continues and verify re-checks.
+        st.warn(&format!("gateway pid {} was down after the update", down));
+        if let Some(h) = env::resolve_hermes(home) {
+            let (code, out) =
+                env::run_capture(&h, &["gateway", "restart"], None).unwrap_or((-1, String::new()));
+            for l in out.lines().take(8) {
+                println!("    {}", l.trim());
+            }
+            if code != 0 {
+                println!("  ! `hermes gateway restart` exited {}", code);
             }
         }
-        None => println!("  no gateway_state.json - nothing to recover"),
+        // A real gateway boot measured ~78 s on this machine; the old 15 s
+        // budget could never have seen one, so "failed to restart" was noise.
+        match settle_gateway(home, std::time::Duration::from_secs(120)) {
+            Some(pid) => println!("  gateway back up (pid={})", pid),
+            None => println!("  ! gateway did not come back within 120s - verify will fail"),
+        }
     }
     let _ = st.write(home);
 
@@ -377,6 +386,66 @@ fn dashboard_exe() -> Option<std::path::PathBuf> {
                 return Some(c);
             }
         }
+    }
+    None
+}
+
+/// Refresh the checkout's tags in the background.
+///
+/// Not waited on: a slow fetch must never delay an update, and by the time the
+/// backup stage ends it has had minutes to finish. Failure is a note, not a
+/// blocker - `verify` still compares code_sha, which is the fact that matters.
+fn prefetch_tags(home: &Path) {
+    use std::process::Stdio;
+
+    let repo = home.join("hermes-agent");
+    if !repo.join(".git").exists() {
+        return;
+    }
+    let spawned = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args([
+            "-c",
+            "gc.autoDetach=false",
+            "fetch",
+            "--tags",
+            "--quiet",
+            "origin",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(_) => {
+            println!("  tags: refreshing in the background (hermes' own fetch has a 30s budget)")
+        }
+        Err(_) => {
+            println!("  tags: could not start `git fetch --tags` - the version label may be stale")
+        }
+    }
+}
+
+/// Return a gateway pid only once the SAME pid is alive on two probes.
+///
+/// "Alive right now" is not a verdict: the updater replaces its own gateway,
+/// and a process observed at one instant can be gone seconds later. Two probes
+/// 8 s apart turn a snapshot into a (short) observation.
+fn settle_gateway(home: &Path, budget: std::time::Duration) -> Option<u32> {
+    let start = std::time::Instant::now();
+    let mut seen: Option<u32> = None;
+    while start.elapsed() < budget {
+        match crate::verify::gateway_status(home) {
+            Some(g) if matches!(env::pid_running(g.pid), env::ProcState::Running) => {
+                if seen == Some(g.pid) {
+                    return Some(g.pid);
+                }
+                seen = Some(g.pid);
+            }
+            _ => seen = None,
+        }
+        std::thread::sleep(std::time::Duration::from_secs(8));
     }
     None
 }

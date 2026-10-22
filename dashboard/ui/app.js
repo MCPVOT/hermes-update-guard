@@ -96,16 +96,29 @@ function renderProfiles(profiles) {
   }
 }
 
-function renderBlockers(blockers) {
+// Blockers stop a run; warnings are things it noted and continued past. They
+// were the same list once, which is how "PASS" ended up displayed next to
+// "3 unfinished update receipt(s)".
+function renderBlockers(blockers, warnings) {
   const box = $("blockers");
   const ul = $("blist");
   ul.textContent = "";
-  if (!blockers?.length) {
+  const items = [
+    ...(blockers || []).map((b) => ["blocker", b]),
+    ...(warnings || []).map((w) => ["warning", w]),
+  ];
+  if (!items.length) {
     box.hidden = true;
     return;
   }
   box.hidden = false;
-  for (const b of blockers) ul.appendChild(el("li", "", b));
+  $("bhead").textContent =
+    blockers?.length && warnings?.length
+      ? "Blockers · warnings"
+      : blockers?.length
+        ? "Blockers"
+        : "Warnings";
+  for (const [kind, text] of items) ul.appendChild(el("li", kind, text));
 }
 
 function renderLog(lines) {
@@ -219,7 +232,7 @@ function render(snap) {
   $("elapsed").textContent = humanDuration(elapsedSeconds(state));
   renderRail(state.stages);
   renderProfiles(state.profiles);
-  renderBlockers(state.blockers);
+  renderBlockers(state.blockers, state.warnings);
   renderLog(snap.log || []);
   renderVerdict(state);
   mounted = true;

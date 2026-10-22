@@ -123,6 +123,10 @@ enum Cmd {
         /// Actually move them (without this it only prints the plan).
         #[arg(long)]
         apply: bool,
+        /// Also quarantine dead-pid update receipts (the "3 unfinished" line).
+        /// Refuses any receipt whose pid cannot be proven dead.
+        #[arg(long)]
+        receipts: bool,
     },
     /// Record that a profile is GONE ON PURPOSE, so self-check stops flagging it as
     /// missing. Refuses if the profile still exists on disk.
@@ -223,7 +227,7 @@ fn main() -> Result<()> {
             }
             None => context_health::run_with(&home, logs),
         },
-        Cmd::Quarantine { apply } => quarantine::run(&home, apply),
+        Cmd::Quarantine { apply, receipts } => quarantine::run(&home, apply, receipts),
         Cmd::Retire { profile, undo } => retire::run(&home, &profile, undo),
         Cmd::SelfCheck => selfcheck::run(&home, cli.repo.as_deref()),
         Cmd::Vibe => {

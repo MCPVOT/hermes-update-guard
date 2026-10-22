@@ -291,15 +291,62 @@ pub fn diff_against(home: &Path, before: &Signals) -> Vec<Signal> {
     out
 }
 
+/// One signature across every log file that reported it.
+#[derive(Debug, Clone)]
+pub struct Merged {
+    pub signature: String,
+    pub count: i64,
+    pub last_seen: String,
+    pub labels: Vec<String>,
+}
+
+/// Collapse per-file rows that share a signature.
+///
+/// The key is `"<profile>/<stream>|<signature>"`, so one OAuth failure logged to
+/// `agent`, `errors` and `gateway` was reported three times and read as three
+/// problems. This is display-only: the stored snapshot keeps the per-file keys.
+fn merge(signals: impl IntoIterator<Item = Signal>) -> Vec<Merged> {
+    let mut map: BTreeMap<String, Merged> = BTreeMap::new();
+    for s in signals {
+        let e = map.entry(s.signature.clone()).or_insert_with(|| Merged {
+            signature: s.signature.clone(),
+            count: 0,
+            last_seen: String::new(),
+            labels: Vec::new(),
+        });
+        e.count += s.count;
+        if s.last_seen > e.last_seen {
+            e.last_seen = s.last_seen.clone();
+        }
+        if !e.labels.iter().any(|l| l == &s.label) {
+            e.labels.push(s.label.clone());
+        }
+    }
+    let mut v: Vec<Merged> = map.into_values().collect();
+    v.sort_by_key(|b| std::cmp::Reverse(b.count));
+    for m in &mut v {
+        m.labels.sort();
+    }
+    v
+}
+
 /// Print the fleet's top log-noise sources.
 pub fn report(home: &Path, top: usize) -> Result<()> {
     let sigs = signals(home);
-    let mut v: Vec<&Signal> = sigs.values().collect();
-    v.sort_by_key(|b| std::cmp::Reverse(b.count));
+    let merged = merge(sigs.into_values());
     println!("== LOG SIGNALS (fleet) ==");
-    println!("  {} distinct signatures across the fleet's logs", v.len());
-    for s in v.iter().take(top) {
-        println!("  [{} x{} last {}]", s.label, s.count, s.last_seen);
+    println!(
+        "  {} distinct signatures across the fleet's logs ({} per-file rows)",
+        merged.len(),
+        merged.iter().map(|m| m.labels.len()).sum::<usize>()
+    );
+    for s in merged.iter().take(top) {
+        println!(
+            "  [{} x{} last {}]",
+            s.labels.join(", "),
+            s.count,
+            s.last_seen
+        );
         println!("       {}", s.signature);
     }
     Ok(())
@@ -317,8 +364,13 @@ pub fn report_diff(home: &Path) -> Result<bool> {
         return Ok(false);
     }
     println!("== LOG SIGNATURES INTRODUCED SINCE THE PRE-UPDATE SNAPSHOT ==");
-    for s in &new {
-        println!("  [{} +{} last {}]", s.label, s.count, s.last_seen);
+    for s in merge(new) {
+        println!(
+            "  [{} +{} last {}]",
+            s.labels.join(", "),
+            s.count,
+            s.last_seen
+        );
         println!("       {}", s.signature);
     }
     Ok(true)
@@ -327,6 +379,36 @@ pub fn report_diff(home: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One event written to three log files was reported as three problems.
+    #[test]
+    fn merge_collapses_one_signature_from_several_logs() {
+        let input = vec![
+            Signal {
+                label: "ofcrm/agent".into(),
+                signature: "OAuthNonInteractiveError".into(),
+                count: 6,
+                last_seen: "2026-10-21 20:45:50".into(),
+            },
+            Signal {
+                label: "ofcrm/errors".into(),
+                signature: "OAuthNonInteractiveError".into(),
+                count: 6,
+                last_seen: "2026-10-21 20:45:50".into(),
+            },
+            Signal {
+                label: "main/errors".into(),
+                signature: "gateway exited UNCLEANLY".into(),
+                count: 1,
+                last_seen: "2026-10-21 20:44:13".into(),
+            },
+        ];
+        let m = merge(input);
+        assert_eq!(m.len(), 2, "two distinct signatures, not three rows");
+        assert_eq!(m[0].count, 12, "counts are summed across files");
+        assert_eq!(m[0].labels, vec!["ofcrm/agent", "ofcrm/errors"]);
+        assert_eq!(m[1].count, 1);
+    }
 
     /// The bug this replaced: index 10 is a space or 'T', never ':', so no
     /// timestamp ever parsed and every signature reported an empty last_seen.

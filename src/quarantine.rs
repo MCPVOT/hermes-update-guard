@@ -49,8 +49,119 @@ fn marker_pid(path: &Path) -> Option<u32> {
         .and_then(|l| l.trim().parse::<u32>().ok())
 }
 
-pub fn run(home: &Path, apply: bool) -> Result<()> {
+/// Unfinished update receipts and what their recorded pid is doing.
+///
+/// A receipt with a dead pid is history: Hermes only retries work from a receipt
+/// whose run is genuinely unfinished, but the file itself is re-read by every
+/// preflight forever, which is why three of them from a week ago still appear on
+/// every run.
+fn unfinished_receipts(home: &Path) -> Vec<(std::path::PathBuf, u32, env::ProcState)> {
+    let dir = home.join("logs").join("update_receipts");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .map(|x| x.eq_ignore_ascii_case("json"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    let mut out = Vec::new();
+    for f in files {
+        let Ok(txt) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+            continue;
+        };
+        let outcome = v.get("outcome").and_then(|x| x.as_str()).unwrap_or("");
+        let unfinished = v.get("finished_at").map(|x| x.is_null()).unwrap_or(false);
+        if outcome != "running" && !unfinished {
+            continue;
+        }
+        let pid = v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+        let state = if pid == 0 {
+            env::ProcState::Absent
+        } else {
+            env::pid_running(pid)
+        };
+        out.push((f, pid, state));
+    }
+    out
+}
+
+/// Move dead-pid receipts aside. A receipt whose pid cannot be proven dead is
+/// never touched: that is either a live update or an unanswerable probe.
+fn quarantine_receipts(home: &Path, apply: bool) -> Result<usize> {
+    let all = unfinished_receipts(home);
+    if all.is_empty() {
+        println!("  no unfinished update receipts");
+        return Ok(0);
+    }
+    let held: Vec<_> = all
+        .iter()
+        .filter(|(_, _, s)| !matches!(s, env::ProcState::Absent))
+        .collect();
+    if !held.is_empty() {
+        for (p, pid, s) in &held {
+            println!(
+                "  ! receipt {} (pid {}) is {} - could be a live update; not touching it",
+                p.file_name().unwrap_or_default().to_string_lossy(),
+                pid,
+                match s {
+                    env::ProcState::Running => "LIVE".to_string(),
+                    env::ProcState::Unknown(why) => format!("UNVERIFIABLE ({why})"),
+                    env::ProcState::Absent => "absent".to_string(),
+                }
+            );
+        }
+        println!(
+            "\nREFUSING to quarantine receipts: {} of them are not provably dead.",
+            held.len()
+        );
+        return Ok(0);
+    }
+    for (p, pid, _) in &all {
+        println!(
+            "  - receipt {} (pid {}) - {}",
+            p.file_name().unwrap_or_default().to_string_lossy(),
+            pid,
+            if apply { "will move" } else { "would move" }
+        );
+    }
+    if !apply {
+        println!("  (dry run: receipts are listed, nothing moved)");
+        return Ok(0);
+    }
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let dest = home
+        .join("backups")
+        .join("update-state-quarantine")
+        .join(&stamp)
+        .join("receipts");
+    std::fs::create_dir_all(&dest)?;
+    let mut moved = 0usize;
+    for (p, _, _) in &all {
+        let name = p.file_name().unwrap_or_default();
+        std::fs::rename(p, dest.join(name))?;
+        moved += 1;
+    }
+    println!("  quarantined {} receipt(s) into {}", moved, dest.display());
+    Ok(moved)
+}
+
+pub fn run(home: &Path, apply: bool, receipts: bool) -> Result<()> {
     println!("== UPDATE-STATE QUARANTINE ==");
+    if receipts {
+        let n = quarantine_receipts(home, apply)?;
+        let _ = n;
+        println!();
+    }
 
     // Read every marker and ask what its owner is doing. `Unknown` (the probe
     // could not answer) is treated like `Running`, because moving a marker
@@ -164,6 +275,62 @@ mod tests {
         std::fs::write(&junk, "not-a-pid\n").unwrap();
         assert_eq!(marker_pid(&junk), None);
         assert_eq!(marker_pid(&d.join("nope")), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A receipt whose pid is alive may be a real update in flight, so the whole
+    /// batch is refused - including the dead ones beside it.
+    #[test]
+    fn receipts_with_a_live_pid_are_never_moved() {
+        let d = std::env::temp_dir().join(format!("hug-q4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let dir = d.join("logs").join("update_receipts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.json");
+        std::fs::write(
+            &live,
+            format!(
+                r#"{{"outcome":"running","finished_at":null,"pid":{}}}"#,
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        let dead = dir.join("dead.json");
+        std::fs::write(
+            &dead,
+            r#"{"outcome":"interrupted","finished_at":null,"pid":0}"#,
+        )
+        .unwrap();
+
+        assert_eq!(quarantine_receipts(&d, true).unwrap(), 0);
+        assert!(live.exists(), "a live receipt must never be moved");
+        assert!(dead.exists(), "and neither may its dead neighbour");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Dead receipts are moved, never deleted, and the receipt content survives.
+    #[test]
+    fn dead_receipts_are_moved_not_deleted() {
+        let d = std::env::temp_dir().join(format!("hug-q5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let dir = d.join("logs").join("update_receipts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dead = dir.join("dead.json");
+        std::fs::write(
+            &dead,
+            r#"{"outcome":"interrupted","finished_at":null,"pid":0}"#,
+        )
+        .unwrap();
+
+        assert_eq!(quarantine_receipts(&d, true).unwrap(), 1);
+        assert!(!dead.exists(), "the source receipt should be gone");
+        let dest = d.join("backups").join("update-state-quarantine");
+        let found = std::fs::read_dir(&dest)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path().join("receipts").join("dead.json"))
+            .any(|p| p.exists());
+        assert!(found, "the receipt should exist under the quarantine dir");
         let _ = std::fs::remove_dir_all(&d);
     }
 
