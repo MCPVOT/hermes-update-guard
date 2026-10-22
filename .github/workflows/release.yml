@@ -113,10 +113,26 @@ jobs:
         # event payload, so there is no attacker-controlled value interpolated here.
         run: |
           $tag = $env:GITHUB_REF_NAME.TrimStart('v')
+          $exe = "dashboard/target/release/hermes-guard-dashboard.exe"
+          $dll = "dashboard/target/release/WebView2Loader.dll"
+
+          if (-not (Test-Path $dll)) {
+            # webview2-com-sys unpacks the loader per architecture under build/,
+            # and not every toolchain also copies it next to the binary. Take the
+            # x64 one from its authoritative location instead of assuming.
+            $dll = (Get-ChildItem -Recurse -Filter WebView2Loader.dll -Path dashboard/target/release/build -ErrorAction SilentlyContinue |
+                    Where-Object { $_.FullName -match '\\x64\\' } |
+                    Select-Object -First 1).FullName
+          }
+
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          if (-not $dll -or -not (Test-Path $dll)) {
+            throw "WebView2Loader.dll not found: the window cannot start without it, so this release must not ship a broken window"
+          }
+
           $out = "hermes-guard-dashboard-$tag-x86_64-pc-windows-msvc.zip"
-          Compress-Archive `
-            -Path dashboard/target/release/hermes-guard-dashboard.exe, dashboard/target/release/WebView2Loader.dll `
-            -DestinationPath $out
+          Compress-Archive -Path $exe, $dll -DestinationPath $out
+          Write-Host "packaged $exe + $dll -> $out"
           "ARTIFACT=$out" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload release asset
