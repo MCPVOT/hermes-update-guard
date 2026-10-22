@@ -6,6 +6,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-10-21
+
+The watch window is no longer a manual step — an update opens it — and three
+defects in its JavaScript are fixed.
+
+### Added
+
+- **`update` opens the watch window itself.** It starts *after*
+  `guard-run.json` is written for the current run, so the window renders this
+  run rather than the previous one, and it is spawned detached — which is the
+  whole point, since it has to survive the desktop app that `--close-desktop`
+  stops. Failing to open it prints a note and changes nothing else: a GUI that
+  will not start must never fail an update.
+- **`dashboard` subcommand** — open the same window without starting an update.
+- **`--no-dashboard`** — for runs with no desktop session (cron, ssh, CI).
+
+The window is looked up next to the guard binary and then on `PATH`. Two things
+have to be true for that to work, both found by testing rather than assuming:
+
+- **`WebView2Loader.dll` must sit beside the executable.** Without it the window
+  dies in milliseconds with `error while loading shared libraries`, which is what
+  happens the moment you copy only the `.exe` into `bin/`.
+- **The spawn breaks away from the parent's job object.** A window still inside
+  the shell's job dies with the shell — and the shell is exactly what the update
+  kills. `CREATE_BREAKAWAY_FROM_JOB` is what makes "outlives the desktop app"
+  true; it falls back if the job forbids breakaway.
+
+Because `spawn()` succeeding proves nothing (a child can die in 900 ms), the
+spawn now waits and checks the child is still alive before reporting a window.
+Verified end to end: killed the parent, window still up; real Escape key closed
+it; `document.title` tracked the run.
+
+### Fixed
+
+- `invoke("set_window_title", …)` returns a Promise, so wrapping it in
+  `try/catch` catches nothing — an ACL rejection would have surfaced as an
+  unhandled rejection on every title change.
+- **Escape never worked.** It called `plugin:window|close`, which is ACL-gated
+  and this crate ships no capabilities file, so the call was denied silently.
+  It goes through an app command (`close_window`) now.
+- A failed `snapshot` replaced its real error with the friendly "no run state
+  yet"; the reason is shown instead.
+
 ## [0.3.5] - 2026-10-21
 
 Fixes from a five-agent audit of the repo (workflows, README, skill, git history,

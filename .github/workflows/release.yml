@@ -88,3 +88,39 @@ jobs:
         with:
           draft: true
           files: ${{ env.ARTIFACT }}
+
+  # The window is a separate crate (excluded from the CLI package so `cargo
+  # build` stays a plain 3-OS matrix), which meant a release shipped a guard that
+  # could not open it. It needs two files, not one: the .exe and WebView2Loader.dll
+  # beside it, so they ship zipped together.
+  dashboard:
+    name: Dashboard (windows)
+    needs: gate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the watch window
+        working-directory: dashboard
+        run: cargo build --release --locked
+
+      - name: Package the window
+        shell: pwsh
+        # $env:GITHUB_REF_NAME is a GitHub-provided environment variable, never an
+        # event payload, so there is no attacker-controlled value interpolated here.
+        run: |
+          $tag = $env:GITHUB_REF_NAME.TrimStart('v')
+          $out = "hermes-guard-dashboard-$tag-x86_64-pc-windows-msvc.zip"
+          Compress-Archive `
+            -Path dashboard/target/release/hermes-guard-dashboard.exe, dashboard/target/release/WebView2Loader.dll `
+            -DestinationPath $out
+          "ARTIFACT=$out" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: ${{ env.ARTIFACT }}

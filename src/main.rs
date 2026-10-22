@@ -85,7 +85,14 @@ enum Cmd {
         /// moving the install off its release channel.
         #[arg(long)]
         channel: Option<String>,
+        /// Do not open the pop-up watch window. The window is only a viewer, so
+        /// this changes nothing about the update itself.
+        #[arg(long)]
+        no_dashboard: bool,
     },
+    /// Open the pop-up watch window for the latest run. The same window an
+    /// `update` opens by itself, without starting an update.
+    Dashboard,
     /// Live view of a running (or finished) guarded update: stages, per-profile
     /// backup progress, blockers and the log tail.
     Watch {
@@ -172,13 +179,22 @@ fn main() -> Result<()> {
             force,
             detached,
             channel,
+            no_dashboard,
         } => {
             let skip = skip_preflight || force;
             if force && !skip_preflight {
                 eprintln!("note: --force is deprecated; it means --skip-preflight (ignore the safety gate)");
             }
-            guard::run(&home, close_desktop, skip, detached, channel.as_deref())
+            guard::run(
+                &home,
+                close_desktop,
+                skip,
+                detached,
+                channel.as_deref(),
+                !no_dashboard,
+            )
         }
+        Cmd::Dashboard => guard::open_dashboard(&home),
         Cmd::Watch { no_tui } => {
             if no_tui {
                 tui::snapshot(&home)
