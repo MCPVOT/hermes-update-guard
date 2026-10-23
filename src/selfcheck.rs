@@ -134,6 +134,34 @@ pub fn run(home: &Path, repo: Option<&Path>) -> Result<()> {
     if let Some(rp) = repo_path {
         if rp.is_dir() {
             println!("  repo        : {}", rp.display());
+            // A stale checkout BESIDE the live one is the same hazard as one under
+            // <home>\\tools, and scanning only that directory printed "no stale
+            // clones" while a v0.1.1 checkout sat in the same parent folder. This is
+            // outside the Hermes home, so it is reported, not counted as a problem.
+            if let Some(parent) = rp.parent() {
+                let me = rp
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let mut siblings: Vec<String> = Vec::new();
+                if let Ok(rd) = std::fs::read_dir(parent) {
+                    for e in rd.flatten() {
+                        let n = e.file_name().to_string_lossy().to_string();
+                        if n != me && n.contains("hermes-update-guard") && e.path().is_dir() {
+                            let v = read_repo_version(&e.path()).unwrap_or_else(|| "?".into());
+                            siblings.push(format!("{n} (v{v})"));
+                        }
+                    }
+                }
+                siblings.sort();
+                if !siblings.is_empty() {
+                    println!(
+                        "  ! {} other checkout(s) beside this repo - a `cargo install --path` from one installs THAT build: {}",
+                        siblings.len(),
+                        siblings.join(", ")
+                    );
+                }
+            }
             if let Some(v) = read_repo_version(&rp) {
                 println!("  repo version: {}", v);
                 if v != env!("CARGO_PKG_VERSION") {

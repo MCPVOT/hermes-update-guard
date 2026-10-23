@@ -40,6 +40,15 @@ pub fn run(home: &Path) -> Result<()> {
         .lines()
         .find(|l| l.contains("Selected release available") || l.contains("Update available"))
         .map(|l| l.trim().to_string());
+    // The commit the update would install. Needed because the updater DETACHES at
+    // the tag it lands on, so a detached HEAD is the NORMAL post-update state, not
+    // an edge case (G17).
+    let target_sha: Option<String> = target
+        .as_deref()
+        .and_then(|t| t.split('(').nth(1))
+        .and_then(|rest| rest.split(')').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.len() >= 7);
     match target {
         Some(t) => println!("  TARGET : {}", t),
         None => {
@@ -84,8 +93,13 @@ pub fn run(home: &Path) -> Result<()> {
         )
         .unwrap_or((-1, "?".into()));
         let branch = branch_raw.trim().to_string();
-        let behind = if branch == "HEAD" || branch.is_empty() {
-            "n/a (detached HEAD, no upstream to count against)".to_string()
+        let detached = branch == "HEAD" || branch.is_empty();
+        let behind = if detached {
+            // G17: a detached HEAD has no upstream, so this printed `n/a` - which
+            // reads like "up to date" and let a whole release (v0.22.5) sit
+            // invisible behind an install the updater had detached at its tag.
+            // Measure against the target `update --check` named instead.
+            detached_distance(&repo, target_sha.as_deref())
         } else {
             match env::run_checked(
                 Path::new("git"),
@@ -111,6 +125,18 @@ pub fn run(home: &Path) -> Result<()> {
                 branch.as_str()
             }
         );
+        if detached {
+            if let Ok((tag, _)) = env::run_checked(
+                Path::new("git"),
+                &["describe", "--tags", "--exact-match", "HEAD"],
+                Some(&repo),
+            ) {
+                let t = tag.trim();
+                if !t.is_empty() {
+                    println!("  tag      : {} (detached at this tag)", t);
+                }
+            }
+        }
         println!("  behind   : {}", behind);
         println!("  stashes  : {}", stashes.lines().count());
         let dirty_lines: Vec<&str> = dirty.lines().collect();
@@ -160,7 +186,14 @@ pub fn run(home: &Path) -> Result<()> {
     ] {
         let p = home.join(marker);
         if p.exists() {
-            println!("  ! {} present — previous update did not finish", marker);
+            // Not a blocker, and saying "!" made it look like one: the updater
+            // quarantines these itself and the guarded update only WARNS. Say what
+            // it is, plus how to clear it, so the flag cannot be read as a refusal.
+            println!(
+                "  [warn] {} present (a previous update did not finish) - the updater clears it; not a blocker",
+                marker
+            );
+            println!("         clear it now with `hermes-update-guard quarantine --apply`");
             found = true;
         }
     }
@@ -255,6 +288,38 @@ pub fn run(home: &Path) -> Result<()> {
 
     println!("\nPREFLIGHT DONE — see flags above.");
     Ok(())
+}
+
+/// How far a DETACHED install is from the commit the update would install.
+///
+/// Never returns `n/a`: "unknown" and "up to date" are different answers, and the
+/// old text collapsed them. If the target object is not in the local store the
+/// honest answer is that the distance cannot be measured yet, with the reason.
+fn detached_distance(repo: &Path, target: Option<&str>) -> String {
+    let Some(t) = target else {
+        return "unknown (detached; `hermes update --check` named no target commit)".to_string();
+    };
+    let spec = format!("{t}^{{commit}}");
+    if env::run_checked(Path::new("git"), &["cat-file", "-e", &spec], Some(repo)).is_err() {
+        return format!(
+            "unknown (detached; target {t} is not in the local object store - `git fetch --tags` makes the distance visible)"
+        );
+    }
+    match env::run_checked(
+        Path::new("git"),
+        &["rev-list", "--count", &format!("HEAD..{t}")],
+        Some(repo),
+    ) {
+        Ok((out, _)) => {
+            let n = out.trim();
+            if n == "0" {
+                format!("0 commits (detached AT the update target {t})")
+            } else {
+                format!("{n} commits (detached; distance to update target {t})")
+            }
+        }
+        Err(_) => "unknown (detached; `git rev-list` failed)".to_string(),
+    }
 }
 
 /// Scan `logs/update_receipts/*.json` for updates that never finished.

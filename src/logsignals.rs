@@ -12,15 +12,28 @@
 //! WHAT IT DOES
 //!   - `signatures()` groups every ERROR/WARNING/exception in the fleet's logs
 //!     into stable signatures (so a repeated failure counts once, not per line).
-//!   - `snapshot()` writes the counts to disk BEFORE an update, and
-//!     `diff_against()` reports which signatures are NEW afterwards, so the
-//!     verdict can attribute a regression to the update instead of guessing.
+//!   - `snapshot()` writes the counts AND the time they were read to disk BEFORE
+//!     an update, and `diff_against()` reports which signatures are NEW
+//!     afterwards, so the verdict can attribute a regression to the update
+//!     instead of guessing.
 //!   - `report()` prints the fleet's top noise sources.
+//!
+//! ATTRIBUTION IS BY TIME, NOT BY COUNT (G16). A count that grew after the
+//! snapshot is not proof the update caused it: logs ROTATE, and a rotated
+//! generation is re-read under a file name the snapshot never saw. Two rules
+//! follow, and both are load-bearing:
+//!   1. a rotation keeps the stream's identity (`agent.log.2` is the `agent`
+//!      stream), so rotating cannot mint a brand-new signature key;
+//!   2. a signal whose newest line predates the snapshot cannot have been
+//!      introduced by the update, whatever its count says.
+//! Before this, `verify` reported entries last written on 2026-08-19 as
+//! "introduced since the pre-update snapshot" - history read as a regression.
 //!
 //! Read-only. It never writes to the Hermes home except the snapshot file
 //! (which lives under backups/, next to the other guard artefacts).
 
 use anyhow::Result;
+use chrono::{Local, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -36,6 +49,39 @@ pub struct Signal {
 
 /// The fleet's log signature set: key = "<profile>|<signature>".
 pub type Signals = BTreeMap<String, Signal>;
+
+/// A stored pre-update snapshot: the counts plus WHEN they were read.
+///
+/// The timestamp is what makes attribution possible at all: without it the only
+/// available evidence is a count, and a count cannot distinguish "the update
+/// caused this" from "a log rotated".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Snapshot {
+    #[serde(default)]
+    pub taken_at_unix: i64,
+    #[serde(default)]
+    pub signals: Signals,
+}
+
+/// A log timestamp -> unix seconds, read as LOCAL time.
+///
+/// Hermes writes local time into its logs, so parsing it as UTC would shift every
+/// comparison by the host's offset (5 h here) and let pre-update history pass as
+/// "new". An ambiguous local time (a DST fall-back hour) resolves to UTC: being an
+/// hour looser twice a year is safer than discarding the timestamp.
+fn ts_to_unix(ts: &str) -> Option<i64> {
+    if ts.is_empty() {
+        return None;
+    }
+    let naive = NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").ok()?;
+    Some(
+        Local
+            .from_local_datetime(&naive)
+            .single()
+            .map(|d| d.timestamp())
+            .unwrap_or_else(|| naive.and_utc().timestamp()),
+    )
+}
 
 fn parse_ts(line: &str) -> Option<String> {
     // "2026-10-21 14:36:00,123" or "2026-10-21T14:36:00Z" at the start of a line.
@@ -197,15 +243,24 @@ fn is_log(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Label for a log file: `agent.log` → `agent`, `agent.log.2` stays `agent.log.2`.
-/// Stable for the plain file, distinct for a rotation, so an upgrade does not
-/// relabel every existing signal as "new".
+/// Label for a log file: `agent.log` -> `agent`, and a ROTATION (`agent.log.2`)
+/// maps to the SAME stream label.
+///
+/// This is half the G16 fix. Giving a rotation its own identity (`agent.log.2`)
+/// meant a log rotating between the snapshot and the verify renamed every
+/// existing signature: the old key silently vanished and the new key had no
+/// history, so entries last written in AUGUST were reported as "introduced since
+/// the pre-update snapshot". A rotation is the same stream continuing - it must
+/// not mint a new identity.
 fn log_label(p: &Path) -> String {
     let n = p
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
+    if let Some(i) = n.find(".log.") {
+        return n[..i].to_string();
+    }
     match n.strip_suffix(".log") {
         Some(base) => base.to_string(),
         None => n,
@@ -257,38 +312,93 @@ pub fn snapshot_path(home: &Path) -> PathBuf {
     home.join("backups").join("guard-logsignals.json")
 }
 
-/// Write the current signal counts (call BEFORE an update).
+/// Write the current signal counts and the time they were read (call BEFORE an
+/// update).
 pub fn snapshot(home: &Path) -> Result<PathBuf> {
-    let sigs = signals(home);
+    let snap = Snapshot {
+        taken_at_unix: Local::now().timestamp(),
+        signals: signals(home),
+    };
     let p = snapshot_path(home);
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&p, serde_json::to_string_pretty(&sigs)?)?;
+    std::fs::write(&p, serde_json::to_string_pretty(&snap)?)?;
     Ok(p)
 }
 
 /// Read the stored snapshot, if any.
-pub fn load_snapshot(home: &Path) -> Option<Signals> {
+///
+/// Two shapes are accepted: the current `{taken_at_unix, signals}` object, and the
+/// legacy bare `{key: Signal}` map written before 2026-10-23. For the legacy shape
+/// the FILE MTIME is the snapshot time - it is the only evidence of when the
+/// counts were read, and falling back to it keeps attribution working instead of
+/// silently degrading to a count-only comparison.
+pub fn load_snapshot(home: &Path) -> Option<Snapshot> {
     let p = snapshot_path(home);
-    let text = std::fs::read_to_string(p).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
-/// Signatures that appeared (or grew) since the snapshot.
-pub fn diff_against(home: &Path, before: &Signals) -> Vec<Signal> {
-    let now = signals(home);
-    let mut out = Vec::new();
-    for (key, s) in &now {
-        let prev = before.get(key).map(|p| p.count).unwrap_or(0);
-        if s.count > prev {
-            let mut d = s.clone();
-            d.count = s.count - prev;
-            out.push(d);
+    let text = std::fs::read_to_string(&p).ok()?;
+    if let Ok(s) = serde_json::from_str::<Snapshot>(&text) {
+        if !s.signals.is_empty() || s.taken_at_unix > 0 {
+            return Some(s);
         }
     }
+    let signals: Signals = serde_json::from_str(&text).ok()?;
+    let taken_at_unix = std::fs::metadata(&p)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some(Snapshot {
+        taken_at_unix,
+        signals,
+    })
+}
+
+/// What a diff found: the new signals, and how many were suppressed as history.
+#[derive(Debug, Clone, Default)]
+pub struct Diff {
+    pub new: Vec<Signal>,
+    /// The count grew, but every line predates the snapshot: rotated/generational
+    /// history re-read under a key the snapshot never had. Reported as a NUMBER,
+    /// never hidden.
+    pub suppressed: usize,
+}
+
+/// Signatures that appeared (or grew) since the snapshot AND were last written
+/// after it was taken.
+pub fn diff_against(home: &Path, before: &Snapshot) -> Diff {
+    let now = signals(home);
+    let since = before.taken_at_unix;
+    let mut out = Vec::new();
+    let mut suppressed = 0usize;
+    for (key, s) in &now {
+        let prev = before.signals.get(key).map(|p| p.count).unwrap_or(0);
+        if s.count <= prev {
+            continue;
+        }
+        // Count growth is not attribution. If this signature's newest line is older
+        // than the snapshot, the update cannot have introduced it - it is a rotated
+        // file read under a name the snapshot never saw. An EMPTY last_seen means
+        // the log format carries no timestamp, so "old" is not provable; keep it
+        // rather than hide a possible regression.
+        if since > 0 {
+            if let Some(t) = ts_to_unix(&s.last_seen) {
+                if t < since {
+                    suppressed += 1;
+                    continue;
+                }
+            }
+        }
+        let mut d = s.clone();
+        d.count = s.count - prev;
+        out.push(d);
+    }
     out.sort_by_key(|b| std::cmp::Reverse(b.count));
-    out
+    Diff {
+        new: out,
+        suppressed,
+    }
 }
 
 /// One signature across every log file that reported it.
@@ -358,13 +468,40 @@ pub fn report_diff(home: &Path) -> Result<bool> {
         println!("  no log-signal snapshot on disk - nothing to compare against");
         return Ok(false);
     };
-    let new = diff_against(home, &before);
-    if new.is_empty() {
+    // Say WHEN the snapshot was taken. "Since the snapshot" is the honest window,
+    // and on a snapshot that is a day old that window is wide: without the date the
+    // reader has no way to tell a post-update regression from the afternoon after.
+    if before.taken_at_unix > 0 {
+        let taken = chrono::DateTime::<chrono::Local>::from(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(before.taken_at_unix as u64),
+        );
+        let age_h = (Local::now().timestamp() - before.taken_at_unix).max(0) as f64 / 3600.0;
+        println!(
+            "  snapshot taken {} ({:.0}h ago) - signals dated after that, not only after the update",
+            taken.format("%Y-%m-%d %H:%M %Z"),
+            age_h
+        );
+    }
+    let d = diff_against(home, &before);
+    if d.new.is_empty() {
         println!("  no new log signatures since the pre-update snapshot");
+        if d.suppressed > 0 {
+            println!(
+                "  ({} signature(s) grew only in ROTATED history - every line predates the snapshot)",
+                d.suppressed
+            );
+        }
         return Ok(false);
     }
     println!("== LOG SIGNATURES INTRODUCED SINCE THE PRE-UPDATE SNAPSHOT ==");
-    for s in merge(new) {
+    // A report nobody can read is a report nobody reads: 1,648 lines of tail put
+    // the one live signal next to 8,000 lines of history. Show the worst 25 by
+    // count and SAY how many are not shown, so the verdict stays complete without
+    // the dump.
+    const SHOWN: usize = 25;
+    let merged = merge(d.new);
+    let total = merged.len();
+    for s in merged.iter().take(SHOWN) {
         println!(
             "  [{} +{} last {}]",
             s.labels.join(", "),
@@ -372,6 +509,18 @@ pub fn report_diff(home: &Path) -> Result<bool> {
             s.last_seen
         );
         println!("       {}", s.signature);
+    }
+    if total > SHOWN {
+        println!(
+            "  ... and {} more signature(s) not shown (ranked by count; the full set is in backups/guard-logsignals.json)",
+            total - SHOWN
+        );
+    }
+    if d.suppressed > 0 {
+        println!(
+            "  ({} further signature(s) grew only in ROTATED history - every line predates the snapshot, so they are NOT attributed to this update)",
+            d.suppressed
+        );
     }
     Ok(true)
 }
@@ -408,6 +557,157 @@ mod tests {
         assert_eq!(m[0].count, 12, "counts are summed across files");
         assert_eq!(m[0].labels, vec!["ofcrm/agent", "ofcrm/errors"]);
         assert_eq!(m[1].count, 1);
+    }
+
+    fn sig(label: &str, signature: &str, count: i64, last_seen: &str) -> Signal {
+        Signal {
+            label: label.into(),
+            signature: signature.into(),
+            count,
+            last_seen: last_seen.into(),
+        }
+    }
+
+    fn tmp_home(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("hug-logsig-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("profiles").join("p1").join("logs")).unwrap();
+        root
+    }
+
+    /// A rotation is the same stream. G16: giving `agent.log.2` its own identity
+    /// renamed every existing signature whenever a log rotated, so old history came
+    /// back as "introduced since the snapshot".
+    #[test]
+    fn rotation_keeps_the_stream_identity() {
+        assert_eq!(
+            log_label(Path::new("C:/x/agent.log.2")),
+            "agent",
+            "a rotated generation belongs to the agent stream"
+        );
+        assert_eq!(log_label(Path::new("C:/x/agent.log")), "agent");
+        assert_eq!(log_label(Path::new("C:/x/errors.log.1")), "errors");
+    }
+
+    /// Rotated generations are READ (a separate fix) and labelled as one stream.
+    #[test]
+    fn rotated_files_are_scanned_under_one_label() {
+        let home = tmp_home("rotation");
+        std::fs::write(
+            home.join("profiles/p1/logs/agent.log.2"),
+            "2026-08-19 18:21:09,000 ERROR old failure\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("profiles/p1/logs/agent.log"),
+            "2026-10-23 07:43:13,000 ERROR old failure\n",
+        )
+        .unwrap();
+        let s = signals(&home);
+        assert_eq!(s.len(), 1, "one signature, one stream: {:?}", s.keys());
+        let only = s.values().next().unwrap();
+        assert_eq!(only.label, "p1/agent");
+        assert_eq!(only.count, 2, "both generations counted once each");
+        assert_eq!(only.last_seen, "2026-10-23 07:43:13");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// G16, the decisive half: a signature whose newest line predates the snapshot
+    /// is history, however much its count grew.
+    #[test]
+    fn signals_older_than_the_snapshot_are_suppressed_not_reported() {
+        let home = tmp_home("attribution");
+        std::fs::write(
+            home.join("profiles/p1/logs/agent.log.2"),
+            "2026-08-19 18:21:09,000 ERROR ancient\n",
+        )
+        .unwrap();
+        let mut before = Signals::new();
+        before.insert(
+            "p1/agent|unrelated".into(),
+            sig("p1/agent", "unrelated", 3, "2026-10-01 00:00:00"),
+        );
+        let snap = Snapshot {
+            taken_at_unix: ts_to_unix("2026-10-22 01:19:48").unwrap(),
+            signals: before,
+        };
+        let d = diff_against(&home, &snap);
+        assert!(
+            d.new.is_empty(),
+            "August history is not a new signature: {:?}",
+            d.new
+        );
+        assert_eq!(d.suppressed, 1, "and it is counted, not hidden");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The other direction must still fire: a post-snapshot line IS reported.
+    #[test]
+    fn signals_newer_than_the_snapshot_are_reported() {
+        let home = tmp_home("attribution-new");
+        std::fs::write(
+            home.join("profiles/p1/logs/agent.log"),
+            "2026-10-23 07:43:13,000 ERROR fresh problem\n",
+        )
+        .unwrap();
+        let snap = Snapshot {
+            taken_at_unix: ts_to_unix("2026-10-22 01:19:48").unwrap(),
+            signals: Signals::new(),
+        };
+        let d = diff_against(&home, &snap);
+        assert_eq!(d.new.len(), 1);
+        assert_eq!(d.suppressed, 0);
+        assert!(d.new[0].signature.contains("fresh problem"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A legacy snapshot is a bare map with no `taken_at_unix`; its mtime has to
+    /// carry the attribution or an upgrade silently degrades every diff.
+    #[test]
+    fn legacy_snapshot_loads_with_mtime_as_taken_at() {
+        let home = tmp_home("legacy");
+        let mut map = Signals::new();
+        map.insert(
+            "p1/agent|ERROR x".into(),
+            sig("p1/agent", "ERROR x", 1, "2026-10-01 00:00:00"),
+        );
+        let p = snapshot_path(&home);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, serde_json::to_string(&map).unwrap()).unwrap();
+        let snap = load_snapshot(&home).expect("legacy snapshot must load");
+        assert_eq!(snap.signals.len(), 1);
+        assert!(
+            snap.taken_at_unix > 1_600_000_000,
+            "mtime became the snapshot time"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Round-trip: what `snapshot` writes is what `load_snapshot` reads.
+    #[test]
+    fn snapshot_round_trips_with_its_timestamp() {
+        let home = tmp_home("roundtrip");
+        std::fs::write(
+            home.join("profiles/p1/logs/agent.log"),
+            "2026-10-23 07:43:13,000 ERROR boom\n",
+        )
+        .unwrap();
+        snapshot(&home).unwrap();
+        let snap = load_snapshot(&home).expect("written snapshot must load");
+        assert_eq!(snap.signals.len(), 1);
+        assert!(snap.taken_at_unix > 0);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Local-time parsing, and ordering that survives the conversion.
+    #[test]
+    fn ts_to_unix_orders_correctly() {
+        let a = ts_to_unix("2026-10-22 01:19:48").unwrap();
+        let b = ts_to_unix("2026-08-19 18:21:09").unwrap();
+        let c = ts_to_unix("2026-10-23 07:43:13").unwrap();
+        assert!(b < a && a < c);
+        assert_eq!(ts_to_unix(""), None);
+        assert_eq!(ts_to_unix("not a date"), None);
     }
 
     /// The bug this replaced: index 10 is a space or 'T', never ':', so no

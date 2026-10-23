@@ -6,6 +6,61 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-10-23
+
+Four defects found by auditing the tool against its own output, not against its
+source. Every one of them made the guard report something that was not true.
+
+### Fixed - G16: rotated logs were reported as regressions
+
+Two causes, both needed:
+
+- **A rotation minted a new signature identity.** `agent.log.2` was labelled as its
+  own stream, so when a log rotated between the snapshot and the verify, every
+  signature in it lost its history and came back as "introduced since the
+  pre-update snapshot". A rotation is the same stream continuing, so `agent.log.N`
+  and `agent.log` now share the label `agent`.
+- **Attribution was by count, not by time.** The snapshot recorded counts and
+  nothing else, so "the count grew" was the whole test. It now records WHEN it was
+  read, and a signal whose newest line predates the snapshot cannot be attributed
+  to the update. Suppressed signatures are counted and printed, never hidden.
+  Legacy snapshots (bare map, no timestamp) use the file's mtime, so an upgrade
+  does not silently degrade the comparison.
+
+Measured before the fix: verify reported entries last written `2026-08-19`,
+`2026-09-24` and `2026-10-16` as introduced by an update that ran on
+`2026-10-22`, and buried the live signal (`2026-10-23`) in 596 KB of noise.
+
+### Fixed - G15: `verify` and `diff` disagreed about the same surface
+
+`diff` measures the live surface against the operator-APPROVED baseline
+(`golden.json`); `verify` measured it against the last export. After an
+intentional `bless`, `diff` said clean and `verify` FAILed on seven lines, so the
+operator had to guess which verdict to believe. `verify` now measures exactly what
+`diff` measures, and a difference from the pre-update export is reported as the
+note it is ("BLESSED changes, not update drift") instead of flipping the verdict.
+
+### Fixed - G17: a detached install reported `behind: n/a`
+
+The v0.22.4 updater leaves the checkout DETACHED at the tag it installed, so
+detached is the normal post-update state - and `behind: n/a (detached HEAD, no
+upstream to count against)` reads like "up to date". A whole release (v0.22.5)
+sat invisible behind an install that reported `n/a`. Preflight now prints the tag
+it is detached at and measures the distance to the commit `update --check` named,
+or says `unknown` WITH the reason (target not in the local object store). It never
+prints `n/a`.
+
+### Changed
+
+- **Preflight's stale-marker flag stopped looking like a blocker.** It printed
+  `!` for `.hermes-update-in-progress.lock`, but the guarded update treats it as a
+  warning (hermes quarantines these itself). The flag now says so and names the
+  command that clears it.
+- **`self-check` sees checkouts beside the repo.** It only scanned
+  `<home>\\tools`, so a v0.1.1 checkout sitting in the same parent folder as the
+  live repo went unreported while the line read "no stale clones". Reported as a
+  warning, since it is outside the Hermes home.
+
 ## [0.3.7] - 2026-10-21
 
 Everything here comes from reading run `20261021-201542` back line by line. The
