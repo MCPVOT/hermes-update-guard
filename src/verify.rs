@@ -122,8 +122,8 @@ pub fn run(home: &Path) -> Result<()> {
     println!("  local patch (stash/restore):");
     check_patch_restored(home, &repo, &mut failures);
 
-    // ---- 5. provider surface vs pre-update export --------------------------
-    println!("  provider surface vs last export:");
+    // ---- 5. provider surface vs the APPROVED baseline -----------------------
+    println!("  provider surface vs approved baseline:");
     check_drift(home, &mut failures);
 
     mark("patch+drift", &mut t);
@@ -466,39 +466,72 @@ fn expected_patched_files(home: &Path) -> Vec<String> {
     files
 }
 
+/// The operator-APPROVED reference: the only baseline `diff` measures against.
+fn approved_baseline(surface: &Path) -> Option<PathBuf> {
+    let g = surface.join("golden.json");
+    g.exists().then_some(g)
+}
+
+/// The export the last update started from, resolved through `last-export.txt`.
+fn export_baseline(surface: &Path) -> Option<PathBuf> {
+    let pointer = surface.join("last-export.txt");
+    let stamp = std::fs::read_to_string(pointer).ok()?.trim().to_string();
+    if stamp.is_empty() {
+        return None;
+    }
+    let dir = surface.join(&stamp);
+    dir.is_dir().then_some(dir)
+}
+
 fn check_drift(home: &Path, failures: &mut Vec<String>) {
     let surface = home.join("backups").join("provider-surface");
-    let pointer = surface.join("last-export.txt");
-    if !pointer.exists() {
-        println!("  FAIL no export baseline (last-export.txt missing) - drift cannot be checked");
+    // G15: `diff` measures against the APPROVED baseline (golden.json) while this
+    // used the last export, so after an intentional `bless` the two commands
+    // disagreed - `diff` clean, `verify` FAIL on seven lines - and the operator had
+    // to guess which one was lying. One reference, one verdict: verify now measures
+    // exactly what diff measures, and the export difference is reported as the
+    // note it always was.
+    let (baseline, label) = match approved_baseline(&surface) {
+        Some(g) => (Some(g), "the approved baseline (golden.json)"),
+        None => (export_baseline(&surface), "the pre-update export"),
+    };
+    let Some(baseline) = baseline else {
+        println!(
+            "  FAIL no provider baseline (no golden.json, no usable export pointer) - drift cannot be checked"
+        );
         failures.push("no provider baseline".into());
         return;
-    }
-    let stamp = match std::fs::read_to_string(&pointer) {
-        Ok(s) => s.trim().to_string(),
-        Err(e) => {
-            println!("  FAIL baseline pointer unreadable: {}", e);
-            failures.push(format!("baseline pointer: {}", e));
-            return;
-        }
     };
-    let baseline = surface.join(&stamp);
-    if !baseline.is_dir() {
-        println!("  FAIL baseline directory missing: {}", baseline.display());
-        failures.push("baseline directory missing".into());
-        return;
-    }
     // compare_against also emits a `baseline UNREADABLE` line for unparseable
     // baselines, so that case surfaces as drift instead of "clean".
     let lines = crate::drift::compare_against(home, &baseline);
     if lines.is_empty() {
-        println!("  ok   no drift vs pre-update export");
+        println!("  ok   no drift vs {}", label);
     } else {
         for l in &lines {
             println!("  ! {}", l.trim());
         }
-        println!("  FAIL {} drift line(s) vs pre-update export", lines.len());
-        failures.push(format!("{} provider drift line(s)", lines.len()));
+        println!("  FAIL {} drift line(s) vs {}", lines.len(), label);
+        failures.push(format!(
+            "{} provider drift line(s) vs {}",
+            lines.len(),
+            label
+        ));
+    }
+
+    // Secondary, informational: what moved since the update's own starting point.
+    // A deliberate change made after that export is real information, but it is not
+    // an update regression while the approved baseline still matches.
+    if approved_baseline(&surface).is_some() && lines.is_empty() {
+        if let Some(export) = export_baseline(&surface) {
+            let since_export = crate::drift::compare_against(home, &export);
+            if !since_export.is_empty() {
+                println!(
+                    "  note {} line(s) differ from the pre-update export - the approved baseline matches, so these are BLESSED changes, not update drift",
+                    since_export.len()
+                );
+            }
+        }
     }
 }
 
