@@ -103,7 +103,7 @@ watched live without the viewer being able to touch it:
 
 ```bash
 # Linux / macOS — fetch, mark executable, put it on PATH
-VER=0.3.4
+VER=0.3.8
 curl -fsSL -o hermes-update-guard \
   "https://github.com/MCPVOT/hermes-update-guard/releases/download/v${VER}/hermes-update-guard-${VER}-x86_64-unknown-linux-gnu"
 chmod +x hermes-update-guard

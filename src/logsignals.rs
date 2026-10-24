@@ -26,6 +26,7 @@
 //!      stream), so rotating cannot mint a brand-new signature key;
 //!   2. a signal whose newest line predates the snapshot cannot have been
 //!      introduced by the update, whatever its count says.
+//!
 //! Before this, `verify` reported entries last written on 2026-08-19 as
 //! "introduced since the pre-update snapshot" - history read as a regression.
 //!
