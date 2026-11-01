@@ -328,7 +328,13 @@ pub fn run(home: &Path) -> Result<()> {
     // The snapshot taken before the update is the baseline: anything that appeared
     // afterwards is a candidate regression, and the pre-existing noise stays noise.
     println!("  log signatures since the pre-update snapshot:");
-    let _ = crate::logsignals::report_diff(home);
+    // M1 (2026-10-26 audit): a section that FAILS to run must not look like a section that found
+    // nothing. Silence here read as "no new signatures" - a false clean on the one report that says
+    // whether this update broke something.
+    if let Err(e) = crate::logsignals::report_diff(home) {
+        println!("  [FAIL] log-signature section could not run: {e}");
+        failures.push(format!("log-signature section failed: {e}"));
+    }
 
     mark("log signals", &mut t);
     // ---- verdict ------------------------------------------------------------

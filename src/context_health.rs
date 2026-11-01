@@ -315,12 +315,19 @@ pub fn run_with(home: &Path, logs: bool) -> Result<()> {
     // Print the log report BEFORE exiting: `--logs` asked for it, and an exit
     // first meant the flag silently produced nothing whenever health had a problem
     // — which is exactly when the logs are most interesting.
+    let mut problems = problems;
     if logs {
         println!();
-        let _ = crate::logsignals::report(home, 12);
+        // M1: an unreadable log report is a failed section, not an empty one.
+        if let Err(e) = crate::logsignals::report(home, 12) {
+            println!("  [FAIL] log report could not run: {e}");
+            problems = true;
+        }
     }
     if problems {
-        std::process::exit(1);
+        // 3 = DATA FINDING (audit M3), so a scheduled run can tell "found stale sessions" from
+        // "the tool broke".
+        std::process::exit(3);
     }
     Ok(())
 }

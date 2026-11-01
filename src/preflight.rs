@@ -66,13 +66,19 @@ pub fn run(home: &Path) -> Result<()> {
         println!("[git @ {}]", repo.display());
         let (_, head) = env::run_capture(
             Path::new("git"),
-            &["-C", repo.to_str().unwrap(), "rev-parse", "--short", "HEAD"],
+            &[
+                "-C",
+                repo.to_string_lossy().as_ref(),
+                "rev-parse",
+                "--short",
+                "HEAD",
+            ],
             None,
         )
         .unwrap_or((-1, "?".into()));
         let (_, dirty) = env::run_capture(
             Path::new("git"),
-            &["-C", repo.to_str().unwrap(), "status", "--short"],
+            &["-C", repo.to_string_lossy().as_ref(), "status", "--short"],
             None,
         )
         .unwrap_or((-1, String::new()));
@@ -84,7 +90,7 @@ pub fn run(home: &Path) -> Result<()> {
             Path::new("git"),
             &[
                 "-C",
-                repo.to_str().unwrap(),
+                repo.to_string_lossy().as_ref(),
                 "rev-parse",
                 "--abbrev-ref",
                 "HEAD",
@@ -112,7 +118,7 @@ pub fn run(home: &Path) -> Result<()> {
         };
         let (_, stashes) = env::run_capture(
             Path::new("git"),
-            &["-C", repo.to_str().unwrap(), "stash", "list"],
+            &["-C", repo.to_string_lossy().as_ref(), "stash", "list"],
             None,
         )
         .unwrap_or((-1, String::new()));
@@ -284,8 +290,21 @@ pub fn run(home: &Path) -> Result<()> {
     // ~1,200 error lines in one afternoon and it reads as a slow profile, not a
     // broken credential.
     println!("\n[mcp readiness]");
-    let _ = crate::mcpcheck::report(home);
+    // M1: if this section cannot run, say so and fail - an unreadable section is not a clean one.
+    // `report` returns its own verdict (Ok(bad)); only an ERROR means the section could not run.
+    let mcp_unreadable = match crate::mcpcheck::report(home) {
+        Ok(_) => false,
+        Err(e) => {
+            println!("  [FAIL] MCP readiness could not be read: {e}");
+            true
+        }
+    };
 
+    if mcp_unreadable {
+        return Err(anyhow::anyhow!(
+            "an unreadable preflight section is not a clean preflight"
+        ));
+    }
     println!("\nPREFLIGHT DONE — see flags above.");
     Ok(())
 }

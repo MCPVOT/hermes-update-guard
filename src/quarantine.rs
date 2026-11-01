@@ -159,7 +159,9 @@ pub fn run(home: &Path, apply: bool, receipts: bool) -> Result<()> {
     println!("== UPDATE-STATE QUARANTINE ==");
     if receipts {
         let n = quarantine_receipts(home, apply)?;
-        let _ = n;
+        if n > 0 {
+            println!("  receipts handled: {n}");
+        }
         println!();
     }
 
@@ -201,11 +203,11 @@ pub fn run(home: &Path, apply: bool, receipts: bool) -> Result<()> {
     if !held.is_empty() {
         for (name, _, pid, state) in &held {
             println!(
-                "  ! {} owner {} - an update really is in flight; not touching it",
+                "  ! {} owner {} (pid {}) - an update really is in flight; not touching it",
                 name,
-                reason(state)
+                reason(state),
+                fmt_pid(*pid)
             );
-            let _ = pid;
         }
         println!(
             "\nREFUSING to quarantine: {} marker(s) in this home are held. Nothing moved.",
