@@ -348,7 +348,8 @@ pub fn report(home: &Path) -> Result<bool> {
 /// Exit-code entry point.
 pub fn run(home: &Path) -> Result<()> {
     if report(home)? {
-        std::process::exit(1);
+        // 3 = DATA FINDING (audit M3), not a tool failure.
+        std::process::exit(3);
     }
     Ok(())
 }

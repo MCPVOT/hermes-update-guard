@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-10-26
+
+Four findings from a full read-only audit of the 0.3.8 tree (7,257 lines, 62 tests). Three of them
+let the guard read green while the thing it guards was broken.
+
+### Fixed
+- **M1 - a failed section no longer renders as an empty one.** `verify`'s log-signature section, the
+  `--logs` report in `health`, and preflight's MCP-readiness section used to discard their own
+  Result, so an error printed a header and nothing else - indistinguishable from "found nothing".
+  They now print `[FAIL] ... could not run` and affect the verdict; preflight returns an error
+  instead of reporting PREFLIGHT DONE.
+- **M2 - the stale-ref / channel-resolution failure is handled.** On `Could not resolve the stable
+  source channel` or `upload-pack: not our ref`, the guard refreshes refs
+  (`git fetch origin --tags --prune`) once and retries the update ONCE. If the refresh itself fails
+  it refuses and says so rather than retrying from a still-stale cache. No code path handled this
+  class before; the repair existed only as prose.
+- **M3 - exit `3` means DATA FINDING.** `self-check`, `context-health` and `mcp` no longer answer
+  `1` for both "found something historical" and "the tool broke". `0` ok, `1` drift/refusal/error,
+  `2` usage, `3` data finding. A scheduled run can now tell the two apart.
+- **M4 - no panic on a non-UTF-8 repo path.** Seven `repo.to_str().unwrap()` calls became lossy
+  conversions, so a pathological install path degrades instead of panicking mid-update.
+
+### Changed
+- Quarantine prints how many receipts it handled, and names the owning pid when it refuses to move
+  a held marker (it used to parse the pid and discard it).
+
+
 ## [0.3.8] - 2026-10-23
 
 Four defects found by auditing the tool against its own output, not against its

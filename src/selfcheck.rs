@@ -267,7 +267,8 @@ pub fn run(home: &Path, repo: Option<&Path>) -> Result<()> {
 
     if problems {
         println!("\n  [FAIL] self-check found something to fix");
-        std::process::exit(1);
+        // 3 = DATA FINDING (audit M3): a scheduled run must be able to tell a finding from a crash.
+        std::process::exit(3);
     }
     println!("\n  [ok]   self-check clean");
     Ok(())

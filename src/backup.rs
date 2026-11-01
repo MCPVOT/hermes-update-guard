@@ -163,21 +163,21 @@ pub fn run_with(home: &Path, dry_run: bool, on_db: &mut dyn FnMut(&str, bool)) -
     if repo.join(".git").exists() {
         env::run_capture(
             Path::new("git"),
-            &["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"],
+            &["-C", repo.to_string_lossy().as_ref(), "rev-parse", "HEAD"],
             None,
         )
         .ok()
         .map(|(_, h)| fs::write(dir.join("HEAD-before.txt"), h.trim()));
         env::run_capture(
             Path::new("git"),
-            &["-C", repo.to_str().unwrap(), "diff"],
+            &["-C", repo.to_string_lossy().as_ref(), "diff"],
             None,
         )
         .ok()
         .map(|(_, d)| fs::write(dir.join("working-tree.patch"), d));
         env::run_capture(
             Path::new("git"),
-            &["-C", repo.to_str().unwrap(), "stash", "list"],
+            &["-C", repo.to_string_lossy().as_ref(), "stash", "list"],
             None,
         )
         .ok()
@@ -186,7 +186,7 @@ pub fn run_with(home: &Path, dry_run: bool, on_db: &mut dyn FnMut(&str, bool)) -
             Path::new("git"),
             &[
                 "-C",
-                repo.to_str().unwrap(),
+                repo.to_string_lossy().as_ref(),
                 "stash",
                 "show",
                 "-p",

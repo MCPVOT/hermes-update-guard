@@ -279,7 +279,31 @@ fn run_stages(
         upd_args.push("--channel");
         upd_args.push(ch);
     }
-    let (code, out) = env::run_capture(&hermes, &upd_args, None)?;
+    let (mut code, mut out) = env::run_capture(&hermes, &upd_args, None)?;
+
+    // M2 (2026-10-26 audit): on the stale-ref / channel-resolution class, refresh the refs once and
+    // retry ONCE. Refreshed, never retried blind - if the refresh itself fails we refuse and say so,
+    // because a retry from a still-stale cache only produces the same failure.
+    if code != 0 && is_stale_ref(&out) {
+        let repo = home.join("hermes-agent");
+        let repo_s = repo.to_string_lossy().into_owned();
+        println!("\n  stale ref detected - refreshing refs, then retrying the update ONCE");
+        let (fc, fout) = env::run_capture(
+            std::path::Path::new("git"),
+            &["-C", &repo_s, "fetch", "origin", "--tags", "--prune"],
+            None,
+        )?;
+        if !fout.trim().is_empty() {
+            println!("  fetch: {}", fout.trim());
+        }
+        if fc == 0 {
+            let (c2, o2) = env::run_capture(&hermes, &upd_args, None)?;
+            code = c2;
+            out = o2;
+        } else {
+            println!("  ! ref refresh failed (exit {fc}) - refusing rather than retrying blind");
+        }
+    }
 
     if !out.is_empty() {
         println!("{}", out);
@@ -388,6 +412,17 @@ fn dashboard_exe() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// Does an update failure look like the STALE-REF / channel-resolution class?
+///
+/// M2 (2026-10-26 audit). A stale remote-tracking ref makes the channel resolver compare against a
+/// cached value and fail with `Could not resolve the stable source channel` while the local tree is
+/// fine - a green preflight does not rule it out. The repair is a REF REFRESH, not a blind retry.
+fn is_stale_ref(out: &str) -> bool {
+    out.contains("Could not resolve the stable source channel")
+        || out.contains("not our ref")
+        || out.contains("upload-pack")
 }
 
 /// Refresh the checkout's tags in the background.
@@ -581,4 +616,28 @@ fn spawn_detached(
         (false, _) => println!("  dashboard : disabled by --no-dashboard"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_stale_ref;
+
+    #[test]
+    fn stale_ref_signatures_are_recognised() {
+        // The two shapes seen in the wild, plus the raw git error that carries the same cause.
+        assert!(is_stale_ref(
+            "Could not resolve the stable source channel: git merge-base --is-ancestor failed"
+        ));
+        assert!(is_stale_ref("fatal: remote error: upload-pack: not our ref 4d04303818"));
+        assert!(is_stale_ref("error: upload-pack: not our ref"));
+    }
+
+    #[test]
+    fn ordinary_update_failures_are_not_mistaken_for_stale_refs() {
+        // A refresh+retry is only correct for the ref class; these must NOT trigger it.
+        assert!(!is_stale_ref("error: could not resolve host: github.com"));
+        assert!(!is_stale_ref("fatal: not a git repository (or any parent)"));
+        assert!(!is_stale_ref("update refused: venv is held by pid 1234"));
+        assert!(!is_stale_ref(""));
+    }
 }

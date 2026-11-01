@@ -215,13 +215,17 @@ fn main() -> Result<()> {
         }
         Cmd::Health { profile, logs } => match profile {
             Some(p) => {
-                let bad = crate::context_health::report_readiness(&home, &p)?;
+                let mut bad = crate::context_health::report_readiness(&home, &p)?;
                 if logs {
                     println!();
-                    let _ = crate::logsignals::report(&home, 12);
+                    // M1: an unreadable log report is a failed section, not an empty one.
+                    if let Err(e) = crate::logsignals::report(&home, 12) {
+                        println!("  [FAIL] log report could not run: {e}");
+                        bad = true;
+                    }
                 }
                 if bad {
-                    std::process::exit(1);
+                    std::process::exit(3);
                 }
                 Ok(())
             }
