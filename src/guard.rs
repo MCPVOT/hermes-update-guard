@@ -628,7 +628,9 @@ mod tests {
         assert!(is_stale_ref(
             "Could not resolve the stable source channel: git merge-base --is-ancestor failed"
         ));
-        assert!(is_stale_ref("fatal: remote error: upload-pack: not our ref 4d04303818"));
+        assert!(is_stale_ref(
+            "fatal: remote error: upload-pack: not our ref 4d04303818"
+        ));
         assert!(is_stale_ref("error: upload-pack: not our ref"));
     }
 

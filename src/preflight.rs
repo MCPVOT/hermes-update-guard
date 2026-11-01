@@ -66,7 +66,13 @@ pub fn run(home: &Path) -> Result<()> {
         println!("[git @ {}]", repo.display());
         let (_, head) = env::run_capture(
             Path::new("git"),
-            &["-C", repo.to_string_lossy().as_ref(), "rev-parse", "--short", "HEAD"],
+            &[
+                "-C",
+                repo.to_string_lossy().as_ref(),
+                "rev-parse",
+                "--short",
+                "HEAD",
+            ],
             None,
         )
         .unwrap_or((-1, "?".into()));
