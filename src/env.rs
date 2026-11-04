@@ -1298,7 +1298,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hug-proof-ok-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let parent = dir.to_string_lossy().to_string();
+        // Canonicalise the same way the proof does: /var/folders on macOS and
+        // 8.3-expanded paths on Windows would otherwise never match the mount
+        // table entry and the test would fail for the wrong reason.
+        let parent = std::fs::canonicalize(&dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let entries = vec![
             mount("/", "/dev/root", "ext4"),
             mount(&parent, "/dev/sda2", "ntfs3"),
