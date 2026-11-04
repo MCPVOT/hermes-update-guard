@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -92,9 +93,10 @@ pub fn profiles(home: &Path) -> Vec<String> {
 pub fn profiles_gone_since_backup(
     home: &Path,
     retired: &std::collections::BTreeSet<String>,
+    bulk_root: &Path,
 ) -> Vec<String> {
     let now = profiles(home);
-    last_seen_in_backups(home)
+    last_seen_in_backups(bulk_root)
         .into_iter()
         .filter(|(n, _)| !now.iter().any(|x| x == n) && !retired.contains(n))
         .map(|(n, s)| format!("{} (last seen {})", n, s.trim_start_matches("pre-update-")))
@@ -105,9 +107,11 @@ pub fn profiles_gone_since_backup(
 ///
 /// A profile can disappear between two updates, and if it is already gone from the
 /// newest backup a latest-only comparison never sees it, so every backup is scanned.
-pub fn last_seen_in_backups(home: &Path) -> std::collections::BTreeMap<String, String> {
-    let backups = home.join("backups");
-    let Ok(rd) = std::fs::read_dir(&backups) else {
+///
+/// `bulk_root` is the RESOLVED bulk root, not `<home>/backups`: the restore points
+/// may live on a mounted disk, and this question is about those runs.
+pub fn last_seen_in_backups(bulk_root: &Path) -> std::collections::BTreeMap<String, String> {
+    let Ok(rd) = std::fs::read_dir(bulk_root) else {
         return Default::default();
     };
     let mut dirs: Vec<(String, PathBuf)> = rd
@@ -175,6 +179,291 @@ pub fn state_db(home: &Path, profile: &str) -> PathBuf {
 
 pub fn config_yaml(home: &Path, profile: &str) -> PathBuf {
     profile_dir(home, profile).join("config.yaml")
+}
+
+/// The ALWAYS-LOCAL guard root: run state, the log, provider-surface baselines,
+/// log-signal snapshots and quarantine all live here.
+///
+/// It is deliberately not configurable. `watch`, `verify`, `self-check` and the
+/// drift baseline must keep working when the removable disk is detached — which
+/// is exactly the moment a post-update verify matters.
+pub fn control_root(home: &Path) -> PathBuf {
+    home.join("backups")
+}
+
+/// Where `pre-update-<stamp>/` directories are written.
+///
+/// Precedence: `--backup-root`, then `$HERMES_GUARD_BULK_ROOT`, else the control
+/// root (today's behaviour, byte-for-byte). The path is NOT validated here; the
+/// mount proof belongs to the commands that write, so a detached disk cannot
+/// stop `verify` from reading the control root.
+pub fn bulk_root(home: &Path, cli: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = cli {
+        return Ok(p.to_path_buf());
+    }
+    if let Ok(v) = std::env::var("HERMES_GUARD_BULK_ROOT") {
+        if !v.trim().is_empty() {
+            return Ok(PathBuf::from(v));
+        }
+    }
+    Ok(control_root(home))
+}
+
+/// What the guard can PROVE about the volume it is about to write to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetProof {
+    pub path: PathBuf,
+    /// Kernel source device (`/dev/sda2`), or `local` for the control root.
+    pub device: String,
+    pub fstype: String,
+    pub is_mountpoint: bool,
+    pub free_bytes: Option<u64>,
+}
+
+impl TargetProof {
+    pub fn print(&self) {
+        println!("  target : {}", self.path.display());
+        println!(
+            "  device : {}",
+            if self.device.is_empty() {
+                "(unknown)"
+            } else {
+                self.device.as_str()
+            }
+        );
+        println!("  fstype : {}", self.fstype);
+        println!("  mount  : {}", self.is_mountpoint);
+        match self.free_bytes {
+            Some(b) => println!("  free   : {:.1} GB", b as f64 / 1_073_741_824.0),
+            None => println!("  free   : unknown"),
+        }
+    }
+}
+
+/// Filesystem types that cannot preserve Unix permissions and are almost always
+/// a boot or installer partition. The `ESD-USB` partition on the measured disk is
+/// 32 GB of vfat sitting next to the real ntfs3 backup volume — choosing it would
+/// produce a backup that cannot be restored with its modes intact.
+pub const UNSAFE_FSTYPES: [&str; 3] = ["vfat", "exfat", "iso9660"];
+
+/// Prove that `p` really is on a mounted volume before a byte is written.
+pub fn prove_target(p: &Path) -> Result<TargetProof> {
+    prove_target_with(p, false)
+}
+
+/// Same proof, but [`prove_target`]'s mount requirement may be waived by
+/// `--allow-local-backup`. The fstype refusal is NEVER waived.
+pub fn prove_target_with(p: &Path, allow_local: bool) -> Result<TargetProof> {
+    let anchor = nearest_existing(p);
+    let canonical = anchor.canonicalize().unwrap_or_else(|_| anchor.clone());
+    #[cfg(target_os = "linux")]
+    let (is_mountpoint, device, fstype) = match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(text) => facts_from_entries(&parse_mountinfo(&text), &canonical),
+        Err(_) => fallback_mount_facts(&canonical),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (is_mountpoint, device, fstype) = (true, String::new(), "unknown".to_string());
+    finish_proof(p, allow_local, is_mountpoint, device, fstype, &anchor)
+}
+
+/// Prove by consulting an explicit mount table.
+///
+/// Split out so the refusal rules are testable without a real mount and without
+/// root — the production path above just supplies the kernel's own table.
+#[cfg(test)]
+pub fn prove_target_from(
+    p: &Path,
+    allow_local: bool,
+    entries: &[MountEntry],
+) -> Result<TargetProof> {
+    let anchor = nearest_existing(p);
+    let canonical = anchor.canonicalize().unwrap_or_else(|_| anchor.clone());
+    let (is_mountpoint, device, fstype) = facts_from_entries(entries, &canonical);
+    finish_proof(p, allow_local, is_mountpoint, device, fstype, &anchor)
+}
+
+fn finish_proof(
+    p: &Path,
+    allow_local: bool,
+    is_mountpoint: bool,
+    device: String,
+    fstype: String,
+    anchor: &Path,
+) -> Result<TargetProof> {
+    reject_unsafe_fstype(p, &fstype)?;
+    if !is_mountpoint && !allow_local {
+        bail!(
+            "refusing to use {} as a backup target: it is not a mount point. \
+             An unplugged disk must not turn into a directory on the root filesystem. \
+             Mount the disk, or pass --allow-local-backup to accept the internal disk.",
+            p.display()
+        );
+    }
+    Ok(TargetProof {
+        path: p.to_path_buf(),
+        device,
+        fstype,
+        is_mountpoint,
+        free_bytes: free_space_bytes(anchor),
+    })
+}
+
+/// Prove the resolved bulk root, allowing the control root without a proof.
+///
+/// `bulk == control` is the historical default and must keep working on a plain
+/// home directory. Anything else has to pass the mount proof unless the operator
+/// explicitly asked for the local disk.
+pub fn prove_backup_target(bulk: &Path, control: &Path, allow_local: bool) -> Result<TargetProof> {
+    if bulk == control {
+        return Ok(TargetProof {
+            path: bulk.to_path_buf(),
+            device: "local".to_string(),
+            fstype: "local".to_string(),
+            // The control root is an explicit, documented exception: it is the
+            // guard's own directory, not a removable target that can vanish.
+            is_mountpoint: true,
+            free_bytes: free_space_bytes(&nearest_existing(bulk)),
+        });
+    }
+    if allow_local {
+        prove_target_with(bulk, true)
+    } else {
+        prove_target(bulk)
+    }
+}
+
+/// Refuse a filesystem type that cannot carry a restore point.
+///
+/// Pure and injectable on purpose: the test does not need a real vfat mount.
+pub fn reject_unsafe_fstype(p: &Path, fstype: &str) -> Result<()> {
+    let fstype = fstype.to_ascii_lowercase();
+    if UNSAFE_FSTYPES.contains(&fstype.as_str()) {
+        bail!(
+            "refusing {}: {} cannot preserve permissions and is usually a boot or installer partition",
+            p.display(),
+            fstype
+        );
+    }
+    Ok(())
+}
+
+/// Deepest ancestor of `p` that exists (or `p` itself).
+///
+/// The target directory normally does not exist yet — `/run/media/.../backup` is
+/// created by the first run — so the proof is made against the volume that would
+/// receive it, not against a path that cannot be stat'ed.
+pub fn nearest_existing(p: &Path) -> PathBuf {
+    let mut cur = p.to_path_buf();
+    loop {
+        if cur.exists() {
+            return cur;
+        }
+        match cur.parent() {
+            Some(parent) if parent != cur => cur = parent.to_path_buf(),
+            _ => return cur,
+        }
+    }
+}
+
+/// `(is_mountpoint, device, fstype)` from an explicit mount table.
+///
+/// "Not the root filesystem" is the test, not "different mount point": separate
+/// btrfs subvolumes such as `/home` share the root device and are therefore not
+/// an independent target. A removable disk has its own device.
+fn facts_from_entries(entries: &[MountEntry], path: &Path) -> (bool, String, String) {
+    let Some(entry) = mount_entry_for(entries, path) else {
+        return (false, String::new(), "unknown".to_string());
+    };
+    let root_device = entries
+        .iter()
+        .find(|e| e.mount_point == Path::new("/"))
+        .map(|e| e.device.as_str());
+    let on_root = entry.mount_point == Path::new("/")
+        || root_device.map(|dev| dev == entry.device).unwrap_or(false);
+    (!on_root, entry.device.clone(), entry.fstype.clone())
+}
+
+/// Compare st_dev with the parent when mountinfo is unavailable.
+#[cfg(target_os = "linux")]
+fn fallback_mount_facts(path: &Path) -> (bool, String, String) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(md) = std::fs::metadata(path) else {
+        return (false, String::new(), "unknown".to_string());
+    };
+    let is_mountpoint = path
+        .parent()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|parent| parent.dev() != md.dev())
+        .unwrap_or(false);
+    (
+        is_mountpoint,
+        format!("dev:{}", md.dev()),
+        "unknown".to_string(),
+    )
+}
+
+/// One `/proc/self/mountinfo` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountEntry {
+    pub mount_point: PathBuf,
+    pub device: String,
+    pub fstype: String,
+}
+
+/// Parse mountinfo, honouring the kernel's octal escapes (`\040` for a space).
+///
+/// Without the unescape, `/run/media/tango/New\040Volume` never matches the path
+/// the operator typed, and a perfectly mounted disk reads as "not a mount point".
+pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
+    text.lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 7 {
+                return None;
+            }
+            let sep = parts.iter().position(|f| *f == "-")?;
+            if sep + 2 >= parts.len() {
+                return None;
+            }
+            Some(MountEntry {
+                mount_point: PathBuf::from(unescape_mountinfo(parts[4])),
+                fstype: parts[sep + 1].to_string(),
+                device: parts[sep + 2].to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The entry whose mount point is the longest prefix of `path` — the volume
+/// that actually holds those bytes.
+pub fn mount_entry_for<'a>(entries: &'a [MountEntry], path: &Path) -> Option<&'a MountEntry> {
+    entries
+        .iter()
+        .filter(|e| path.starts_with(&e.mount_point))
+        .max_by_key(|e| e.mount_point.as_os_str().len())
+}
+
+fn unescape_mountinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let digits: String = chars.by_ref().take(3).collect();
+        match u32::from_str_radix(&digits, 8)
+            .ok()
+            .and_then(char::from_u32)
+        {
+            Some(decoded) if digits.len() == 3 => out.push(decoded),
+            _ => {
+                out.push('\\');
+                out.push_str(&digits);
+            }
+        }
+    }
+    out
 }
 
 /// Free space on the volume that holds `path`, in bytes.
@@ -874,8 +1163,9 @@ mod tests {
         std::fs::write(old.join("elevate/state.db"), "x").unwrap();
 
         let none = std::collections::BTreeSet::new();
+        let bulk = home.join("backups");
         assert_eq!(
-            profiles_gone_since_backup(&home, &none),
+            profiles_gone_since_backup(&home, &none, &bulk),
             vec![
                 "ancient (last seen 20250101-000000)".to_string(),
                 "elevate (last seen 20260101-000000)".to_string(),
@@ -887,7 +1177,7 @@ mod tests {
         let retired: std::collections::BTreeSet<String> =
             ["elevate".to_string()].into_iter().collect();
         assert_eq!(
-            profiles_gone_since_backup(&home, &retired),
+            profiles_gone_since_backup(&home, &retired, &bulk),
             vec!["ancient (last seen 20250101-000000)".to_string()]
         );
 
@@ -895,7 +1185,7 @@ mod tests {
         let bare = std::env::temp_dir().join(format!("hug-bare-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&bare);
         std::fs::create_dir_all(&bare).unwrap();
-        assert!(profiles_gone_since_backup(&bare, &none).is_empty());
+        assert!(profiles_gone_since_backup(&bare, &none, &bare.join("backups")).is_empty());
 
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&bare);
@@ -919,5 +1209,155 @@ mod tests {
         let (_, code, parsed) = venv_holders_probe_with(Some(Path::new("git")));
         assert!(!parsed, "prose output is not the documented JSON");
         assert_ne!(code, 0, "git has no `update` subcommand");
+    }
+
+    /// Serialise the one test that touches a process-global env var.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Precedence is the whole contract: an explicit flag must beat the env var,
+    /// and the env var must beat the default. The env path is NOT validated as a
+    /// mount here — the proof belongs to the command that writes.
+    #[test]
+    fn bulk_root_precedence_flag_then_env_then_control() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = PathBuf::from("/tmp/hug-home");
+        let saved = std::env::var_os("HERMES_GUARD_BULK_ROOT");
+        std::env::remove_var("HERMES_GUARD_BULK_ROOT");
+
+        assert_eq!(bulk_root(&home, None).unwrap(), home.join("backups"));
+        std::env::set_var("HERMES_GUARD_BULK_ROOT", "/mnt/not-a-real-mount/env");
+        assert_eq!(
+            bulk_root(&home, None).unwrap(),
+            PathBuf::from("/mnt/not-a-real-mount/env"),
+            "an env path is returned even though it cannot be a mount"
+        );
+        assert_eq!(
+            bulk_root(&home, Some(Path::new("/mnt/flag/backup"))).unwrap(),
+            PathBuf::from("/mnt/flag/backup"),
+            "the explicit flag beats the env var"
+        );
+
+        match saved {
+            Some(v) => std::env::set_var("HERMES_GUARD_BULK_ROOT", v),
+            None => std::env::remove_var("HERMES_GUARD_BULK_ROOT"),
+        }
+    }
+
+    fn mount(mount_point: &str, device: &str, fstype: &str) -> MountEntry {
+        MountEntry {
+            mount_point: PathBuf::from(mount_point),
+            device: device.to_string(),
+            fstype: fstype.to_string(),
+        }
+    }
+
+    /// A plain directory on the root filesystem is refused, and a path that does
+    /// not exist yet is refused too — and neither refusal creates anything.
+    #[test]
+    fn prove_target_refuses_the_root_filesystem_and_creates_nothing() {
+        let dir = std::env::temp_dir().join(format!("hug-proof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let root_only = vec![mount("/", "/dev/root", "ext4")];
+        let existing = prove_target_from(&dir, false, &root_only);
+        assert!(existing.is_err());
+        let msg = format!("{:#}", existing.unwrap_err());
+        assert!(
+            msg.contains("it is not a mount point") && msg.contains("--allow-local-backup"),
+            "the refusal must name the rule and the way out: {msg}"
+        );
+
+        let deep = dir.join("new/backup/dir");
+        let missing = prove_target_from(&deep, false, &root_only);
+        assert!(missing.is_err(), "a path that must be created is refused");
+        assert!(!deep.exists(), "the proof must not create the target");
+
+        // The operator can still choose the local disk deliberately.
+        let allowed = prove_target_from(&deep, true, &root_only).unwrap();
+        assert!(!allowed.is_mountpoint);
+        assert!(
+            !deep.exists(),
+            "--allow-local-backup must not create it either"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A target under a mounted non-root volume is accepted, and the proof carries
+    /// that volume's device and fstype.
+    #[test]
+    fn prove_target_accepts_a_mounted_volume() {
+        let dir = std::env::temp_dir().join(format!("hug-proof-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent = dir.to_string_lossy().to_string();
+        let entries = vec![
+            mount("/", "/dev/root", "ext4"),
+            mount(&parent, "/dev/sda2", "ntfs3"),
+        ];
+        let target = dir.join("mcpvot-backup/hermes-guard");
+        let proof = prove_target_from(&target, false, &entries).unwrap();
+        assert_eq!(proof.device, "/dev/sda2");
+        assert_eq!(proof.fstype, "ntfs3");
+        assert!(proof.is_mountpoint);
+        assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The control root is legal without any mount proof (backwards compatibility).
+    #[test]
+    fn control_root_is_accepted_without_a_proof() {
+        let home = std::env::temp_dir().join(format!("hug-control-{}", std::process::id()));
+        let control = control_root(&home);
+        let proof = prove_backup_target(&control, &control, false).unwrap();
+        assert!(proof.is_mountpoint);
+        assert_eq!(proof.device, "local");
+        assert!(
+            !control.exists(),
+            "proving must not create the control root"
+        );
+    }
+
+    /// Installer/boot filesystems cannot preserve permission bits, so they are
+    /// refused by TYPE, independently of whether the path is a mount point.
+    #[test]
+    fn prove_target_rejects_boot_and_installer_filesystems() {
+        for fs in ["vfat", "VFAT", "exfat", "iso9660"] {
+            assert!(
+                reject_unsafe_fstype(Path::new("/mnt/x"), fs).is_err(),
+                "{fs} must be refused"
+            );
+        }
+        for fs in ["ntfs3", "ext4", "btrfs", "apfs", "unknown"] {
+            assert!(reject_unsafe_fstype(Path::new("/mnt/x"), fs).is_ok());
+        }
+    }
+
+    /// mountinfo escapes spaces as `\040`; without decoding it, the real SanDisk
+    /// mount at `/run/media/tango/New Volume` can never match what was typed.
+    #[test]
+    fn mountinfo_parses_escaped_mount_points_and_longest_prefix() {
+        let text = "\
+413 29 8:2 / /run/media/tango/New\\040Volume rw,relatime shared:468 - ntfs3 /dev/sda2 rw\n\
+350 29 8:1 / /run/media/tango/ESD-USB rw,relatime shared:453 - vfat /dev/sda1 rw\n\
+29 33 0:26 / /run rw,nosuid shared:12 - tmpfs run rw\n";
+        let entries = parse_mountinfo(text);
+        assert_eq!(
+            entries[0].mount_point,
+            PathBuf::from("/run/media/tango/New Volume")
+        );
+        assert_eq!(entries[0].device, "/dev/sda2");
+        assert_eq!(entries[0].fstype, "ntfs3");
+        assert_eq!(entries[1].fstype, "vfat");
+
+        let target = Path::new("/run/media/tango/New Volume/mcpvot-backup/hermes-guard");
+        let hit = mount_entry_for(&entries, target).unwrap();
+        assert_eq!(hit.device, "/dev/sda2");
+
+        let (is_mount, device, fstype) = facts_from_entries(&entries, target);
+        assert!(is_mount);
+        assert_eq!(device, "/dev/sda2");
+        assert_eq!(fstype, "ntfs3");
     }
 }

@@ -1,10 +1,11 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+use crate::config::Config;
 use crate::env;
 
 /// Read-only preflight: surface every condition that decides an update.
-pub fn run(home: &Path) -> Result<()> {
+pub fn run(home: &Path, cfg: &Config) -> Result<()> {
     crate::vibe::print_compact(env!("CARGO_PKG_VERSION"));
     println!("== HERMES UPDATE PREFLIGHT ==");
     println!("home: {}", home.display());
@@ -17,6 +18,51 @@ pub fn run(home: &Path) -> Result<()> {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "(unknown path)".into())
     );
+
+    // ---- backup target ------------------------------------------------------
+    // Printed, never created: preflight stays read-only even when the proof
+    // fails. The commands that would write refuse for the same reason.
+    println!("\n[backup target]");
+    println!("  control: {}", cfg.control_root.display());
+    println!(
+        "  bulk   : {}{}",
+        cfg.bulk_root.display(),
+        if cfg.bulk_is_control() {
+            " (default control root - no mount proof required)"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "  content: {}  secrets: {}  keep: {}",
+        if cfg.content.is_empty() {
+            "(none)".to_string()
+        } else {
+            cfg.content.join(",")
+        },
+        if cfg.no_secrets {
+            "EXCLUDED (--no-secrets)"
+        } else {
+            "included"
+        },
+        if cfg.keep == 0 {
+            "all".to_string()
+        } else {
+            cfg.keep.to_string()
+        }
+    );
+    match env::prove_backup_target(&cfg.bulk_root, &cfg.control_root, cfg.allow_local_backup) {
+        Ok(proof) => {
+            proof.print();
+            if cfg.allow_local_backup && !proof.is_mountpoint {
+                println!("  note   : --allow-local-backup accepted a non-mount target");
+            }
+        }
+        Err(e) => {
+            println!("  REFUSED: {e}");
+            println!("  backup/update would refuse this target; preflight wrote nothing");
+        }
+    }
 
     // version + update-channel state
     let hermes = env::venv_hermes(home);

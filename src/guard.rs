@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use std::path::Path;
 
 use crate::backup;
+use crate::config::Config;
 use crate::drift;
 use crate::env;
 use crate::state::{RunState, StageState};
@@ -17,9 +18,10 @@ pub fn run(
     detached: bool,
     channel: Option<&str>,
     dashboard: bool,
+    cfg: &Config,
 ) -> Result<()> {
     if detached {
-        return spawn_detached(home, close_desktop, force, channel, dashboard);
+        return spawn_detached(home, close_desktop, force, channel, dashboard, cfg);
     }
 
     crate::vibe::print_compact(env!("CARGO_PKG_VERSION"));
@@ -41,7 +43,7 @@ pub fn run(
         }
     }
 
-    let result = run_stages(home, close_desktop, force, &mut st, channel);
+    let result = run_stages(home, close_desktop, force, &mut st, channel, cfg);
 
     st.finish(if result.is_ok() { 0 } else { 1 });
     let _ = st.write(home);
@@ -54,6 +56,7 @@ fn run_stages(
     force: bool,
     st: &mut RunState,
     channel: Option<&str>,
+    cfg: &Config,
 ) -> Result<()> {
     // ---- PREFLIGHT ---------------------------------------------------------
     st.stage("preflight", StageState::Active);
@@ -230,7 +233,7 @@ fn run_stages(
             );
             let _ = st.write(home);
         };
-        backup::run_with(home, false, &mut on_db)?
+        backup::run_with(home, false, cfg, &mut on_db)?
     };
     st.stage("backup", StageState::Done);
     let _ = st.write(home);
@@ -369,7 +372,7 @@ fn run_stages(
     st.stage("verify", StageState::Active);
     let _ = st.write(home);
     println!("\n-- POST-UPDATE VERIFY --");
-    let verified = crate::verify::run(home);
+    let verified = crate::verify::run(home, cfg);
     match &verified {
         Ok(()) => st.stage("verify", StageState::Done),
         Err(e) => {
@@ -560,6 +563,7 @@ fn spawn_detached(
     force: bool,
     channel: Option<&str>,
     dashboard: bool,
+    cfg: &Config,
 ) -> Result<()> {
     use std::process::{Command, Stdio};
 
@@ -581,6 +585,26 @@ fn spawn_detached(
     }
     if let Some(ch) = channel {
         cmd.arg("--channel").arg(ch);
+    }
+    // The child must resolve the SAME backup target: a detached run that fell
+    // back to the control root would put the restore point on the wrong disk.
+    if !cfg.bulk_is_control() {
+        cmd.arg("--backup-root").arg(&cfg.bulk_root);
+    }
+    if cfg.no_secrets {
+        cmd.arg("--no-secrets");
+    }
+    if !cfg.content.is_empty() && cfg.content.len() != crate::config::CONTENT_KINDS.len() {
+        cmd.arg("--content").arg(cfg.content.join(","));
+    }
+    if cfg.keep > 0 {
+        cmd.arg("--keep").arg(cfg.keep.to_string());
+    }
+    if cfg.allow_local_backup {
+        cmd.arg("--allow-local-backup");
+    }
+    if cfg.allow_lineage_change {
+        cmd.arg("--allow-lineage-change");
     }
     // The child opens the window, not this parent (two windows otherwise).
     if !dashboard {
