@@ -59,13 +59,77 @@ the latest release waits for the next release even though the upstream branch is
 ahead — so "N commits behind" and "no update available" are simultaneously true.
 Confirm the channel in preflight output before concluding the install is current.
 
-## Backup layout (`backups/pre-update-<stamp>/`)
+## Backup layout and the two roots (0.4.0+)
 
-Per profile: `.env`, `auth.json`, `channel_directory.json`, `config.yaml`,
-`gateway_state.json`, `state.db`, `cron/`, `memories/`, `scripts/`, `skills/`.
-Root: `HEAD-before.txt`, `version-before.txt`, `stash-list.txt`,
-`stash-0.patch`. Two writers coexist — a directory snapshot and a `.zip`
-archive. Treat every one of these as secret-bearing.
+Two roots, one writer:
+
+| Root | Default | Holds |
+|---|---|---|
+| control | `<home>/backups` | `guard-run.json`, `guard-update.log`, `provider-surface/`, `guard-logsignals.json`, `quarantine/`, `profile-retired.json` |
+| bulk | `--backup-root`, else `$HERMES_GUARD_BULK_ROOT`, else the control root | `pre-update-<stamp>/` only |
+
+The control root is never configurable: `watch`, `verify`, `self-check` and drift
+baselines must work when the removable disk is detached.
+
+Per profile inside a run: `.env`, `auth.json`, `channel_directory.json`,
+`config.yaml`, `gateway_state.json`, `state.db`, `cron/`, `memories/`, `scripts/`,
+`skills/`. Root: `HEAD-before.txt`, `version-before.txt`, `stash-list.txt`,
+`stash-0.patch`, `working-tree.patch`, `manifest.json`. Two writers coexist — a
+directory snapshot and a `.zip` archive. Treat every one of these as secret-bearing
+(unless `--no-secrets` was used).
+
+`copy_dir` deliberately skips dot-entries (`dot-cache`) and symlinks (`symlink`):
+the measured fleet carries an 85 MB regenerable `skills/.hub` cache and
+`skills/omarchy` / `skills/diagnose-crash` symlinks into `/usr/share/omarchy`.
+
+## `manifest.json` schema
+
+Written after the completeness gate, so it never describes a run that refused to
+be whole. `verify` reads the newest run on the bulk root.
+
+```json
+{
+  "guard_version": "0.4.0",
+  "created": "<RFC3339 local>",
+  "secrets_included": false,
+  "profiles": ["default", "trilogy-brain"],
+  "files": 1234,
+  "bytes": 76543210,
+  "target": {
+    "path": "/run/media/tango/New Volume/mcpvot-backup/hermes-guard/pre-update-...",
+    "device": "/dev/sda2",
+    "fstype": "ntfs3",
+    "is_mountpoint": true,
+    "free_bytes": 336000000000
+  },
+  "skipped": [
+    { "path": "trilogy-brain/skills/.hub", "reason": "dot-cache" },
+    { "path": "trilogy-brain/skills/omarchy", "reason": "symlink" },
+    { "path": "default/.env", "reason": "secret" }
+  ]
+}
+```
+
+Reasons are `dot-cache`, `symlink`, `secret`. A run without a manifest is a
+pre-0.4.0 run: `verify` says `no manifest (pre-0.4.0 run)` and claims neither
+completeness nor partiality beyond that.
+
+## Lineage gate
+
+`hermes update --check` names a release tag. Before updating, the guard resolves
+it and runs two tests in opposite directions:
+
+```text
+git merge-base --is-ancestor "$tag" HEAD   -> true: REWIND (block)
+git merge-base --is-ancestor HEAD "$tag"   -> true: fast-forward (allow)
+neither                                    -> divergent (block)
+```
+
+`git describe --tags HEAD` and `rev-list --count` in both directions are reported
+on a block. `--allow-lineage-change` prints the from/to and proceeds. `preflight`
+does the same comparison read-only and never fetches; an absent tag prints
+`release tag not fetched locally: run preflight after git fetch --tags or let
+update test it`.
 
 ## Interrupted-update residue
 

@@ -1,7 +1,7 @@
 ---
 name: hermes-update-guard
-description: Use when running or verifying a `hermes update`, or after a failed update left a stale lock — drives the guarded pipeline (preflight, WAL-safe backup, provider-drift tripwire, post-verify) through the hermes-update-guard binary.
-version: 0.3.8
+description: Use when running or verifying a `hermes update`: guards it with preflight, a WAL-safe backup on a mount-proven target, a provider-drift tripwire and post-verify.
+version: 0.4.0
 author: MCPVOT
 license: MIT
 platforms: [macos, linux, windows]
@@ -35,6 +35,11 @@ tripwire — the whole scripted update ritual in one static binary.
 | **Approve** the current surface as the golden reference | `hermes-update-guard bless` |
 | Prove no drift | `hermes-update-guard diff --baseline last-known` |
 | WAL-safe backup | `hermes-update-guard backup` |
+| Back up to a mounted disk | `hermes-update-guard backup --backup-root "<mount>/hermes-guard"` |
+| Leave credentials out | add `--no-secrets` (the manifest says partial) |
+| Keep only the newest N runs | add `--keep 5` |
+| Accept a non-mount target deliberately | add `--allow-local-backup` |
+| Allow a rewind/divergence | add `--allow-lineage-change` (the gate prints from/to first) |
 | Guarded update (all-in-one) | `hermes-update-guard update --close-desktop` |
 | Unattended update (survives a closed shell) | `hermes-update-guard update --close-desktop --detached` |
 | Watch a run live | `hermes-update-guard watch` (or `watch --no-tui` for a snapshot) |
@@ -49,6 +54,24 @@ tripwire — the whole scripted update ritual in one static binary.
 | Snapshot log signatures before an update | `hermes-update-guard snapshot-logs` |
 | Is the binary I am running current? | `hermes-update-guard self-check` |
 | Identity banner | `hermes-update-guard vibe` |
+
+## Backup roots and the mount proof
+
+`pre-update-<stamp>/` can be written to a mounted removable disk with
+`--backup-root <PATH>` or `$HERMES_GUARD_BULK_ROOT`. Everything else —
+`guard-run.json`, the log, `provider-surface/`, log signals, quarantine — stays in
+`<home>/backups`, so `watch`, `verify` and `self-check` work with the disk
+unplugged.
+
+`backup` and `update` prove the target is on a mounted, non-root volume before
+writing. A missing mount is refused (an unplugged disk must not become a directory
+on the internal SSD), and `vfat` / `exfat` / `iso9660` are always refused. Pass
+`--allow-local-backup` to choose the internal disk on purpose. `preflight` prints
+the proof and creates nothing.
+
+Each run writes `manifest.json` (files, bytes, target device/fstype, and every
+skip with a reason). `--no-secrets` excludes `.env` and `auth.json` and sets
+`secrets_included: false`, so `verify` reports the restore point as **PARTIAL**.
 
 ## Procedure
 
@@ -93,6 +116,10 @@ local build). If it is not installed:
 
 ## Decision rules
 
+- `preflight` → `lineage` (and `update`'s own lineage gate): a release that is an
+  ANCESTOR of HEAD (a rewind) or has DIVERGED blocks the update. A clean
+  fast-forward proceeds. `--allow-lineage-change` is the deliberate override; it
+  prints the from/to `git describe`, the tag and the commit counts both ways.
 - `preflight` reports `dirty: N file(s)` → those files will be stashed by the
   updater. `verify` afterwards proves they came back: a clean tree **with** stash
   entries still present is a FAIL (the patched file was parked, not restored).

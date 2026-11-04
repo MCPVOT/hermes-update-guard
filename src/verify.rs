@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
+use crate::config::Config;
 use crate::env;
 
 /// Post-update verification: HEAD advanced, version sane, every live db integrity ok,
@@ -22,7 +23,7 @@ fn mark(what: &str, since: &mut std::time::Instant) {
     *since = std::time::Instant::now();
 }
 
-pub fn run(home: &Path) -> Result<()> {
+pub fn run(home: &Path, cfg: &Config) -> Result<()> {
     println!("== POST-UPDATE VERIFY ==");
 
     let mut t = std::time::Instant::now();
@@ -118,9 +119,46 @@ pub fn run(home: &Path) -> Result<()> {
     }
 
     mark("databases", &mut t);
+    // ---- 3b. the restore point's own manifest -------------------------------
+    // A backup can be INTENTIONALLY partial (--no-secrets, --content). Silence
+    // about that is the same failure mode as an unreadable section: an operator
+    // reads "VERIFY: PASS" and believes the restore point is whole.
+    println!("  restore point:");
+    match crate::backup::newest_run(&cfg.bulk_root) {
+        None => println!(
+            "  ! no pre-update backup on {} - nothing to restore from there",
+            cfg.bulk_root.display()
+        ),
+        Some(run) => match crate::backup::read_manifest(&run) {
+            Some(m) => {
+                if m.secrets_included {
+                    println!(
+                        "  restore point is COMPLETE (secrets included): {} files, {:.1} MB",
+                        m.files,
+                        m.bytes as f64 / 1_048_576.0
+                    );
+                } else {
+                    println!(
+                        "  restore point is PARTIAL: .env and auth.json were excluded (--no-secrets)"
+                    );
+                    println!(
+                        "      {} files, {:.1} MB, {} skipped entr(ies)",
+                        m.files,
+                        m.bytes as f64 / 1_048_576.0,
+                        m.skipped.len()
+                    );
+                }
+            }
+            None if run.join("manifest.json").exists() => println!(
+                "  ! manifest.json is unreadable - cannot say whether this restore point is complete"
+            ),
+            None => println!("  no manifest (pre-0.4.0 run)"),
+        },
+    }
+
     // ---- 4. local patch restoration ----------------------------------------
     println!("  local patch (stash/restore):");
-    check_patch_restored(home, &repo, &mut failures);
+    check_patch_restored(&repo, &mut failures, &cfg.bulk_root);
 
     // ---- 5. provider surface vs the APPROVED baseline -----------------------
     println!("  provider surface vs approved baseline:");
@@ -355,7 +393,7 @@ pub fn run(home: &Path) -> Result<()> {
 /// Two distinct failures: a clean tree WITH stash entries (the updater parked the
 /// patch) and a clean tree with NO stashes while the pre-update backup recorded a
 /// working-tree patch (the change vanished entirely).
-fn check_patch_restored(home: &Path, repo: &Path, failures: &mut Vec<String>) {
+fn check_patch_restored(repo: &Path, failures: &mut Vec<String>, bulk_root: &Path) {
     let dirty = match env::run_checked(Path::new("git"), &["status", "--short"], Some(repo)) {
         Ok((stdout, _)) => stdout
             .lines()
@@ -381,7 +419,7 @@ fn check_patch_restored(home: &Path, repo: &Path, failures: &mut Vec<String>) {
         }
     };
 
-    let expected = expected_patched_files(home);
+    let expected = expected_patched_files(bulk_root);
 
     if !dirty.is_empty() {
         println!(
@@ -438,23 +476,11 @@ fn check_patch_restored(home: &Path, repo: &Path, failures: &mut Vec<String>) {
 }
 
 /// File paths recorded in the newest pre-update backup's working-tree.patch.
-fn expected_patched_files(home: &Path) -> Vec<String> {
-    let backups = home.join("backups");
-    let Ok(entries) = std::fs::read_dir(&backups) else {
-        return vec![];
-    };
-    let mut dirs: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("pre-update-"))
-                .unwrap_or(false)
-        })
-        .collect();
-    dirs.sort();
-    let Some(newest) = dirs.last() else {
+///
+/// Read from the RESOLVED bulk root: when the run wrote to a removable disk the
+/// patch is there, not under `<home>/backups`.
+fn expected_patched_files(bulk_root: &Path) -> Vec<String> {
+    let Some(newest) = crate::backup::newest_run(bulk_root) else {
         return vec![];
     };
     let patch = newest.join("working-tree.patch");
@@ -634,7 +660,7 @@ mod tests {
         )
         .unwrap();
 
-        let files = expected_patched_files(&root);
+        let files = expected_patched_files(&root.join("backups"));
         assert_eq!(
             files,
             vec![
@@ -649,6 +675,6 @@ mod tests {
     /// No backup at all must yield an empty list (not a panic, not a fake entry).
     #[test]
     fn expected_patched_files_empty_without_backups() {
-        assert!(expected_patched_files(Path::new("C:/definitely-not-here-xyz")).is_empty());
+        assert!(expected_patched_files(Path::new("C:/definitely-not-here-xyz/backups")).is_empty());
     }
 }

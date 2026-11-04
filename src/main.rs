@@ -6,10 +6,12 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod backup;
+mod config;
 mod context_health;
 mod drift;
 mod env;
 mod guard;
+mod lineage;
 mod logsignals;
 mod mcpcheck;
 mod preflight;
@@ -36,6 +38,39 @@ struct Cli {
     /// (also read from $HERMES_GUARD_REPO). Catches a STALE installed binary.
     #[arg(long, global = true)]
     repo: Option<PathBuf>,
+
+    /// Where `pre-update-<stamp>/` restore points go. Default:
+    /// $HERMES_GUARD_BULK_ROOT, else <home>/backups. Must be a mount point
+    /// unless it is the control root or --allow-local-backup is passed.
+    #[arg(long, global = true, value_name = "PATH")]
+    backup_root: Option<PathBuf>,
+
+    /// Leave `.env` and `auth.json` out of the backup. Recorded in the manifest,
+    /// so `verify` calls the restore point PARTIAL instead of complete.
+    #[arg(long, global = true)]
+    no_secrets: bool,
+
+    /// Comma-separated content directories to copy: memories,skills,scripts,cron
+    /// (default: all four).
+    #[arg(long, global = true, value_name = "LIST")]
+    content: Option<String>,
+
+    /// Keep only the newest N pre-update runs on the bulk root (0 = keep all).
+    /// Pruning happens only after a verified backup, and never removes the run
+    /// just written.
+    #[arg(long, global = true, default_value_t = 0, value_name = "N")]
+    keep: usize,
+
+    /// Accept a backup target that is not a mount point (the internal disk).
+    /// Without this, an unplugged disk is refused instead of silently becoming
+    /// a directory on the root filesystem.
+    #[arg(long, global = true)]
+    allow_local_backup: bool,
+
+    /// Proceed even when the selected release would REWIND or DIVERGE from HEAD.
+    /// The gate prints what it is switching from and to before continuing.
+    #[arg(long, global = true)]
+    allow_lineage_change: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -168,15 +203,29 @@ fn main() -> Result<()> {
         Some(p) => env::hermes_home_from(p)?,
         None => env::hermes_home()?,
     };
+    // Resolve the two roots and the flags ONCE. Modules must not re-derive the
+    // bulk root: a silent fallback there could write a restore point onto the
+    // internal disk while the operator believed it was on the removable one.
+    let cfg = config::Config::new(
+        &home,
+        config::ConfigInput {
+            backup_root: cli.backup_root.clone(),
+            no_secrets: cli.no_secrets,
+            content: cli.content.clone(),
+            keep: cli.keep,
+            allow_local_backup: cli.allow_local_backup,
+            allow_lineage_change: cli.allow_lineage_change,
+        },
+    )?;
     match cli.cmd {
-        Cmd::Preflight => preflight::run(&home),
+        Cmd::Preflight => preflight::run(&home, &cfg),
         Cmd::Export => drift::export(&home),
         Cmd::Bless => drift::bless(&home),
         Cmd::Diff { baseline } => {
             let b = baseline.as_deref().and_then(resolve_baseline);
             drift::diff(&home, b.as_deref())
         }
-        Cmd::Backup { dry_run } => backup::run(&home, dry_run).map(|_| ()),
+        Cmd::Backup { dry_run } => backup::run(&home, dry_run, &cfg).map(|_| ()),
         Cmd::Update {
             close_desktop,
             skip_preflight,
@@ -196,6 +245,7 @@ fn main() -> Result<()> {
                 detached,
                 channel.as_deref(),
                 !no_dashboard,
+                &cfg,
             )
         }
         Cmd::Dashboard => guard::open_dashboard(&home),
@@ -206,7 +256,7 @@ fn main() -> Result<()> {
                 tui::run(&home)
             }
         }
-        Cmd::Verify => verify::run(&home),
+        Cmd::Verify => verify::run(&home, &cfg),
         Cmd::Mcp => mcpcheck::run(&home),
         Cmd::SnapshotLogs => {
             let sp = logsignals::snapshot(&home)?;
@@ -232,8 +282,8 @@ fn main() -> Result<()> {
             None => context_health::run_with(&home, logs),
         },
         Cmd::Quarantine { apply, receipts } => quarantine::run(&home, apply, receipts),
-        Cmd::Retire { profile, undo } => retire::run(&home, &profile, undo),
-        Cmd::SelfCheck => selfcheck::run(&home, cli.repo.as_deref()),
+        Cmd::Retire { profile, undo } => retire::run(&home, &profile, undo, &cfg.bulk_root),
+        Cmd::SelfCheck => selfcheck::run(&home, cli.repo.as_deref(), &cfg.bulk_root),
         Cmd::Vibe => {
             vibe::print_full();
             Ok(())
