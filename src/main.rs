@@ -11,6 +11,7 @@ mod context_health;
 mod drift;
 mod env;
 mod guard;
+mod lineage;
 mod logsignals;
 mod mcpcheck;
 mod preflight;

@@ -5,6 +5,7 @@ use crate::backup;
 use crate::config::Config;
 use crate::drift;
 use crate::env;
+use crate::lineage;
 use crate::state::{RunState, StageState};
 
 /// Full guarded update: preflight -> drift export -> WAL-safe backup -> hermes update --yes -> verify.
@@ -247,6 +248,13 @@ fn run_stages(
         Err(e) => println!("  ! log-signal snapshot failed: {}", e),
     }
 
+    // ---- LINEAGE GATE -----------------------------------------------------
+    // The selected release must move the checkout FORWARD. On this machine HEAD
+    // is a canary checkout 112 commits past v0.22.5 and stable offers v0.22.7,
+    // an ANCESTOR of HEAD: updated blindly the resolver would walk the tree
+    // backwards 1,075 commits and call it an update.
+    lineage_gate(home, cfg)?;
+
     // ---- UPDATE ------------------------------------------------------------
     // Capture the fleet's context health BEFORE the update. `verify` compares
     // against it, so a transcript that was already broken is reported as
@@ -388,6 +396,74 @@ fn run_stages(
         backup_dir.display()
     );
     Ok(())
+}
+
+/// Classify the move to the selected release and block a rewind or a divergence.
+///
+/// Read-only: it runs `hermes update --check` and `git` only. A tag that is not in
+/// the local object store is a note, not a refusal: the update's own fetch can
+/// still bring it, and blocking on an unfetched tag would strand every install.
+fn lineage_gate(home: &Path, cfg: &Config) -> Result<()> {
+    println!("\n-- LINEAGE GATE --");
+    let Some(hermes) = env::resolve_hermes(home) else {
+        println!("  no hermes CLI found - gate skipped");
+        return Ok(());
+    };
+    let (_, check) =
+        env::run_capture(&hermes, &["update", "--check"], None).unwrap_or((-1, String::new()));
+    let Some(tag) = lineage::parse_target_tag(&check) else {
+        println!("  `hermes update --check` named no release tag - gate skipped");
+        return Ok(());
+    };
+    let repo = home.join("hermes-agent");
+    if !repo.join(".git").exists() {
+        println!("  no git checkout at {} - gate skipped", repo.display());
+        return Ok(());
+    }
+    println!("  target release: {}", tag);
+
+    match lineage::classify(&repo, &tag)? {
+        lineage::Lineage::TagMissing => println!(
+            "  release tag not fetched locally: run preflight after `git fetch --tags` or let update test it"
+        ),
+        lineage::Lineage::UpToDate { .. } => {
+            println!("  ok HEAD is already at {} - no move", tag)
+        }
+        lineage::Lineage::FastForward { add, drop } => println!(
+            "  ok fast-forward: {} commit(s) added, {} dropped",
+            add, drop
+        ),
+        lineage::Lineage::Rewind { add, drop } => {
+            let verdict = "is an ANCESTOR of HEAD: updating would REWIND the install";
+            if cfg.allow_lineage_change {
+                println!("  ! {}", lineage_message(&repo, &tag, verdict, add, drop));
+                println!("  --allow-lineage-change: proceeding anyway");
+            } else {
+                bail!("{}", lineage_message(&repo, &tag, verdict, add, drop));
+            }
+        }
+        lineage::Lineage::Divergent { add, drop } => {
+            let verdict = "has DIVERGED from HEAD: neither history contains the other";
+            if cfg.allow_lineage_change {
+                println!("  ! {}", lineage_message(&repo, &tag, verdict, add, drop));
+                println!("  --allow-lineage-change: proceeding anyway");
+            } else {
+                bail!("{}", lineage_message(&repo, &tag, verdict, add, drop));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lineage_message(repo: &Path, tag: &str, verdict: &str, add: u64, drop: u64) -> String {
+    format!(
+        "lineage: BLOCKED - {tag} {verdict}\n  \
+         HEAD     : {}\n  \
+         target   : {tag}\n  \
+         commits  : {add} to add, {drop} to drop\n  \
+         ways out : pass --allow-lineage-change to proceed anyway, or switch to the channel that matches this checkout",
+        lineage::describe(repo)
+    )
 }
 
 /// Where the dashboard lives, if it has been built. The window is optional, so
