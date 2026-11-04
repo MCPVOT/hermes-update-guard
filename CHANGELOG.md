@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-04
+
+### Added
+- **External backup target.** `pre-update-<stamp>/` directories can now be written to a mounted
+  removable disk via `--backup-root <PATH>` (or `$HERMES_GUARD_BULK_ROOT`). The control root
+  (`<home>/backups`: `guard-run.json`, the log, `provider-surface/`, log signals, quarantine) stays
+  local, so `watch`, `verify`, `self-check` and the drift baseline keep working with the disk
+  detached - exactly when a post-update verify matters.
+- **Mount proof.** `backup` and `update` refuse a target that is not on a mounted, non-root volume,
+  with the explicit "an unplugged disk must not turn into a directory on the root filesystem"
+  message. `vfat`, `exfat` and `iso9660` are refused outright, so the 32 GB ESD-USB installer
+  partition can never be selected. `--allow-local-backup` accepts the internal disk deliberately;
+  `preflight` prints the proof but never creates the directory.
+- **Content selection.** `--no-secrets` skips `.env` and `auth.json` (recorded in the manifest).
+  `--content memories,skills,scripts,cron` copies a subset. `copy_dir` now skips dot-directories
+  (the regenerable `skills/.hub`) and symlinks (regenerable system content), recording each skip.
+- **Per-run `manifest.json`.** Records `files`, `bytes`, the target's device / fstype / mount status /
+  free space, and every skipped entry with a reason. `verify` reads it and calls a restore point
+  PARTIAL when secrets were excluded; a missing manifest is reported as a pre-0.4.0 run.
+- **Retention.** `--keep <N>` keeps the newest N runs on the bulk root. Pruning runs only after a
+  verified backup, never removes the run just written, is a no-op at `N=0`, and refuses to delete
+  when the target failed its mount proof.
+- **Lineage gate.** Before `hermes update`, the selected release tag is compared with HEAD using
+  `git merge-base --is-ancestor` in both directions. A fast-forward proceeds; a rewind or a
+  divergence BLOCKS unless `--allow-lineage-change`, naming `git describe`, the tag and the commit
+  counts both ways. `preflight` reports the same comparison read-only, without fetching.
+
+### Changed
+- `env::last_seen_in_backups` (and `self-check` / `retire`) now scan the **resolved bulk root**,
+  because they answer questions about `pre-update-*` runs.
+- `verify` reads the pre-update patch from the bulk root, so patch restoration is still detected
+  when the restore point is on a removable disk.
+
 ## [0.3.9] - 2026-10-26
 
 Four findings from a full read-only audit of the 0.3.8 tree (7,257 lines, 62 tests). Three of them
