@@ -255,11 +255,13 @@ pub fn prove_target(p: &Path) -> Result<TargetProof> {
 /// `--allow-local-backup`. The fstype refusal is NEVER waived.
 pub fn prove_target_with(p: &Path, allow_local: bool) -> Result<TargetProof> {
     let anchor = nearest_existing(p);
-    let canonical = anchor.canonicalize().unwrap_or_else(|_| anchor.clone());
     #[cfg(target_os = "linux")]
-    let (is_mountpoint, device, fstype) = match std::fs::read_to_string("/proc/self/mountinfo") {
-        Ok(text) => facts_from_entries(&parse_mountinfo(&text), &canonical),
-        Err(_) => fallback_mount_facts(&canonical),
+    let (is_mountpoint, device, fstype) = {
+        let canonical = anchor.canonicalize().unwrap_or_else(|_| anchor.clone());
+        match std::fs::read_to_string("/proc/self/mountinfo") {
+            Ok(text) => facts_from_entries(&parse_mountinfo(&text), &canonical),
+            Err(_) => fallback_mount_facts(&canonical),
+        }
     };
     #[cfg(not(target_os = "linux"))]
     let (is_mountpoint, device, fstype) = (true, String::new(), "unknown".to_string());
@@ -370,6 +372,7 @@ pub fn nearest_existing(p: &Path) -> PathBuf {
 /// "Not the root filesystem" is the test, not "different mount point": separate
 /// btrfs subvolumes such as `/home` share the root device and are therefore not
 /// an independent target. A removable disk has its own device.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn facts_from_entries(entries: &[MountEntry], path: &Path) -> (bool, String, String) {
     let Some(entry) = mount_entry_for(entries, path) else {
         return (false, String::new(), "unknown".to_string());
@@ -404,6 +407,7 @@ fn fallback_mount_facts(path: &Path) -> (bool, String, String) {
 
 /// One `/proc/self/mountinfo` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct MountEntry {
     pub mount_point: PathBuf,
     pub device: String,
@@ -414,6 +418,7 @@ pub struct MountEntry {
 ///
 /// Without the unescape, `/run/media/tango/New\040Volume` never matches the path
 /// the operator typed, and a perfectly mounted disk reads as "not a mount point".
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
     text.lines()
         .filter_map(|line| {
@@ -436,6 +441,7 @@ pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
 
 /// The entry whose mount point is the longest prefix of `path` — the volume
 /// that actually holds those bytes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn mount_entry_for<'a>(entries: &'a [MountEntry], path: &Path) -> Option<&'a MountEntry> {
     entries
         .iter()
@@ -443,6 +449,7 @@ pub fn mount_entry_for<'a>(entries: &'a [MountEntry], path: &Path) -> Option<&'a
         .max_by_key(|e| e.mount_point.as_os_str().len())
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn unescape_mountinfo(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
