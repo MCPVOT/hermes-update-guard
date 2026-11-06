@@ -1,7 +1,7 @@
 ---
 name: hermes-update-guard
 description: Use when running or verifying a `hermes update`: guards it with preflight, a WAL-safe backup on a mount-proven target, a provider-drift tripwire and post-verify.
-version: 0.4.0
+version: 0.4.1
 author: MCPVOT
 license: MIT
 platforms: [macos, linux, windows]
@@ -72,6 +72,31 @@ the proof and creates nothing.
 Each run writes `manifest.json` (files, bytes, target device/fstype, and every
 skip with a reason). `--no-secrets` excludes `.env` and `auth.json` and sets
 `secrets_included: false`, so `verify` reports the restore point as **PARTIAL**.
+
+`tmpfs`, `ramfs` and `devtmpfs` are refused as well, and `--allow-local-backup`
+does NOT waive them. An unmounted udisks volume leaves its mount point as a tmpfs
+under `/run/media/<user>`, so a proof that only asks "not the root filesystem"
+passes on that parent and the only restore point would be written to RAM. Before
+0.4.1 it was: `fstype: tmpfs, mount: true, free 3.6 GB`, exit 0.
+
+## What 0.4.1 changed in the probes
+
+- **The desktop-app probe is per platform.** `Hermes.exe` on Windows,
+  `Hermes.app/Contents/MacOS/Hermes` on macOS, `linux-unpacked/Hermes` on Linux,
+  combined so a positive match wins and an unreadable probe stays `Unknown` (fail
+  closed). `--close-desktop` therefore closes the app everywhere; before 0.4.1 it
+  was a no-op outside Windows, and the packaged rebuild overwrote a running app.
+  If `preflight` prints `not running` while the packaged app is up, the probe does
+  not match that build: stop and report it.
+- **`dup_uids` is session-scoped.** It counts a logical message stored more than
+  once inside ONE session. A fork legitimately carries the same `message_uid` in a
+  parent session and its fork, and is no longer counted (measured: 402 reported,
+  0 real). A non-zero `dup_uids` is real duplication: back up before touching it,
+  never delete sessions to clear it.
+- **A health baseline older than 6h is not an attribution.** `verify` prints
+  `pre-update baseline is <n>h old` and does not compare against it, so a verify
+  run hours later cannot blame the update for drift it never caused. Run a
+  guarded update to re-take the baseline.
 
 ## Procedure
 

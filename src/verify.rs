@@ -4,6 +4,13 @@ use std::path::{Path, PathBuf};
 use crate::config::Config;
 use crate::env;
 
+/// How old a recorded pre-update health baseline may be before it stops being an
+/// attribution. `verify` runs minutes after its own run finishes; a baseline read
+/// out of a state file that is hours old describes a different day's fleet, and
+/// comparing against it reported "got WORSE during the update" for drift the
+/// update never caused (measured: a verify 45h after the run).
+const BASELINE_MAX_AGE_S: i64 = 6 * 3600;
+
 /// Post-update verification: HEAD advanced, version sane, every live db integrity ok,
 /// provider surface matches the pre-update export, gateway state present, and every
 /// locally pinned file still applied.
@@ -174,9 +181,23 @@ pub fn run(home: &Path, cfg: &Config) -> Result<()> {
     // condition that is unchanged is PRE-EXISTING (a warning, not a failure);
     // only a regression the update introduced fails the verdict.
     println!("  context health:");
-    let before = crate::state::RunState::read(home)
-        .ok()
-        .and_then(|st| st.health_before);
+    // A baseline only attributes if it came from a recent run. Reading
+    // `health_before` out of whatever state file is on disk made a verify hours
+    // later blame the update for drift the update never caused.
+    let before = crate::state::RunState::read(home).ok().and_then(|st| {
+        let stamp = st.finished_at.clone().unwrap_or_else(|| st.started_at.clone());
+        let age_s = crate::state::elapsed_since(&stamp);
+        if age_s > BASELINE_MAX_AGE_S {
+            println!(
+                "    ! pre-update baseline is {}h old (run {}) - too old to attribute anything to this update; run a guarded update to re-take it",
+                age_s / 3600,
+                st.run_id
+            );
+            None
+        } else {
+            st.health_before
+        }
+    });
     let now = crate::context_health::summarize(home);
     println!(
         "    now: dup_uids={} max_bloat={:.1}x stuck={} at_risk={}",

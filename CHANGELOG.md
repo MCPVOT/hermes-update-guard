@@ -6,6 +6,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-06
+
+### Fixed
+- **The Desktop-app probe was Windows-only.** `preflight` and `--close-desktop` asked every host for
+  `Hermes.exe`. POSIX answers with `pgrep -f`, and the packaged macOS/Linux app is a bare `Hermes`
+  binary inside its bundle, so the probe reported "not running" while the app was alive: measured on
+  Linux as `[desktop app] not running` with the main process running. `--close-desktop` closed nothing
+  and the packaged rebuild overwrote the files of a running app. `desktop_app_images()` now names each
+  platform's image, `combine_proc_states()` lets a positive match win while keeping a failed probe
+  `Unknown` (fail closed), and `close_desktop_app()` closes every match.
+- **An UNMOUNTED removable disk could be accepted as a backup target.** The mount proof anchors on the
+  nearest existing directory, and udisks mounts `/run/media/<user>` as `tmpfs`, so "not the root
+  filesystem" passed and the restore point would have been written to RAM: measured as
+  `device: run, fstype: tmpfs, mount: true, free 3.6 GB` with the plan printed and exit 0.
+  `VOLATILE_FSTYPES` (`tmpfs`, `ramfs`, `devtmpfs`) is now refused unconditionally, and
+  `--allow-local-backup` does not waive it: the flag means the internal disk, never memory.
+- **Context health counted forks as duplication.** `dup_uids` grouped by `message_uid` alone, so one
+  message living in a parent session and in its fork counted as two live rows: 402 reported across a
+  three-profile fleet with 0 real duplicates, which made `verify` fail after any update followed by a
+  fork. `count_live_dup_uids()` groups by `(message_uid, session_id)`, so a fork is not duplication and
+  the same uid twice inside one session still is.
+- **`verify` blamed the update for drift it never caused.** It read `health_before` out of whatever run
+  state was on disk, so a verify 46h after a run compared against that run's baseline and printed
+  `FAIL context health got WORSE during the update`. A baseline older than 6h is now printed as
+  `pre-update baseline is <n>h old` and not used for attribution.
+
+### Changed
+- Six tests added, covering both directions: a fork is not duplication and a same-session duplicate is;
+  a probe that cannot run stays `Unknown` while a positive match outranks it; an unmounted volume under
+  a tmpfs parent is refused and the same path is accepted once the volume is mounted; volatile
+  filesystems are refused while `ntfs3`, `ext4`, `btrfs`, `xfs` and `apfs` are not.
+
 ## [0.4.0] - 2026-11-04
 
 ### Added

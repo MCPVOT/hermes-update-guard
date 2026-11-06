@@ -283,8 +283,10 @@ pub fn run(home: &Path, cfg: &Config) -> Result<()> {
     println!("\n[update receipts]");
     report_stale_receipts(home);
 
-    // desktop app running (a blocker for the update phase) — fail closed
-    match env::process_state("Hermes.exe") {
+    // Desktop app is running (a blocker for the update). Probe every name the
+    // app can have on this platform: the old hard-coded `.exe` answered
+    // "absent" on a Linux host where the packaged app was running.
+    match env::desktop_app_state() {
         env::ProcState::Running => {
             println!("\n[desktop app] RUNNING — update phase needs it closed")
         }

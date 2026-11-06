@@ -85,11 +85,13 @@ fn run_stages(
             );
         }
 
-        // Tri-state: `Unknown` (tasklist broken) is NOT "closed". The old bool
+        // Tri-state: `Unknown` (probe broken) is NOT "closed". The old bool
         // probe answered false on any error, so a broken tool let the update run
         // while the app still held every profile's state.db.
-        const DESKTOP: &str = "Hermes.exe";
-        match env::process_state(DESKTOP) {
+        //
+        // The probe covers every name the app runs under on this platform; a
+        // Windows-only image name made the whole gate a no-op on Linux.
+        match env::desktop_app_state() {
             env::ProcState::Absent => println!("  Desktop app not running"),
             env::ProcState::Unknown(why) => {
                 let msg = format!(
@@ -108,8 +110,7 @@ fn run_stages(
             }
             env::ProcState::Running => {
                 println!("  Desktop app running - closing it (graceful, then forced)...");
-                let report = match env::close_process(
-                    DESKTOP,
+                let report = match env::close_desktop_app(
                     std::time::Duration::from_secs(8),
                     std::time::Duration::from_secs(12),
                 ) {

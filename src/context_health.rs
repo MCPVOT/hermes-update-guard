@@ -122,6 +122,24 @@ impl Health {
     }
 }
 
+/// Count logical messages stored more than once INSIDE one session.
+///
+/// The session scope is the whole point. `message_uid` identifies a logical
+/// message, and a fork legitimately carries the same uid in the parent session
+/// and in the fork, so grouping by uid alone reports forks as duplication (M5:
+/// 402 on this fleet with zero real duplicates). Grouping by
+/// `(message_uid, session_id)` counts only a message that is stored twice in the
+/// same transcript, which is what actually inflates a prompt.
+pub fn count_live_dup_uids(conn: &Connection) -> i64 {
+    conn.prepare(
+        "SELECT COUNT(*) FROM (SELECT message_uid, session_id FROM messages \
+         WHERE active = 1 AND message_uid IS NOT NULL \
+         GROUP BY message_uid, session_id HAVING COUNT(*) > 1)",
+    )
+    .and_then(|mut st| st.query_row([], |r| r.get::<_, i64>(0)))
+    .unwrap_or(0)
+}
+
 /// Audit one profile's state.db.
 pub fn audit_profile(home: &Path, profile: &str) -> Health {
     let mut h = Health {
@@ -166,15 +184,13 @@ pub fn audit_profile(home: &Path, profile: &str) -> Health {
             h.distinct_all = row.1;
         }
     }
-    // duplicate live rows per logical message
-    if let Ok(mut st) = conn.prepare(
-        "SELECT COUNT(*) FROM (SELECT message_uid FROM messages \
-         WHERE active = 1 AND message_uid IS NOT NULL GROUP BY message_uid HAVING COUNT(*) > 1)",
-    ) {
-        if let Ok(n) = st.query_row([], |r| r.get::<_, i64>(0)) {
-            h.dup_uids = n;
-        }
-    }
+    // Duplicate LIVE rows per logical message, scoped to one session. A fork
+    // copies messages into a second session, so the same `message_uid` appears
+    // once per session by design; counting by uid alone reported every fork as
+    // duplication (402 on this fleet, 0 real) and made `verify` red after any
+    // update that was followed by a fork. A real duplicate is the same uid twice
+    // inside ONE session, which genuinely doubles the prompt.
+    h.dup_uids = count_live_dup_uids(&conn);
     // worst single offender
     if let Ok(mut st) = conn.prepare(
         "SELECT session_id, COUNT(*) c FROM messages \
@@ -504,14 +520,7 @@ pub fn readiness(home: &Path, profile: &str) -> Readiness {
             &db,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         ) {
-            if let Ok(mut st) = conn.prepare(
-                "SELECT COUNT(*) FROM (SELECT message_uid FROM messages WHERE active = 1 \
-                 AND message_uid IS NOT NULL GROUP BY message_uid HAVING COUNT(*)>1)",
-            ) {
-                if let Ok(n) = st.query_row([], |r| r.get::<_, i64>(0)) {
-                    r.live_dup_uids = n;
-                }
-            }
+            r.live_dup_uids = count_live_dup_uids(&conn);
             if let Ok(mut st) = conn.prepare(
                 "SELECT COUNT(*), COUNT(DISTINCT message_uid) FROM messages WHERE message_uid IS NOT NULL",
             ) {
@@ -640,4 +649,51 @@ pub fn custom_compression_engine(home: &Path, profile: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A transcript holding `(message_uid, session_id, active)` rows.
+    fn db_with(rows: &[(&str, &str, i64)]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (\
+               message_uid TEXT, session_id TEXT, active INTEGER NOT NULL DEFAULT 1);",
+        )
+        .unwrap();
+        for (uid, session, active) in rows {
+            conn.execute(
+                "INSERT INTO messages (message_uid, session_id, active) VALUES (?1, ?2, ?3)",
+                rusqlite::params![uid, session, active],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// The same logical message in two sessions is a FORK, not duplication. Counting
+    /// by uid alone reported 402 of these on this fleet with zero real duplicates,
+    /// which made `verify` fail after any update followed by a fork.
+    #[test]
+    fn a_fork_is_not_duplication() {
+        let conn = db_with(&[("a", "s1", 1), ("a", "s2", 1)]);
+        assert_eq!(count_live_dup_uids(&conn), 0);
+    }
+
+    /// The real defect the column exists for: one message stored twice inside one
+    /// transcript, which genuinely doubles the prompt.
+    #[test]
+    fn the_same_uid_twice_in_one_session_is_duplication() {
+        let conn = db_with(&[("b", "s1", 1), ("b", "s1", 1), ("c", "s1", 1)]);
+        assert_eq!(count_live_dup_uids(&conn), 1);
+    }
+
+    /// Archived copies are history, not live duplication.
+    #[test]
+    fn archived_copies_are_not_live_duplicates() {
+        let conn = db_with(&[("d", "s1", 1), ("d", "s1", 0)]);
+        assert_eq!(count_live_dup_uids(&conn), 0);
+    }
 }

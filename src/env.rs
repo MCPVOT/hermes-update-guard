@@ -244,7 +244,16 @@ impl TargetProof {
 /// a boot or installer partition. The `ESD-USB` partition on the measured disk is
 /// 32 GB of vfat sitting next to the real ntfs3 backup volume — choosing it would
 /// produce a backup that cannot be restored with its modes intact.
-pub const UNSAFE_FSTYPES: [&str; 3] = ["vfat", "exfat", "iso9660"];
+pub const UNSAFE_FSTYPES: [&str; 3] = ["exfat", "iso9660", "vfat"];
+
+/// Filesystems that do not survive a restart. A removable disk that is NOT mounted
+/// leaves its mount point as an empty directory under `/run/media/<user>`, and
+/// `udev`/`udisks` mount that parent as `tmpfs`. Proving "not the root filesystem"
+/// therefore passes on the parent, so an unmounted external target used to be
+/// accepted, printed as `mount: true, fstype: tmpfs`, and the only restore point
+/// would have been written to RAM. Refused unconditionally, like the other unsafe
+/// types: `--allow-local-backup` means "the internal disk", not "memory".
+pub const VOLATILE_FSTYPES: [&str; 3] = ["ramfs", "tmpfs", "devtmpfs"];
 
 /// Prove that `p` really is on a mounted volume before a byte is written.
 pub fn prove_target(p: &Path) -> Result<TargetProof> {
@@ -339,6 +348,16 @@ pub fn prove_backup_target(bulk: &Path, control: &Path, allow_local: bool) -> Re
 /// Pure and injectable on purpose: the test does not need a real vfat mount.
 pub fn reject_unsafe_fstype(p: &Path, fstype: &str) -> Result<()> {
     let fstype = fstype.to_ascii_lowercase();
+    if VOLATILE_FSTYPES.contains(&fstype.as_str()) {
+        bail!(
+            "refusing {}: the nearest existing directory is on {} (RAM-backed), which is what an \
+             UNMOUNTED removable disk looks like under /run/media/<user>. The restore point would \
+             be written to memory and lost on reboot. Mount the volume and retry; --allow-local-backup \
+             means the internal disk, not memory.",
+            p.display(),
+            fstype
+        );
+    }
     if UNSAFE_FSTYPES.contains(&fstype.as_str()) {
         bail!(
             "refusing {}: {} cannot preserve permissions and is usually a boot or installer partition",
@@ -855,6 +874,56 @@ pub fn process_state(image: &str) -> ProcState {
     }
 }
 
+/// Command-line fragments that identify a running Desktop app on THIS platform.
+///
+/// The Windows image is `Hermes.exe`. macOS and Linux ship a bare `Hermes` binary
+/// inside a bundle/app directory, and `pgrep -f` matches command LINES, so asking
+/// every platform for `Hermes.exe` answered "absent" on a host where the app was
+/// running (measured: pid alive, preflight printed `[desktop app] not running`).
+/// That turned `--close-desktop` into a no-op and let the packaged rebuild
+/// overwrite the files of a running app.
+pub fn desktop_app_images() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &["Hermes.exe"]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        &["Hermes.app/Contents/MacOS/Hermes", "Hermes Helper"]
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        &["linux-unpacked/Hermes", "/Hermes --type=", "hermes-desktop"]
+    }
+}
+
+/// Combine per-image probe results. A positive match on any name wins, because one
+/// confirmed process IS the answer; Unknown only wins when nothing matched and some
+/// probe could not run (fail closed, never "absent" from a broken probe).
+pub fn combine_proc_states(states: &[ProcState]) -> ProcState {
+    let mut unknown: Option<String> = None;
+    for s in states {
+        match s {
+            ProcState::Running => return ProcState::Running,
+            ProcState::Unknown(why) => unknown = unknown.or_else(|| Some(why.clone())),
+            ProcState::Absent => {}
+        }
+    }
+    match unknown {
+        Some(why) => ProcState::Unknown(why),
+        None => ProcState::Absent,
+    }
+}
+
+/// Tri-state state of the Desktop app across every name it can run under here.
+pub fn desktop_app_state() -> ProcState {
+    let states: Vec<ProcState> = desktop_app_images()
+        .iter()
+        .map(|i| process_state(i))
+        .collect();
+    combine_proc_states(&states)
+}
+
 /// Is `pid` still alive? Same tri-state discipline as the image probe: a failed
 /// `tasklist` answers Unknown, never "dead".
 #[cfg(windows)]
@@ -948,6 +1017,52 @@ pub struct CloseReport {
     pub closed: bool,
     pub detail: String,
     pub survivors: Vec<u32>,
+}
+
+/// Close the Desktop app under every name it can run as on this platform.
+///
+/// `--close-desktop` used to pass the Windows image name on every host, so on
+/// macOS and Linux it closed nothing and the update proceeded with the app alive.
+/// Reports the same shape as [`close_process`]; the detail names which image was
+/// actually closed, so a report is never a bare "closed".
+pub fn close_desktop_app(
+    graceful: std::time::Duration,
+    forced: std::time::Duration,
+) -> Result<CloseReport> {
+    let mut details: Vec<String> = Vec::new();
+    let mut survivors: Vec<u32> = Vec::new();
+    let mut closed_all = true;
+    let mut handled = 0usize;
+
+    for image in desktop_app_images() {
+        match process_state(image) {
+            ProcState::Absent => {}
+            ProcState::Unknown(why) => {
+                bail!("cannot verify whether {image} is running ({why}) - treating it as running")
+            }
+            ProcState::Running => {
+                let report = close_process(image, graceful, forced)?;
+                handled += 1;
+                if !report.closed {
+                    closed_all = false;
+                    survivors.extend(report.survivors.iter().copied());
+                }
+                details.push(format!("{image}: {}", report.detail));
+            }
+        }
+    }
+
+    survivors.sort_unstable();
+    survivors.dedup();
+    Ok(CloseReport {
+        closed: closed_all,
+        detail: if handled == 0 {
+            "no desktop app process was running".to_string()
+        } else {
+            details.join("; ")
+        },
+        survivors,
+    })
 }
 
 /// Close the app in two bounded stages: graceful, then forced. The old code sent
@@ -1255,6 +1370,128 @@ mod tests {
             mount_point: PathBuf::from(mount_point),
             device: device.to_string(),
             fstype: fstype.to_string(),
+        }
+    }
+
+    /// The Desktop app runs as a bare `Hermes` binary on macOS and Linux. A probe
+    /// that only knows the Windows image name answered "absent" on a host where
+    /// the app was running, which made `--close-desktop` a no-op.
+    #[test]
+    fn desktop_probe_knows_every_platform_name() {
+        let images = desktop_app_images();
+        assert!(!images.is_empty(), "a probe with no names can never match");
+        #[cfg(windows)]
+        assert!(images.contains(&"Hermes.exe"));
+        #[cfg(target_os = "macos")]
+        assert!(images.iter().any(|i| i.contains("MacOS/Hermes")));
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            assert!(
+                images.iter().any(|i| i.starts_with("linux-unpacked/")),
+                "the packaged Linux app must be probeable: {images:?}"
+            );
+            assert!(
+                !images.contains(&"Hermes.exe"),
+                "a Windows image name can never match on Linux"
+            );
+        }
+    }
+
+    /// One confirmed process IS the answer; Unknown only wins when nothing matched
+    /// and a probe could not run. Both directions, so the combiner cannot silently
+    /// pass a running app or invent one.
+    #[test]
+    fn probe_combiner_prefers_running_and_fails_closed() {
+        assert_eq!(
+            combine_proc_states(&[ProcState::Absent, ProcState::Running]),
+            ProcState::Running
+        );
+        assert_eq!(
+            combine_proc_states(&[ProcState::Absent, ProcState::Absent]),
+            ProcState::Absent
+        );
+        assert!(matches!(
+            combine_proc_states(&[
+                ProcState::Absent,
+                ProcState::Unknown("pgrep missing".into())
+            ]),
+            ProcState::Unknown(_)
+        ));
+        assert_eq!(
+            combine_proc_states(&[ProcState::Unknown("x".into()), ProcState::Running]),
+            ProcState::Running,
+            "a positive hit outranks an unrelated probe failure"
+        );
+    }
+
+    /// The bug this closes: an UNMOUNTED removable disk leaves its mount point on a
+    /// tmpfs under /run/media/<user>, the "not the root filesystem" test passes on
+    /// that parent, and the only restore point would be written to RAM.
+    #[test]
+    fn refuses_a_target_that_lands_on_tmpfs() {
+        let dir = std::env::temp_dir().join(format!("hug-tmpfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent = std::fs::canonicalize(&dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        // udisks layout: the parent exists as a tmpfs, the volume's own directory does not.
+        let entries = vec![
+            mount("/", "/dev/root", "ext4"),
+            mount(&parent, "tmpfs", "tmpfs"),
+        ];
+        let target = dir.join("New Volume/mcpvot-backup/hermes-guard");
+        let refused = prove_target_from(&target, false, &entries);
+        assert!(
+            refused.is_err(),
+            "an unmounted volume under a tmpfs parent must be refused"
+        );
+        let msg = format!("{:#}", refused.unwrap_err());
+        assert!(
+            msg.contains("RAM-backed") && msg.contains("Mount the volume"),
+            "the refusal must say why and what to do: {msg}"
+        );
+        assert!(!target.exists(), "the proof must never create the target");
+
+        // --allow-local-backup does NOT waive a volatile filesystem: it means the
+        // internal disk, never memory.
+        assert!(prove_target_from(&target, true, &entries).is_err());
+
+        // The same path is accepted once the volume is really mounted. A real
+        // mount makes the volume's own directory exist, which is exactly what the
+        // proof anchors on, so the fixture has to create it too. The mount entry
+        // must use the CANONICAL path: the proof canonicalises its anchor, and on
+        // macOS (/var -> /private/var) and Windows (8.3 names, \\?\ prefix) the
+        // raw temp path never matches the table.
+        let volume = std::fs::canonicalize(&dir).unwrap().join("New Volume");
+        std::fs::create_dir_all(&volume).unwrap();
+        let mounted = vec![
+            mount("/", "/dev/root", "ext4"),
+            mount(&parent, "tmpfs", "tmpfs"),
+            mount(volume.to_string_lossy().as_ref(), "/dev/sda2", "ntfs3"),
+        ];
+        let proof = prove_target_from(&target, false, &mounted).unwrap();
+        assert_eq!(proof.fstype, "ntfs3");
+        assert_eq!(proof.device, "/dev/sda2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The boot/installer refusal keeps its own reason, and a real backup
+    /// filesystem is never refused.
+    #[test]
+    fn fstype_refusals_name_their_reason() {
+        let p = Path::new("/run/media/u/ESD-USB");
+        let vfat = format!("{:#}", reject_unsafe_fstype(p, "vfat").unwrap_err());
+        assert!(vfat.contains("cannot preserve permissions"), "{vfat}");
+        let tmpfs = format!("{:#}", reject_unsafe_fstype(p, "tmpfs").unwrap_err());
+        assert!(tmpfs.contains("RAM-backed"), "{tmpfs}");
+        for ok in ["ntfs3", "ext4", "btrfs", "xfs", "apfs"] {
+            assert!(
+                reject_unsafe_fstype(p, ok).is_ok(),
+                "{ok} is a real backup filesystem"
+            );
         }
     }
 
