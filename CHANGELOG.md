@@ -6,6 +6,173 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-07
+
+### Added
+- **`verify` reads the restore point instead of trusting its manifest.** The manifest is a claim about
+  what the backup contains; the files are the evidence, and the only moment anyone checks is when they
+  need to restore. `verify` now opens every snapshot the manifest lists read-only and runs
+  `pragma integrity_check` (printing the message count, or `unknown` when the table is absent), and when
+  the manifest says secrets were included it confirms `.env` and `auth.json` exist and are non-empty for
+  every profile. Either failure is a check failure with the path in the message.
+- Two directions tested: a whole restore point passes, a missing secret and an unreadable snapshot are
+  each caught.
+
+### Changed
+- The completeness line now reads `COMPLETE per its manifest`, because the manifest is what says so and
+  the following lines are the reading that can contradict it.
+
+## [0.6.0] - 2026-11-07
+
+### Added
+- **`verify` reports the update markers a finished run left behind.** Two
+  `.hermes-update*` markers survived the v0.23.0 update on this seat and sat in the home for hours;
+  `preflight` warned, but the post-update verdict said nothing. `verify` now prints them and names the
+  way out (`quarantine --apply`), splitting them by owner: a dead pid is a leftover, a live or
+  unverifiable one means an update really is in flight. Never a failure, because the updater owns them.
+- **`verify` reports the gateway's served and parked profile map.** The fleet is one process with
+  `servedProfiles`, so a single connection hides a member: a profile can be `parked` with a reason
+  (its shell or store could not open) and its chats are served by nobody until a rescan. The state
+  file now parses both fields (`parse_gateway_status`, pure and tested, including a file that predates
+  them), prints the served list, and names every parked profile with the reason the gateway recorded.
+  Reported, not failed: the gateway is the authority on why it parked, and the cause is usually a
+  store the update did not touch.
+
+### Changed
+- `quarantine::markers_with_owner` and `classify_markers` are shared with `verify`, so both commands
+  read the same marker set under the same rule (`Unknown` counts as held).
+
+## [0.5.0] - 2026-11-07
+
+### Fixed
+- **The backup-target mount proof only existed on Linux.** The non-Linux branch of `prove_target_with`
+  returned `is_mountpoint: true` with `fstype: unknown` for ANY path, so a `--backup-root` on a macOS
+  or Windows seat was accepted without a proof, and an unplugged disk was not caught.
+  - macOS now reads the `mount` table (`parse_mount_command`, tested on every platform with a real
+    shaped sample including a mount point that contains a space) and answers from it. An unmounted
+    `/Volumes/Backup` leaves the anchor on `/`, which is not a volume, so the target is refused. A
+    table that cannot be read answers "not a mount point": fail closed, never the permissive default.
+  - Windows now uses the drive letter as the volume identity. `volume_root` maps `E:\a\b` to `E:\` and
+    `\\server\share\x` to `\\server\share`; if the letter the target names is absent, the nearest
+    existing ancestor is on another volume and the two roots differ, so the target is refused. The
+    drive type comes from `fsutil fsinfo drivetype` and its labels feed the existing refusals:
+    `cdrom` is added to `UNSAFE_FSTYPES`, `ramdisk` to `VOLATILE_FSTYPES`, and a mounted
+    `removable` disk stays legal, because that is the feature.
+- Other Unix (`freebsd`, `openbsd`) now fails closed instead of assuming a mount.
+
+### Added
+- `parse_fsutil_drivetype`, `parse_mount_command`, `volume_root` (Windows) and `bsd_mount_entries`
+  (macOS), each split out so the decision is testable without the host's real volumes.
+- Two tests that run on every platform: the macOS-shaped table end to end through `prove_target_from`
+  (refused on `/`, accepted once its volume is listed) and the fsutil label mapping.
+
+## [0.4.3] - 2026-11-07
+
+### Fixed
+- **A stderr diagnostic poisoned the venv probe.** `run_capture` appends stderr to stdout (it is the
+  reader for `pgrep`, `df` and version calls, where that is fine). The venv probe parses JSON from the
+  same reader, so on a multi-profile host with `HERMES_HOME` unset the checkout's `hermes` printed a
+  626-byte `[HERMES_HOME fallback]` warning to stderr, the `[]` payload no longer parsed, and the gate
+  refused a free venv with `venv state UNKNOWN (probe exit 0)`. The probe now uses
+  `run_capture_stdout` (stdout only) and passes `HERMES_HOME` to the child, so the warning is both
+  ignored and not produced.
+- **One backup test depended on the runner's temp filesystem.** `bulk_root_receives_only_pre_update_runs`
+  built a temp-dir bulk root with `allow_local_backup`, which the unconditional volatile refusal now
+  rejects when `TMPDIR` is tmpfs (Linux `/tmp`). It asserts the RAM-backed refusal there and the
+  retention behaviour where a backup can actually be written, so the test no longer changes verdict
+  with the machine it runs on. CI was green because the runners use disk-backed temp.
+
+### Added
+- `env::target_is_volatile()`: whether the nearest existing directory of a path sits on a volatile
+  filesystem, without attempting a write.
+
+## [0.4.2] - 2026-11-06
+
+### Fixed
+- **Two Hermes installations produced two identical launcher icons, and preflight never said so.**
+  Measured on `mcpvot`: `~/.local/share/applications/com.nousresearch.hermes.desktop` (the checkout app
+  rewritten by `hermes desktop`) and `/usr/share/applications/hermes-desktop.desktop` (the
+  `hermes-desktop 2026.9.7-7` package) both carried `Name=Hermes`, so the app menu showed two icons and
+  one entry could start a stale build. `preflight` now prints a `[desktop launchers]` section: every
+  entry that claims Hermes, its scope (`user`/`system`), its `Exec`, whether it is visible, and — when
+  more than one is visible — a warning that the launcher will show duplicate icons plus the two safe
+  remedies (hide the stale entry, or remove the package that owns it). It is read-only and never edits
+  a launcher.
+  XDG precedence is honoured: a user entry shadows the system entry with the same desktop-file ID, and
+  `Hidden=true` / `NoDisplay=true` entries are listed as hidden rather than counted as a second icon.
+  Matching is exact (`Name=Hermes`, `hermes desktop`, `hermes-desktop`), so `Hermes Guard Dashboard` is
+  not mistaken for a desktop install.
+
+### Changed
+- Three tests added: both installs are listed with their scopes; a hidden user override shadows the
+  system entry and leaves one visible icon; unrelated and guard-dashboard entries are ignored.
+
+
+## [0.4.1] - 2026-11-06
+
+### Fixed
+- **The Desktop-app probe was Windows-only.** `preflight` and `--close-desktop` asked every host for
+  `Hermes.exe`. POSIX answers with `pgrep -f`, and the packaged macOS/Linux app is a bare `Hermes`
+  binary inside its bundle, so the probe reported "not running" while the app was alive: measured on
+  Linux as `[desktop app] not running` with the main process running. `--close-desktop` closed nothing
+  and the packaged rebuild overwrote the files of a running app. `desktop_app_images()` now names each
+  platform's image, `combine_proc_states()` lets a positive match win while keeping a failed probe
+  `Unknown` (fail closed), and `close_desktop_app()` closes every match.
+- **An UNMOUNTED removable disk could be accepted as a backup target.** The mount proof anchors on the
+  nearest existing directory, and udisks mounts `/run/media/<user>` as `tmpfs`, so "not the root
+  filesystem" passed and the restore point would have been written to RAM: measured as
+  `device: run, fstype: tmpfs, mount: true, free 3.6 GB` with the plan printed and exit 0.
+  `VOLATILE_FSTYPES` (`tmpfs`, `ramfs`, `devtmpfs`) is now refused unconditionally, and
+  `--allow-local-backup` does not waive it: the flag means the internal disk, never memory.
+- **Context health counted forks as duplication.** `dup_uids` grouped by `message_uid` alone, so one
+  message living in a parent session and in its fork counted as two live rows: 402 reported across a
+  three-profile fleet with 0 real duplicates, which made `verify` fail after any update followed by a
+  fork. `count_live_dup_uids()` groups by `(message_uid, session_id)`, so a fork is not duplication and
+  the same uid twice inside one session still is.
+- **`verify` blamed the update for drift it never caused.** It read `health_before` out of whatever run
+  state was on disk, so a verify 46h after a run compared against that run's baseline and printed
+  `FAIL context health got WORSE during the update`. A baseline older than 6h is now printed as
+  `pre-update baseline is <n>h old` and not used for attribution.
+
+### Changed
+- Six tests added, covering both directions: a fork is not duplication and a same-session duplicate is;
+  a probe that cannot run stays `Unknown` while a positive match outranks it; an unmounted volume under
+  a tmpfs parent is refused and the same path is accepted once the volume is mounted; volatile
+  filesystems are refused while `ntfs3`, `ext4`, `btrfs`, `xfs` and `apfs` are not.
+
+## [0.4.0] - 2026-11-04
+
+### Added
+- **External backup target.** `pre-update-<stamp>/` directories can now be written to a mounted
+  removable disk via `--backup-root <PATH>` (or `$HERMES_GUARD_BULK_ROOT`). The control root
+  (`<home>/backups`: `guard-run.json`, the log, `provider-surface/`, log signals, quarantine) stays
+  local, so `watch`, `verify`, `self-check` and the drift baseline keep working with the disk
+  detached - exactly when a post-update verify matters.
+- **Mount proof.** `backup` and `update` refuse a target that is not on a mounted, non-root volume,
+  with the explicit "an unplugged disk must not turn into a directory on the root filesystem"
+  message. `vfat`, `exfat` and `iso9660` are refused outright, so the 32 GB ESD-USB installer
+  partition can never be selected. `--allow-local-backup` accepts the internal disk deliberately;
+  `preflight` prints the proof but never creates the directory.
+- **Content selection.** `--no-secrets` skips `.env` and `auth.json` (recorded in the manifest).
+  `--content memories,skills,scripts,cron` copies a subset. `copy_dir` now skips dot-directories
+  (the regenerable `skills/.hub`) and symlinks (regenerable system content), recording each skip.
+- **Per-run `manifest.json`.** Records `files`, `bytes`, the target's device / fstype / mount status /
+  free space, and every skipped entry with a reason. `verify` reads it and calls a restore point
+  PARTIAL when secrets were excluded; a missing manifest is reported as a pre-0.4.0 run.
+- **Retention.** `--keep <N>` keeps the newest N runs on the bulk root. Pruning runs only after a
+  verified backup, never removes the run just written, is a no-op at `N=0`, and refuses to delete
+  when the target failed its mount proof.
+- **Lineage gate.** Before `hermes update`, the selected release tag is compared with HEAD using
+  `git merge-base --is-ancestor` in both directions. A fast-forward proceeds; a rewind or a
+  divergence BLOCKS unless `--allow-lineage-change`, naming `git describe`, the tag and the commit
+  counts both ways. `preflight` reports the same comparison read-only, without fetching.
+
+### Changed
+- `env::last_seen_in_backups` (and `self-check` / `retire`) now scan the **resolved bulk root**,
+  because they answer questions about `pre-update-*` runs.
+- `verify` reads the pre-update patch from the bulk root, so patch restoration is still detected
+  when the restore point is on a removable disk.
+
 ## [0.3.9] - 2026-10-26
 
 Four findings from a full read-only audit of the 0.3.8 tree (7,257 lines, 62 tests). Three of them

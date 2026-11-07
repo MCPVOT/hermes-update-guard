@@ -1,7 +1,15 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
+use crate::config::Config;
 use crate::env;
+
+/// How old a recorded pre-update health baseline may be before it stops being an
+/// attribution. `verify` runs minutes after its own run finishes; a baseline read
+/// out of a state file that is hours old describes a different day's fleet, and
+/// comparing against it reported "got WORSE during the update" for drift the
+/// update never caused (measured: a verify 45h after the run).
+const BASELINE_MAX_AGE_S: i64 = 6 * 3600;
 
 /// Post-update verification: HEAD advanced, version sane, every live db integrity ok,
 /// provider surface matches the pre-update export, gateway state present, and every
@@ -22,7 +30,7 @@ fn mark(what: &str, since: &mut std::time::Instant) {
     *since = std::time::Instant::now();
 }
 
-pub fn run(home: &Path) -> Result<()> {
+pub fn run(home: &Path, cfg: &Config) -> Result<()> {
     println!("== POST-UPDATE VERIFY ==");
 
     let mut t = std::time::Instant::now();
@@ -118,9 +126,51 @@ pub fn run(home: &Path) -> Result<()> {
     }
 
     mark("databases", &mut t);
+    // ---- 3b. the restore point's own manifest -------------------------------
+    // A backup can be INTENTIONALLY partial (--no-secrets, --content). Silence
+    // about that is the same failure mode as an unreadable section: an operator
+    // reads "VERIFY: PASS" and believes the restore point is whole.
+    println!("  restore point:");
+    match crate::backup::newest_run(&cfg.bulk_root) {
+        None => println!(
+            "  ! no pre-update backup on {} - nothing to restore from there",
+            cfg.bulk_root.display()
+        ),
+        Some(run) => match crate::backup::read_manifest(&run) {
+            Some(m) => {
+                if m.secrets_included {
+                    println!(
+                        "  restore point is COMPLETE per its manifest (secrets included): {} files, {:.1} MB",
+                        m.files,
+                        m.bytes as f64 / 1_048_576.0
+                    );
+                } else {
+                    println!(
+                        "  restore point is PARTIAL: .env and auth.json were excluded (--no-secrets)"
+                    );
+                    println!(
+                        "      {} files, {:.1} MB, {} skipped entr(ies)",
+                        m.files,
+                        m.bytes as f64 / 1_048_576.0,
+                        m.skipped.len()
+                    );
+                }
+                // The manifest is a CLAIM about the restore point. Read the point
+                // itself: a truncated snapshot or a silently skipped secret is
+                // discovered at restore time otherwise, which is the worst possible
+                // moment to find out.
+                check_restore_point(&run, &m.profiles, m.secrets_included, &mut failures);
+            }
+            None if run.join("manifest.json").exists() => println!(
+                "  ! manifest.json is unreadable - cannot say whether this restore point is complete"
+            ),
+            None => println!("  no manifest (pre-0.4.0 run)"),
+        },
+    }
+
     // ---- 4. local patch restoration ----------------------------------------
     println!("  local patch (stash/restore):");
-    check_patch_restored(home, &repo, &mut failures);
+    check_patch_restored(&repo, &mut failures, &cfg.bulk_root);
 
     // ---- 5. provider surface vs the APPROVED baseline -----------------------
     println!("  provider surface vs approved baseline:");
@@ -136,9 +186,23 @@ pub fn run(home: &Path) -> Result<()> {
     // condition that is unchanged is PRE-EXISTING (a warning, not a failure);
     // only a regression the update introduced fails the verdict.
     println!("  context health:");
-    let before = crate::state::RunState::read(home)
-        .ok()
-        .and_then(|st| st.health_before);
+    // A baseline only attributes if it came from a recent run. Reading
+    // `health_before` out of whatever state file is on disk made a verify hours
+    // later blame the update for drift the update never caused.
+    let before = crate::state::RunState::read(home).ok().and_then(|st| {
+        let stamp = st.finished_at.clone().unwrap_or_else(|| st.started_at.clone());
+        let age_s = crate::state::elapsed_since(&stamp);
+        if age_s > BASELINE_MAX_AGE_S {
+            println!(
+                "    ! pre-update baseline is {}h old (run {}) - too old to attribute anything to this update; run a guarded update to re-take it",
+                age_s / 3600,
+                st.run_id
+            );
+            None
+        } else {
+            st.health_before
+        }
+    });
     let now = crate::context_health::summarize(home);
     println!(
         "    now: dup_uids={} max_bloat={:.1}x stuck={} at_risk={}",
@@ -246,11 +310,60 @@ pub fn run(home: &Path) -> Result<()> {
                         }
                     }
                 }
+
+                // A MULTIPLEXED gateway parks a profile it could not bring up (its
+                // session store was unusable) and answers `profile_parked` for it.
+                // The code_sha check above is one process, so it says nothing about
+                // whether every profile is actually being served.
+                if !g.parked.is_empty() {
+                    for (name, why) in &g.parked {
+                        println!(
+                            "  ! profile '{}' is PARKED by the gateway: {}",
+                            name,
+                            one_line(why)
+                        );
+                    }
+                    println!(
+                        "  ! a parked profile is served by nobody until a rescan; the gateway recorded the reason, so check that store before blaming the update"
+                    );
+                } else if !g.served.is_empty() {
+                    println!(
+                        "  gateway serves {} profile(s): {}",
+                        g.served.len(),
+                        g.served.join(", ")
+                    );
+                }
             }
             Err(e) => {
                 println!("  FAIL gateway_state.json: {}", e);
                 failures.push(format!("gateway state: {}", e));
             }
+        }
+    }
+
+    // ---- 7b. update markers left behind -------------------------------------
+    // The updater writes `.hermes-update*` markers and normally clears them. Two
+    // survived the v0.23.0 run on this seat and sat in the home for hours, so a
+    // finished verify should SAY it rather than leave the next operator to trip
+    // over them. Never a failure: a marker held by a live pid means an update is
+    // genuinely in flight, which is not this run's business.
+    println!("  update markers:");
+    let marker_entries = crate::quarantine::markers_with_owner(home);
+    let (live, stale) = crate::quarantine::classify_markers(&marker_entries);
+    if marker_entries.is_empty() {
+        println!("  ok   no .hermes-update* markers left in the home");
+    } else {
+        for name in &stale {
+            println!(
+                "  ! {} was left behind by a run whose pid is gone - clear it with `hermes-update-guard quarantine --apply`",
+                name
+            );
+        }
+        for name in &live {
+            println!(
+                "  ! {} is held by a LIVE run - an update may be in flight; not a failure",
+                name
+            );
         }
     }
 
@@ -355,7 +468,7 @@ pub fn run(home: &Path) -> Result<()> {
 /// Two distinct failures: a clean tree WITH stash entries (the updater parked the
 /// patch) and a clean tree with NO stashes while the pre-update backup recorded a
 /// working-tree patch (the change vanished entirely).
-fn check_patch_restored(home: &Path, repo: &Path, failures: &mut Vec<String>) {
+fn check_patch_restored(repo: &Path, failures: &mut Vec<String>, bulk_root: &Path) {
     let dirty = match env::run_checked(Path::new("git"), &["status", "--short"], Some(repo)) {
         Ok((stdout, _)) => stdout
             .lines()
@@ -381,7 +494,7 @@ fn check_patch_restored(home: &Path, repo: &Path, failures: &mut Vec<String>) {
         }
     };
 
-    let expected = expected_patched_files(home);
+    let expected = expected_patched_files(bulk_root);
 
     if !dirty.is_empty() {
         println!(
@@ -438,23 +551,11 @@ fn check_patch_restored(home: &Path, repo: &Path, failures: &mut Vec<String>) {
 }
 
 /// File paths recorded in the newest pre-update backup's working-tree.patch.
-fn expected_patched_files(home: &Path) -> Vec<String> {
-    let backups = home.join("backups");
-    let Ok(entries) = std::fs::read_dir(&backups) else {
-        return vec![];
-    };
-    let mut dirs: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("pre-update-"))
-                .unwrap_or(false)
-        })
-        .collect();
-    dirs.sort();
-    let Some(newest) = dirs.last() else {
+///
+/// Read from the RESOLVED bulk root: when the run wrote to a removable disk the
+/// patch is there, not under `<home>/backups`.
+fn expected_patched_files(bulk_root: &Path) -> Vec<String> {
+    let Some(newest) = crate::backup::newest_run(bulk_root) else {
         return vec![];
     };
     let patch = newest.join("working-tree.patch");
@@ -547,16 +648,44 @@ pub struct GatewayStatus {
     pub pid: u32,
     pub state: String,
     pub code_sha: String,
+    /// Profiles the gateway itself reports as served.
+    pub served: Vec<String>,
+    /// Profiles the gateway could NOT bring up, name → the reason it recorded.
+    /// A parked profile is served by nobody: the gateway answers `profile_parked`
+    /// instead of waiting, so its chats are down until a rescan picks it up.
+    pub parked: std::collections::BTreeMap<String, String>,
 }
 
-/// Read the root gateway state file.
-pub fn gateway_status(home: &Path) -> Option<GatewayStatus> {
-    let gw = home.join("gateway_state.json");
-    if !gw.exists() {
-        return None;
-    }
-    let text = std::fs::read_to_string(&gw).ok()?;
-    let js: serde_json::Value = serde_json::from_str(&text).ok()?;
+/// Parse a gateway state file body. Pure so the shape can be tested without a
+/// running gateway: `parked_profiles` is a map of name → reason, and a file that
+/// predates the field simply has it absent.
+pub fn parse_gateway_status(text: &str) -> Option<GatewayStatus> {
+    let js: serde_json::Value = serde_json::from_str(text).ok()?;
+    let parked = js
+        .get("parked_profiles")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        v.as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| v.to_string()),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let served = js
+        .get("served_profiles")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
     Some(GatewayStatus {
         pid: js.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         state: js
@@ -569,7 +698,119 @@ pub fn gateway_status(home: &Path) -> Option<GatewayStatus> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        served,
+        parked,
     })
+}
+
+/// Read the root gateway state file.
+pub fn gateway_status(home: &Path) -> Option<GatewayStatus> {
+    let gw = home.join("gateway_state.json");
+    if !gw.exists() {
+        return None;
+    }
+    parse_gateway_status(&std::fs::read_to_string(&gw).ok()?)
+}
+
+/// Read the restore point itself, not just its manifest.
+///
+/// Every profile the manifest lists must have a snapshot that opens and passes
+/// `pragma integrity_check`, and when the manifest claims secrets were included
+/// `.env` and `auth.json` must actually be there and non-empty. A restore point
+/// that fails here is a trap, because it is only ever read at the moment it is
+/// needed.
+fn check_restore_point(run: &Path, profiles: &[String], secrets: bool, failures: &mut Vec<String>) {
+    for p in profiles {
+        let db = run.join(p).join("state.db");
+        match restore_db_summary(&db) {
+            Ok((verdict, messages)) if verdict.eq_ignore_ascii_case("ok") => {
+                if messages >= 0 {
+                    println!("  ok   {}/state.db integrity=ok messages={}", p, messages);
+                } else {
+                    println!("  ok   {}/state.db integrity=ok messages=unknown", p);
+                }
+            }
+            Ok((verdict, _)) => {
+                println!(
+                    "  FAIL {}/state.db integrity_check says: {}",
+                    p,
+                    one_line(&verdict)
+                );
+                failures.push(format!("restore point {p}/state.db failed integrity_check"));
+            }
+            Err(e) => {
+                println!(
+                    "  FAIL {}/state.db cannot be read back: {}",
+                    p,
+                    one_line(&e.to_string())
+                );
+                failures.push(format!("restore point {p}/state.db unreadable"));
+            }
+        }
+    }
+
+    if !secrets {
+        return;
+    }
+    let mut missing: Vec<String> = Vec::new();
+    for p in profiles {
+        for f in [".env", "auth.json"] {
+            let present = std::fs::metadata(run.join(p).join(f))
+                .map(|md| md.len() > 0)
+                .unwrap_or(false);
+            if !present {
+                missing.push(format!("{}/{}", p, f));
+            }
+        }
+    }
+    if missing.is_empty() {
+        println!("  ok   secrets present for every profile the manifest lists (.env, auth.json)");
+    } else {
+        for m in &missing {
+            println!(
+                "  FAIL {} is missing or empty but the manifest says secrets were included",
+                m
+            );
+            failures.push(format!("restore point is missing {m}"));
+        }
+    }
+}
+
+/// `(integrity_check verdict, message count)` for a backed-up snapshot.
+///
+/// Read-only: verify must never touch the point it is checking. `-1` means the
+/// snapshot opened but has no `messages` table, which is reported as unknown
+/// rather than as zero.
+fn restore_db_summary(db: &Path) -> Result<(String, i64)> {
+    if !db.exists() {
+        bail!("no file at {}", db.display());
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening {}", db.display()))?;
+    let verdict: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .with_context(|| format!("integrity_check on {}", db.display()))?;
+    let messages: i64 = conn
+        .query_row("select count(*) from messages", [], |r| r.get(0))
+        .unwrap_or(-1);
+    Ok((verdict, messages))
+}
+
+/// Collapse a reason the gateway recorded into one printable line.
+fn one_line(why: &str) -> String {
+    let flat: String = why
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let trimmed = flat.trim();
+    if trimmed.chars().count() > 160 {
+        format!("{}...", trimmed.chars().take(160).collect::<String>())
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// The commit the install is on (short form), if it is a git install.
@@ -612,6 +853,95 @@ fn integrity(db: &Path) -> Result<(String, i64)> {
 mod tests {
     use super::*;
 
+    /// The restore point is evidence, not a claim: the snapshot must open and pass
+    /// integrity_check, and a manifest that says "secrets included" must be true on
+    /// disk. Both directions, because a hole here is only found at restore time.
+    #[test]
+    fn restore_point_is_read_not_assumed() {
+        let dir = std::env::temp_dir().join(format!("hug-rp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prof = dir.join("ofcrm");
+        std::fs::create_dir_all(&prof).unwrap();
+        {
+            let conn = rusqlite::Connection::open(prof.join("state.db")).unwrap();
+            conn.execute_batch(
+                "create table messages (message_uid text);\
+                 insert into messages values ('a'),('b');",
+            )
+            .unwrap();
+        }
+        std::fs::write(prof.join(".env"), "KEY=1\n").unwrap();
+        std::fs::write(prof.join("auth.json"), "{}\n").unwrap();
+        let profiles = vec!["ofcrm".to_string()];
+
+        let mut failures = Vec::new();
+        check_restore_point(&dir, &profiles, true, &mut failures);
+        assert!(
+            failures.is_empty(),
+            "a whole restore point must pass: {failures:?}"
+        );
+
+        // A manifest that claims secrets while the file is gone.
+        std::fs::remove_file(prof.join(".env")).unwrap();
+        let mut failures = Vec::new();
+        check_restore_point(&dir, &profiles, true, &mut failures);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains(".env"), "{failures:?}");
+
+        // A snapshot that cannot be read back at all.
+        std::fs::write(prof.join("state.db"), b"not a database").unwrap();
+        let mut failures = Vec::new();
+        check_restore_point(&dir, &profiles, false, &mut failures);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("unreadable"), "{failures:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A multiplexed gateway records what it serves and what it parked. Both shapes
+    /// must parse, including a state file that predates the field, because the old
+    /// struct ignored both and verify could not tell a parked profile from a
+    /// healthy one.
+    #[test]
+    fn gateway_state_reports_served_and_parked_profiles() {
+        let healthy = r#"{"pid": 2394633, "gateway_state": "running",
+                          "code_sha": "2bd378ed1b8d",
+                          "served_profiles": ["default","ofcrm","trilogy-brain"],
+                          "parked_profiles": {}}"#;
+        let g = parse_gateway_status(healthy).unwrap();
+        assert_eq!(g.pid, 2394633);
+        assert_eq!(g.served.len(), 3);
+        assert!(g.parked.is_empty(), "nothing parked is the healthy shape");
+
+        let parked = r#"{"pid": 7, "gateway_state": "running", "code_sha": "abc",
+                         "served_profiles": ["default"],
+                         "parked_profiles": {"ofcrm": "session store unusable: disk I/O error"}}"#;
+        let g = parse_gateway_status(parked).unwrap();
+        assert_eq!(g.parked.len(), 1);
+        assert!(g.parked["ofcrm"].contains("session store unusable"));
+        assert_eq!(g.served, vec!["default".to_string()]);
+
+        // A state file written before the field existed: empty, never an error.
+        let legacy = r#"{"pid": 1, "gateway_state": "running", "code_sha": "x"}"#;
+        let g = parse_gateway_status(legacy).unwrap();
+        assert!(g.parked.is_empty() && g.served.is_empty());
+        assert!(parse_gateway_status("not json").is_none());
+    }
+
+    /// A recorded reason can carry newlines; a report line must not.
+    #[test]
+    fn a_parked_reason_stays_on_one_line() {
+        assert_eq!(
+            one_line("store unusable\nretry pending"),
+            "store unusable retry pending"
+        );
+        assert_eq!(one_line("  padded  "), "padded");
+        let long = "x".repeat(400);
+        let out = one_line(&long);
+        assert_eq!(out.chars().count(), 163, "160 chars plus an ellipsis");
+        assert!(out.ends_with("..."));
+    }
+
     /// The pre-update working-tree.patch is the record of what was pinned. If we
     /// cannot read the file list back, verify can never notice a dropped patch.
     #[test]
@@ -634,7 +964,7 @@ mod tests {
         )
         .unwrap();
 
-        let files = expected_patched_files(&root);
+        let files = expected_patched_files(&root.join("backups"));
         assert_eq!(
             files,
             vec![
@@ -649,6 +979,6 @@ mod tests {
     /// No backup at all must yield an empty list (not a panic, not a fake entry).
     #[test]
     fn expected_patched_files_empty_without_backups() {
-        assert!(expected_patched_files(Path::new("C:/definitely-not-here-xyz")).is_empty());
+        assert!(expected_patched_files(Path::new("C:/definitely-not-here-xyz/backups")).is_empty());
     }
 }

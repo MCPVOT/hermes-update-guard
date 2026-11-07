@@ -53,7 +53,7 @@ pub fn retired(home: &Path) -> BTreeSet<String> {
     load(&file(home)).into_iter().map(|(k, _)| k).collect()
 }
 
-pub fn run(home: &Path, profile: &str, undo: bool) -> Result<()> {
+pub fn run(home: &Path, profile: &str, undo: bool, bulk_root: &Path) -> Result<()> {
     let path = file(home);
     let mut map = load(&path);
 
@@ -80,7 +80,7 @@ pub fn run(home: &Path, profile: &str, undo: bool) -> Result<()> {
         );
     }
 
-    let last_seen = crate::env::last_seen_in_backups(home)
+    let last_seen = crate::env::last_seen_in_backups(bulk_root)
         .get(profile)
         .map(|s| s.trim_start_matches("pre-update-").to_string())
         .unwrap_or_else(|| "never".into());
@@ -124,14 +124,14 @@ mod tests {
         let h = home("undo");
         assert!(profiles_gone(&h).contains(&"gone (last seen 20260101-000000)".to_string()));
 
-        run(&h, "gone", false).unwrap();
+        run(&h, "gone", false, &h.join("backups")).unwrap();
         assert!(retired(&h).contains("gone"));
         assert!(
             profiles_gone(&h).is_empty(),
             "a retired profile must not be flagged"
         );
 
-        run(&h, "gone", true).unwrap();
+        run(&h, "gone", true, &h.join("backups")).unwrap();
         assert!(!retired(&h).contains("gone"));
         assert!(
             profiles_gone(&h).contains(&"gone (last seen 20260101-000000)".to_string()),
@@ -143,13 +143,15 @@ mod tests {
     #[test]
     fn refuse_to_retire_a_live_profile() {
         let h = home("live");
-        let err = run(&h, "live", false).unwrap_err().to_string();
+        let err = run(&h, "live", false, &h.join("backups"))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("still exists on disk"), "got: {err}");
         assert!(!retired(&h).contains("live"));
         let _ = std::fs::remove_dir_all(&h);
     }
 
     fn profiles_gone(h: &Path) -> Vec<String> {
-        crate::env::profiles_gone_since_backup(h, &retired(h))
+        crate::env::profiles_gone_since_backup(h, &retired(h), &h.join("backups"))
     }
 }

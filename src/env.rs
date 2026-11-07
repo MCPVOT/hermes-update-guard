@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -92,9 +93,10 @@ pub fn profiles(home: &Path) -> Vec<String> {
 pub fn profiles_gone_since_backup(
     home: &Path,
     retired: &std::collections::BTreeSet<String>,
+    bulk_root: &Path,
 ) -> Vec<String> {
     let now = profiles(home);
-    last_seen_in_backups(home)
+    last_seen_in_backups(bulk_root)
         .into_iter()
         .filter(|(n, _)| !now.iter().any(|x| x == n) && !retired.contains(n))
         .map(|(n, s)| format!("{} (last seen {})", n, s.trim_start_matches("pre-update-")))
@@ -105,9 +107,11 @@ pub fn profiles_gone_since_backup(
 ///
 /// A profile can disappear between two updates, and if it is already gone from the
 /// newest backup a latest-only comparison never sees it, so every backup is scanned.
-pub fn last_seen_in_backups(home: &Path) -> std::collections::BTreeMap<String, String> {
-    let backups = home.join("backups");
-    let Ok(rd) = std::fs::read_dir(&backups) else {
+///
+/// `bulk_root` is the RESOLVED bulk root, not `<home>/backups`: the restore points
+/// may live on a mounted disk, and this question is about those runs.
+pub fn last_seen_in_backups(bulk_root: &Path) -> std::collections::BTreeMap<String, String> {
+    let Ok(rd) = std::fs::read_dir(bulk_root) else {
         return Default::default();
     };
     let mut dirs: Vec<(String, PathBuf)> = rd
@@ -175,6 +179,514 @@ pub fn state_db(home: &Path, profile: &str) -> PathBuf {
 
 pub fn config_yaml(home: &Path, profile: &str) -> PathBuf {
     profile_dir(home, profile).join("config.yaml")
+}
+
+/// The ALWAYS-LOCAL guard root: run state, the log, provider-surface baselines,
+/// log-signal snapshots and quarantine all live here.
+///
+/// It is deliberately not configurable. `watch`, `verify`, `self-check` and the
+/// drift baseline must keep working when the removable disk is detached — which
+/// is exactly the moment a post-update verify matters.
+pub fn control_root(home: &Path) -> PathBuf {
+    home.join("backups")
+}
+
+/// Where `pre-update-<stamp>/` directories are written.
+///
+/// Precedence: `--backup-root`, then `$HERMES_GUARD_BULK_ROOT`, else the control
+/// root (today's behaviour, byte-for-byte). The path is NOT validated here; the
+/// mount proof belongs to the commands that write, so a detached disk cannot
+/// stop `verify` from reading the control root.
+pub fn bulk_root(home: &Path, cli: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = cli {
+        return Ok(p.to_path_buf());
+    }
+    if let Ok(v) = std::env::var("HERMES_GUARD_BULK_ROOT") {
+        if !v.trim().is_empty() {
+            return Ok(PathBuf::from(v));
+        }
+    }
+    Ok(control_root(home))
+}
+
+/// What the guard can PROVE about the volume it is about to write to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetProof {
+    pub path: PathBuf,
+    /// Kernel source device (`/dev/sda2`), or `local` for the control root.
+    pub device: String,
+    pub fstype: String,
+    pub is_mountpoint: bool,
+    pub free_bytes: Option<u64>,
+}
+
+impl TargetProof {
+    pub fn print(&self) {
+        println!("  target : {}", self.path.display());
+        println!(
+            "  device : {}",
+            if self.device.is_empty() {
+                "(unknown)"
+            } else {
+                self.device.as_str()
+            }
+        );
+        println!("  fstype : {}", self.fstype);
+        println!("  mount  : {}", self.is_mountpoint);
+        match self.free_bytes {
+            Some(b) => println!("  free   : {:.1} GB", b as f64 / 1_073_741_824.0),
+            None => println!("  free   : unknown"),
+        }
+    }
+}
+
+/// Filesystem types that cannot preserve Unix permissions and are almost always
+/// a boot or installer partition. The `ESD-USB` partition on the measured disk is
+/// 32 GB of vfat sitting next to the real ntfs3 backup volume — choosing it would
+/// produce a backup that cannot be restored with its modes intact.
+pub const UNSAFE_FSTYPES: [&str; 4] = ["cdrom", "exfat", "iso9660", "vfat"];
+
+/// Filesystems that do not survive a restart. A removable disk that is NOT mounted
+/// leaves its mount point as an empty directory under `/run/media/<user>`, and
+/// `udev`/`udisks` mount that parent as `tmpfs`. Proving "not the root filesystem"
+/// therefore passes on the parent, so an unmounted external target used to be
+/// accepted, printed as `mount: true, fstype: tmpfs`, and the only restore point
+/// would have been written to RAM. Refused unconditionally, like the other unsafe
+/// types: `--allow-local-backup` means "the internal disk", not "memory".
+pub const VOLATILE_FSTYPES: [&str; 4] = ["ramfs", "ramdisk", "tmpfs", "devtmpfs"];
+
+/// Prove that `p` really is on a mounted volume before a byte is written.
+pub fn prove_target(p: &Path) -> Result<TargetProof> {
+    prove_target_with(p, false)
+}
+
+/// Same proof, but [`prove_target`]'s mount requirement may be waived by
+/// `--allow-local-backup`. The fstype refusal is NEVER waived.
+pub fn prove_target_with(p: &Path, allow_local: bool) -> Result<TargetProof> {
+    let anchor = nearest_existing(p);
+    #[cfg(target_os = "linux")]
+    let (is_mountpoint, device, fstype) = {
+        let canonical = anchor.canonicalize().unwrap_or_else(|_| anchor.clone());
+        match std::fs::read_to_string("/proc/self/mountinfo") {
+            Ok(text) => facts_from_entries(&parse_mountinfo(&text), &canonical),
+            Err(_) => fallback_mount_facts(&canonical),
+        }
+    };
+    // macOS answers the same question from `mount`, which prints
+    // "<device> on <mount point> (<fstype>, ...)" for every mounted volume. An
+    // unmounted /Volumes/Backup leaves the anchor on "/" and is refused. A table
+    // that cannot be read answers "not a mount point" (fail closed), never the
+    // permissive default this branch used to return.
+    #[cfg(target_os = "macos")]
+    let (is_mountpoint, device, fstype) = {
+        let canonical = anchor.canonicalize().unwrap_or_else(|_| anchor.clone());
+        match bsd_mount_entries() {
+            Some(entries) => facts_from_entries(&entries, &canonical),
+            None => (false, String::new(), "unknown".to_string()),
+        }
+    };
+    // Windows makes the intended volume explicit with a drive letter: when the
+    // letter the target names is absent, the nearest existing ancestor is on a
+    // different volume (C:\Users\...), which is precisely the unplugged-disk case.
+    #[cfg(windows)]
+    let (is_mountpoint, device, fstype) = windows_target_facts(p, &anchor);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    let (is_mountpoint, device, fstype) = (false, String::new(), "unknown".to_string());
+    finish_proof(p, allow_local, is_mountpoint, device, fstype, &anchor)
+}
+
+/// True when the nearest existing directory of `p` sits on a volatile filesystem.
+///
+/// The same fact `reject_unsafe_fstype` refuses on, exposed so callers (and tests)
+/// can ask "could a restore point live here at all" without attempting a write.
+/// Today the caller is the backup test, which must not change verdict with the
+/// runner's TEMP filesystem; `reject_unsafe_fstype` stays the production refusal.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn target_is_volatile(p: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let anchor = nearest_existing(p);
+        let canonical = anchor.canonicalize().unwrap_or_else(|_| anchor.clone());
+        let fstype = match std::fs::read_to_string("/proc/self/mountinfo") {
+            Ok(text) => facts_from_entries(&parse_mountinfo(&text), &canonical).2,
+            Err(_) => fallback_mount_facts(&canonical).2,
+        };
+        VOLATILE_FSTYPES.contains(&fstype.to_ascii_lowercase().as_str())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let anchor = nearest_existing(p);
+        let canonical = anchor.canonicalize().unwrap_or_else(|_| anchor.clone());
+        match bsd_mount_entries() {
+            Some(entries) => {
+                let fstype = facts_from_entries(&entries, &canonical).2;
+                VOLATILE_FSTYPES.contains(&fstype.to_ascii_lowercase().as_str())
+            }
+            None => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        match volume_root(p)
+            .or_else(|| volume_root(&nearest_existing(p)))
+            .and_then(|root| drive_type_label(&root))
+        {
+            Some(label) => VOLATILE_FSTYPES.contains(&label.as_str()),
+            None => false,
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = p;
+        false
+    }
+}
+
+/// Parse the POSIX `mount` table (macOS/BSD, and Linux's `mount` too):
+/// `"/dev/disk3s1 on /Volumes/My Backup (apfs, local, journaled)"`.
+///
+/// `rsplit_once(" (")` is deliberate: mount points may contain `" ("`, and the
+/// option group is the last one on the line.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub fn parse_mount_command(text: &str) -> Vec<MountEntry> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((device, rest)) = line.split_once(" on ") else {
+            continue;
+        };
+        let Some((mount_point, opts)) = rest.rsplit_once(" (") else {
+            continue;
+        };
+        let fstype = opts.split(',').next().unwrap_or("unknown").trim();
+        let mount_point = mount_point.trim();
+        let device = device.trim();
+        if mount_point.is_empty() || device.is_empty() {
+            continue;
+        }
+        out.push(MountEntry {
+            mount_point: PathBuf::from(mount_point),
+            device: device.to_string(),
+            fstype: fstype.to_string(),
+        });
+    }
+    out
+}
+
+/// The mounted-volume table on macOS, or `None` when `mount` cannot answer.
+#[cfg(target_os = "macos")]
+pub fn bsd_mount_entries() -> Option<Vec<MountEntry>> {
+    let (code, out) = run_capture_stdout(Path::new("mount"), &[], None, None).ok()?;
+    if code != 0 {
+        return None;
+    }
+    let entries = parse_mount_command(&out);
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
+}
+
+/// Windows volume root for a path: `E:\a\b` → `E:\`, `\\server\share\x` →
+/// `\\server\share`. `None` when the path is relative.
+#[cfg(windows)]
+pub fn volume_root(p: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut comps = p.components();
+    match comps.next() {
+        Some(Component::Prefix(prefix)) => {
+            let mut root = PathBuf::from(prefix.as_os_str());
+            if matches!(comps.next(), Some(Component::RootDir)) {
+                root.push(std::path::MAIN_SEPARATOR.to_string());
+            }
+            Some(root)
+        }
+        Some(Component::RootDir) => Some(PathBuf::from(std::path::MAIN_SEPARATOR.to_string())),
+        _ => None,
+    }
+}
+
+/// `fsutil fsinfo drivetype` output → a label the fstype refusals understand.
+///
+/// Pure and tested on every platform: the labels slot into `UNSAFE_FSTYPES`
+/// (`cdrom`) and `VOLATILE_FSTYPES` (`ramdisk`) so one set of rules covers both
+/// worlds.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub fn parse_fsutil_drivetype(out: &str) -> Option<String> {
+    let lower = out.to_ascii_lowercase();
+    let label = if lower.contains("cd-rom") {
+        "cdrom"
+    } else if lower.contains("ram disk") || lower.contains("ramdisk") {
+        "ramdisk"
+    } else if lower.contains("removable") {
+        "removable"
+    } else if lower.contains("network") {
+        "network"
+    } else if lower.contains("fixed") {
+        "fixed"
+    } else {
+        return None;
+    };
+    Some(label.to_string())
+}
+
+/// Drive type of a Windows volume root, or `None` when `fsutil` cannot answer.
+#[cfg(windows)]
+pub fn drive_type_label(root: &Path) -> Option<String> {
+    let (code, out) = run_capture_stdout(
+        Path::new("fsutil"),
+        &["fsinfo", "drivetype", &root.to_string_lossy()],
+        None,
+        None,
+    )
+    .ok()?;
+    if code != 0 {
+        return None;
+    }
+    parse_fsutil_drivetype(&out)
+}
+
+/// Two paths name the same Windows volume. Drive letters are case-insensitive.
+#[cfg(windows)]
+fn same_volume(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+/// Mount facts for a Windows target.
+///
+/// The proof used to be `(true, "", "unknown")` on every non-Linux host, so a
+/// `--backup-root` on an absent drive letter was accepted and the restore point
+/// would have landed on whatever volume happened to sit above the missing one.
+#[cfg(windows)]
+fn windows_target_facts(target: &Path, anchor: &Path) -> (bool, String, String) {
+    let (Some(target_root), Some(anchor_root)) = (volume_root(target), volume_root(anchor)) else {
+        // A relative path has no volume identity to prove.
+        return (false, String::new(), "unknown".to_string());
+    };
+    let device = target_root.display().to_string();
+    if !target_root.exists() || !same_volume(&target_root, &anchor_root) {
+        // The target names a volume that is not there; the anchor landed on another.
+        return (false, device, "unknown".to_string());
+    }
+    let fstype = drive_type_label(&target_root).unwrap_or_else(|| "unknown".to_string());
+    (true, device, fstype)
+}
+
+/// Prove by consulting an explicit mount table.
+///
+/// Split out so the refusal rules are testable without a real mount and without
+/// root — the production path above just supplies the kernel's own table.
+#[cfg(test)]
+pub fn prove_target_from(
+    p: &Path,
+    allow_local: bool,
+    entries: &[MountEntry],
+) -> Result<TargetProof> {
+    let anchor = nearest_existing(p);
+    let canonical = anchor.canonicalize().unwrap_or_else(|_| anchor.clone());
+    let (is_mountpoint, device, fstype) = facts_from_entries(entries, &canonical);
+    finish_proof(p, allow_local, is_mountpoint, device, fstype, &anchor)
+}
+
+fn finish_proof(
+    p: &Path,
+    allow_local: bool,
+    is_mountpoint: bool,
+    device: String,
+    fstype: String,
+    anchor: &Path,
+) -> Result<TargetProof> {
+    reject_unsafe_fstype(p, &fstype)?;
+    if !is_mountpoint && !allow_local {
+        bail!(
+            "refusing to use {} as a backup target: it is not a mount point. \
+             An unplugged disk must not turn into a directory on the root filesystem. \
+             Mount the disk, or pass --allow-local-backup to accept the internal disk.",
+            p.display()
+        );
+    }
+    Ok(TargetProof {
+        path: p.to_path_buf(),
+        device,
+        fstype,
+        is_mountpoint,
+        free_bytes: free_space_bytes(anchor),
+    })
+}
+
+/// Prove the resolved bulk root, allowing the control root without a proof.
+///
+/// `bulk == control` is the historical default and must keep working on a plain
+/// home directory. Anything else has to pass the mount proof unless the operator
+/// explicitly asked for the local disk.
+pub fn prove_backup_target(bulk: &Path, control: &Path, allow_local: bool) -> Result<TargetProof> {
+    if bulk == control {
+        return Ok(TargetProof {
+            path: bulk.to_path_buf(),
+            device: "local".to_string(),
+            fstype: "local".to_string(),
+            // The control root is an explicit, documented exception: it is the
+            // guard's own directory, not a removable target that can vanish.
+            is_mountpoint: true,
+            free_bytes: free_space_bytes(&nearest_existing(bulk)),
+        });
+    }
+    if allow_local {
+        prove_target_with(bulk, true)
+    } else {
+        prove_target(bulk)
+    }
+}
+
+/// Refuse a filesystem type that cannot carry a restore point.
+///
+/// Pure and injectable on purpose: the test does not need a real vfat mount.
+pub fn reject_unsafe_fstype(p: &Path, fstype: &str) -> Result<()> {
+    let fstype = fstype.to_ascii_lowercase();
+    if VOLATILE_FSTYPES.contains(&fstype.as_str()) {
+        bail!(
+            "refusing {}: the nearest existing directory is on {} (RAM-backed), which is what an \
+             UNMOUNTED removable disk looks like under /run/media/<user>. The restore point would \
+             be written to memory and lost on reboot. Mount the volume and retry; --allow-local-backup \
+             means the internal disk, not memory.",
+            p.display(),
+            fstype
+        );
+    }
+    if UNSAFE_FSTYPES.contains(&fstype.as_str()) {
+        bail!(
+            "refusing {}: {} cannot preserve permissions and is usually a boot or installer partition",
+            p.display(),
+            fstype
+        );
+    }
+    Ok(())
+}
+
+/// Deepest ancestor of `p` that exists (or `p` itself).
+///
+/// The target directory normally does not exist yet — `/run/media/.../backup` is
+/// created by the first run — so the proof is made against the volume that would
+/// receive it, not against a path that cannot be stat'ed.
+pub fn nearest_existing(p: &Path) -> PathBuf {
+    let mut cur = p.to_path_buf();
+    loop {
+        if cur.exists() {
+            return cur;
+        }
+        match cur.parent() {
+            Some(parent) if parent != cur => cur = parent.to_path_buf(),
+            _ => return cur,
+        }
+    }
+}
+
+/// `(is_mountpoint, device, fstype)` from an explicit mount table.
+///
+/// "Not the root filesystem" is the test, not "different mount point": separate
+/// btrfs subvolumes such as `/home` share the root device and are therefore not
+/// an independent target. A removable disk has its own device.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn facts_from_entries(entries: &[MountEntry], path: &Path) -> (bool, String, String) {
+    let Some(entry) = mount_entry_for(entries, path) else {
+        return (false, String::new(), "unknown".to_string());
+    };
+    let root_device = entries
+        .iter()
+        .find(|e| e.mount_point == Path::new("/"))
+        .map(|e| e.device.as_str());
+    let on_root = entry.mount_point == Path::new("/")
+        || root_device.map(|dev| dev == entry.device).unwrap_or(false);
+    (!on_root, entry.device.clone(), entry.fstype.clone())
+}
+
+/// Compare st_dev with the parent when mountinfo is unavailable.
+#[cfg(target_os = "linux")]
+fn fallback_mount_facts(path: &Path) -> (bool, String, String) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(md) = std::fs::metadata(path) else {
+        return (false, String::new(), "unknown".to_string());
+    };
+    let is_mountpoint = path
+        .parent()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|parent| parent.dev() != md.dev())
+        .unwrap_or(false);
+    (
+        is_mountpoint,
+        format!("dev:{}", md.dev()),
+        "unknown".to_string(),
+    )
+}
+
+/// One `/proc/self/mountinfo` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct MountEntry {
+    pub mount_point: PathBuf,
+    pub device: String,
+    pub fstype: String,
+}
+
+/// Parse mountinfo, honouring the kernel's octal escapes (`\040` for a space).
+///
+/// Without the unescape, `/run/media/tango/New\040Volume` never matches the path
+/// the operator typed, and a perfectly mounted disk reads as "not a mount point".
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
+    text.lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 7 {
+                return None;
+            }
+            let sep = parts.iter().position(|f| *f == "-")?;
+            if sep + 2 >= parts.len() {
+                return None;
+            }
+            Some(MountEntry {
+                mount_point: PathBuf::from(unescape_mountinfo(parts[4])),
+                fstype: parts[sep + 1].to_string(),
+                device: parts[sep + 2].to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The entry whose mount point is the longest prefix of `path` — the volume
+/// that actually holds those bytes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn mount_entry_for<'a>(entries: &'a [MountEntry], path: &Path) -> Option<&'a MountEntry> {
+    entries
+        .iter()
+        .filter(|e| path.starts_with(&e.mount_point))
+        .max_by_key(|e| e.mount_point.as_os_str().len())
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn unescape_mountinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let digits: String = chars.by_ref().take(3).collect();
+        match u32::from_str_radix(&digits, 8)
+            .ok()
+            .and_then(char::from_u32)
+        {
+            Some(decoded) if digits.len() == 3 => out.push(decoded),
+            _ => {
+                out.push('\\');
+                out.push_str(&digits);
+            }
+        }
+    }
+    out
 }
 
 /// Free space on the volume that holds `path`, in bytes.
@@ -351,6 +863,41 @@ pub fn run_capture(program: &Path, args: &[&str], cwd: Option<&Path>) -> Result<
     Ok((out.status.code().unwrap_or(-1), text))
 }
 
+/// Run a command and return `(exit, stdout ONLY)`.
+///
+/// Separate from [`run_capture`] because a probe whose PAYLOAD is stdout must not
+/// be poisoned by a diagnostic on stderr. Measured: `hermes update
+/// --list-venv-holders` prints `[]` on stdout and a ~626-byte
+/// `[HERMES_HOME fallback]` warning on stderr when `HERMES_HOME` is unset on a
+/// multi-profile host; merging the two made the JSON unparseable and the venv gate
+/// refuse a free venv with "venv state UNKNOWN (probe exit 0)".
+///
+/// `home` is passed to the child as `HERMES_HOME` when given, which removes the
+/// fallback warning at its source as well as tolerating it.
+pub fn run_capture_stdout(
+    program: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<(i32, String)> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    if let Some(d) = cwd {
+        cmd.current_dir(d);
+    }
+    if let Some(h) = home {
+        cmd.env("HERMES_HOME", h);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    let out = cmd
+        .output()
+        .with_context(|| format!("failed to spawn {}", program.display()))?;
+    Ok((
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    ))
+}
+
 /// Collect every process holding the hermes venv, via hermes' own probe.
 ///
 /// `hermes update --list-venv-holders` prints
@@ -365,21 +912,30 @@ pub fn run_capture(program: &Path, args: &[&str], cwd: Option<&Path>) -> Result<
 /// exit...") instead of the JSON list, so the third flag lets callers say
 /// "venv state UNKNOWN — treat as held" rather than assuming free.
 pub fn venv_holders_probe(home: &Path) -> (Vec<String>, i32, bool) {
-    venv_holders_probe_with(resolve_hermes(home).as_deref())
+    venv_holders_probe_with(resolve_hermes(home).as_deref(), Some(home))
 }
 
 /// Testable core of [`venv_holders_probe`]: `None` means no CLI was resolvable,
 /// which must read as UNKNOWN (parsed = false), never as "venv free".
-fn venv_holders_probe_with(cli: Option<&Path>) -> (Vec<String>, i32, bool) {
+///
+/// stdout only: the payload is JSON on stdout, and a fallback warning on stderr
+/// used to merge into it and turn a free venv into UNKNOWN.
+fn venv_holders_probe_with(cli: Option<&Path>, home: Option<&Path>) -> (Vec<String>, i32, bool) {
     let Some(hermes) = cli else {
         return (vec![], -1, false);
     };
-    let Ok((code, out)) = run_capture(hermes, &["update", "--list-venv-holders"], None) else {
+    let Ok((code, out)) =
+        run_capture_stdout(hermes, &["update", "--list-venv-holders"], None, home)
+    else {
         return (vec![], -1, false);
     };
     let trimmed = out.trim();
     if trimmed.is_empty() {
-        return (vec![], code, true);
+        // No payload at all. Exit 0 is the probe's documented "venv is free";
+        // any other exit is UNKNOWN, never free. Since stderr is no longer read,
+        // an empty stdout plus a non-zero exit is the shape of a CLI that
+        // answered in prose (or has no such subcommand), and that must not pass.
+        return (vec![], code, code == 0);
     }
     match serde_json::from_str::<serde_json::Value>(trimmed) {
         Ok(serde_json::Value::Array(arr)) if arr.is_empty() => (vec![], code, true),
@@ -559,6 +1115,202 @@ pub fn process_state(image: &str) -> ProcState {
     }
 }
 
+/// Command-line fragments that identify a running Desktop app on THIS platform.
+///
+/// The Windows image is `Hermes.exe`. macOS and Linux ship a bare `Hermes` binary
+/// inside a bundle/app directory, and `pgrep -f` matches command LINES, so asking
+/// every platform for `Hermes.exe` answered "absent" on a host where the app was
+/// running (measured: pid alive, preflight printed `[desktop app] not running`).
+/// That turned `--close-desktop` into a no-op and let the packaged rebuild
+/// overwrite the files of a running app.
+pub fn desktop_app_images() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &["Hermes.exe"]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        &["Hermes.app/Contents/MacOS/Hermes", "Hermes Helper"]
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        &["linux-unpacked/Hermes", "/Hermes --type=", "hermes-desktop"]
+    }
+}
+
+/// Combine per-image probe results. A positive match on any name wins, because one
+/// confirmed process IS the answer; Unknown only wins when nothing matched and some
+/// probe could not run (fail closed, never "absent" from a broken probe).
+pub fn combine_proc_states(states: &[ProcState]) -> ProcState {
+    let mut unknown: Option<String> = None;
+    for s in states {
+        match s {
+            ProcState::Running => return ProcState::Running,
+            ProcState::Unknown(why) => unknown = unknown.or_else(|| Some(why.clone())),
+            ProcState::Absent => {}
+        }
+    }
+    match unknown {
+        Some(why) => ProcState::Unknown(why),
+        None => ProcState::Absent,
+    }
+}
+
+/// Tri-state state of the Desktop app across every name it can run under here.
+pub fn desktop_app_state() -> ProcState {
+    let states: Vec<ProcState> = desktop_app_images()
+        .iter()
+        .map(|i| process_state(i))
+        .collect();
+    combine_proc_states(&states)
+}
+
+/// A `.desktop` entry that claims to launch a Hermes desktop app.
+///
+/// Two installations can each ship one: the checkout app that `hermes desktop`
+/// installs, and a distribution package such as `hermes-desktop`. Both are
+/// `Name=Hermes`, so the launcher shows two identical icons and one of them can
+/// start a stale build. Preflight reports them instead of guessing which is
+/// current.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopLauncher {
+    pub path: PathBuf,
+    /// `user` for `$XDG_DATA_HOME`, `system` for `$XDG_DATA_DIRS`.
+    pub scope: &'static str,
+    pub name: String,
+    pub exec: String,
+    /// False when the entry sets `NoDisplay=true` or `Hidden=true`.
+    pub visible: bool,
+}
+
+/// Application directories in XDG precedence order.
+pub fn desktop_launcher_dirs() -> Vec<(PathBuf, &'static str)> {
+    let mut dirs = Vec::new();
+    let user = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".local/share"))
+        });
+    if let Some(root) = user {
+        dirs.push((root.join("applications"), "user"));
+    }
+    let data_dirs = std::env::var("XDG_DATA_DIRS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+    for root in data_dirs.split(':').filter(|s| !s.is_empty()) {
+        dirs.push((PathBuf::from(root).join("applications"), "system"));
+    }
+    dirs
+}
+
+/// Every launcher entry that claims Hermes, after XDG shadowing.
+pub fn desktop_launchers() -> Vec<DesktopLauncher> {
+    desktop_launchers_in(&desktop_launcher_dirs())
+}
+
+/// Testable core: the first directory wins for a desktop-file ID, exactly as the
+/// XDG spec says, so a user override with `Hidden=true` really hides the system
+/// entry it shadows.
+pub fn desktop_launchers_in(dirs: &[(PathBuf, &'static str)]) -> Vec<DesktopLauncher> {
+    let mut seen: Vec<std::ffi::OsString> = Vec::new();
+    let mut found = Vec::new();
+    for (dir, scope) in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "desktop"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Some(id) = path.file_name().map(|n| n.to_owned()) else {
+                continue;
+            };
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some((name, exec, visible)) = parse_desktop_entry(&text) else {
+                continue;
+            };
+            if claims_hermes(&name, &exec) {
+                found.push(DesktopLauncher {
+                    path,
+                    scope,
+                    name,
+                    exec,
+                    visible,
+                });
+            }
+        }
+    }
+    found
+}
+
+/// `(Name, Exec, visible)` from the `[Desktop Entry]` group.
+fn parse_desktop_entry(text: &str) -> Option<(String, String, bool)> {
+    let mut name = None;
+    let mut exec = None;
+    let mut kind = None;
+    let mut hidden = false;
+    let mut in_entry = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_entry = line.eq_ignore_ascii_case("[Desktop Entry]");
+            continue;
+        }
+        if !in_entry {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "Name" => name = Some(value.trim().to_string()),
+            "Exec" => exec = Some(value.trim().to_string()),
+            "Type" => kind = Some(value.trim().to_string()),
+            "Hidden" | "NoDisplay" if value.trim().eq_ignore_ascii_case("true") => hidden = true,
+            _ => {}
+        }
+    }
+    if kind.is_some_and(|k| !k.eq_ignore_ascii_case("Application")) {
+        return None;
+    }
+    Some((name?, exec?, !hidden))
+}
+
+/// Does this entry point at a Hermes desktop app? Match the name and the program
+/// basename, never an arbitrary substring: `Hermes Guard Dashboard` must not be
+/// counted as a second Hermes Desktop.
+fn claims_hermes(name: &str, exec: &str) -> bool {
+    let name = name.to_lowercase();
+    let exec = exec.to_lowercase();
+    let program = exec
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c| c == '"' || c == '\'');
+    let base = program.rsplit('/').next().unwrap_or(program);
+    let by_name =
+        name == "hermes" || name.starts_with("hermes desktop") || name.starts_with("hermes agent");
+    let by_exec = base == "hermes" || base == "hermes-desktop" || exec.contains("/hermes desktop");
+    by_name || by_exec
+}
+
 /// Is `pid` still alive? Same tri-state discipline as the image probe: a failed
 /// `tasklist` answers Unknown, never "dead".
 #[cfg(windows)]
@@ -652,6 +1404,52 @@ pub struct CloseReport {
     pub closed: bool,
     pub detail: String,
     pub survivors: Vec<u32>,
+}
+
+/// Close the Desktop app under every name it can run as on this platform.
+///
+/// `--close-desktop` used to pass the Windows image name on every host, so on
+/// macOS and Linux it closed nothing and the update proceeded with the app alive.
+/// Reports the same shape as [`close_process`]; the detail names which image was
+/// actually closed, so a report is never a bare "closed".
+pub fn close_desktop_app(
+    graceful: std::time::Duration,
+    forced: std::time::Duration,
+) -> Result<CloseReport> {
+    let mut details: Vec<String> = Vec::new();
+    let mut survivors: Vec<u32> = Vec::new();
+    let mut closed_all = true;
+    let mut handled = 0usize;
+
+    for image in desktop_app_images() {
+        match process_state(image) {
+            ProcState::Absent => {}
+            ProcState::Unknown(why) => {
+                bail!("cannot verify whether {image} is running ({why}) - treating it as running")
+            }
+            ProcState::Running => {
+                let report = close_process(image, graceful, forced)?;
+                handled += 1;
+                if !report.closed {
+                    closed_all = false;
+                    survivors.extend(report.survivors.iter().copied());
+                }
+                details.push(format!("{image}: {}", report.detail));
+            }
+        }
+    }
+
+    survivors.sort_unstable();
+    survivors.dedup();
+    Ok(CloseReport {
+        closed: closed_all,
+        detail: if handled == 0 {
+            "no desktop app process was running".to_string()
+        } else {
+            details.join("; ")
+        },
+        survivors,
+    })
 }
 
 /// Close the app in two bounded stages: graceful, then forced. The old code sent
@@ -874,8 +1672,9 @@ mod tests {
         std::fs::write(old.join("elevate/state.db"), "x").unwrap();
 
         let none = std::collections::BTreeSet::new();
+        let bulk = home.join("backups");
         assert_eq!(
-            profiles_gone_since_backup(&home, &none),
+            profiles_gone_since_backup(&home, &none, &bulk),
             vec![
                 "ancient (last seen 20250101-000000)".to_string(),
                 "elevate (last seen 20260101-000000)".to_string(),
@@ -887,7 +1686,7 @@ mod tests {
         let retired: std::collections::BTreeSet<String> =
             ["elevate".to_string()].into_iter().collect();
         assert_eq!(
-            profiles_gone_since_backup(&home, &retired),
+            profiles_gone_since_backup(&home, &retired, &bulk),
             vec!["ancient (last seen 20250101-000000)".to_string()]
         );
 
@@ -895,17 +1694,49 @@ mod tests {
         let bare = std::env::temp_dir().join(format!("hug-bare-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&bare);
         std::fs::create_dir_all(&bare).unwrap();
-        assert!(profiles_gone_since_backup(&bare, &none).is_empty());
+        assert!(profiles_gone_since_backup(&bare, &none, &bare.join("backups")).is_empty());
 
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    /// The venv probe's payload is stdout. A diagnostic on stderr used to merge
+    /// into it and turn a free venv into UNKNOWN (measured: 626 bytes of
+    /// `[HERMES_HOME fallback]` warning beside a real `[]`). Both directions: the
+    /// stdout-only reader ignores stderr, and the merging reader still shows it.
+    #[cfg(unix)]
+    #[test]
+    fn stdout_only_capture_ignores_stderr() {
+        let (code, out) = run_capture_stdout(
+            Path::new("sh"),
+            &[
+                "-c",
+                "printf '[]'; printf '[HERMES_HOME fallback] noisy' >&2",
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "[]", "stdout is the payload, nothing else");
+
+        let (_, merged) = run_capture(
+            Path::new("sh"),
+            &["-c", "printf '[]'; printf 'noisy' >&2"],
+            None,
+        )
+        .unwrap();
+        assert!(
+            merged.contains("noisy"),
+            "the merging reader is the one that poisoned the probe"
+        );
     }
 
     /// venv_holders_probe must report "unknown" (parsed=false) when there is no
     /// hermes CLI at all, so callers fail closed instead of assuming the venv free.
     #[test]
     fn venv_probe_unknown_without_hermes() {
-        let (holders, code, parsed) = venv_holders_probe_with(None);
+        let (holders, code, parsed) = venv_holders_probe_with(None, None);
         assert!(!parsed, "no hermes CLI must mean UNKNOWN, not free");
         assert_eq!(code, -1);
         assert!(holders.is_empty());
@@ -916,8 +1747,470 @@ mod tests {
     #[test]
     fn venv_probe_unknown_on_prose() {
         // any CLI that prints prose instead of the documented JSON
-        let (_, code, parsed) = venv_holders_probe_with(Some(Path::new("git")));
+        let (_, code, parsed) = venv_holders_probe_with(Some(Path::new("git")), None);
         assert!(!parsed, "prose output is not the documented JSON");
         assert_ne!(code, 0, "git has no `update` subcommand");
+    }
+
+    /// Serialise the one test that touches a process-global env var.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Precedence is the whole contract: an explicit flag must beat the env var,
+    /// and the env var must beat the default. The env path is NOT validated as a
+    /// mount here — the proof belongs to the command that writes.
+    #[test]
+    fn bulk_root_precedence_flag_then_env_then_control() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = PathBuf::from("/tmp/hug-home");
+        let saved = std::env::var_os("HERMES_GUARD_BULK_ROOT");
+        std::env::remove_var("HERMES_GUARD_BULK_ROOT");
+
+        assert_eq!(bulk_root(&home, None).unwrap(), home.join("backups"));
+        std::env::set_var("HERMES_GUARD_BULK_ROOT", "/mnt/not-a-real-mount/env");
+        assert_eq!(
+            bulk_root(&home, None).unwrap(),
+            PathBuf::from("/mnt/not-a-real-mount/env"),
+            "an env path is returned even though it cannot be a mount"
+        );
+        assert_eq!(
+            bulk_root(&home, Some(Path::new("/mnt/flag/backup"))).unwrap(),
+            PathBuf::from("/mnt/flag/backup"),
+            "the explicit flag beats the env var"
+        );
+
+        match saved {
+            Some(v) => std::env::set_var("HERMES_GUARD_BULK_ROOT", v),
+            None => std::env::remove_var("HERMES_GUARD_BULK_ROOT"),
+        }
+    }
+
+    fn mount(mount_point: &str, device: &str, fstype: &str) -> MountEntry {
+        MountEntry {
+            mount_point: PathBuf::from(mount_point),
+            device: device.to_string(),
+            fstype: fstype.to_string(),
+        }
+    }
+
+    /// The Desktop app runs as a bare `Hermes` binary on macOS and Linux. A probe
+    /// that only knows the Windows image name answered "absent" on a host where
+    /// the app was running, which made `--close-desktop` a no-op.
+    #[test]
+    fn desktop_probe_knows_every_platform_name() {
+        let images = desktop_app_images();
+        assert!(!images.is_empty(), "a probe with no names can never match");
+        #[cfg(windows)]
+        assert!(images.contains(&"Hermes.exe"));
+        #[cfg(target_os = "macos")]
+        assert!(images.iter().any(|i| i.contains("MacOS/Hermes")));
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            assert!(
+                images.iter().any(|i| i.starts_with("linux-unpacked/")),
+                "the packaged Linux app must be probeable: {images:?}"
+            );
+            assert!(
+                !images.contains(&"Hermes.exe"),
+                "a Windows image name can never match on Linux"
+            );
+        }
+    }
+
+    /// One confirmed process IS the answer; Unknown only wins when nothing matched
+    /// and a probe could not run. Both directions, so the combiner cannot silently
+    /// pass a running app or invent one.
+    #[test]
+    fn probe_combiner_prefers_running_and_fails_closed() {
+        assert_eq!(
+            combine_proc_states(&[ProcState::Absent, ProcState::Running]),
+            ProcState::Running
+        );
+        assert_eq!(
+            combine_proc_states(&[ProcState::Absent, ProcState::Absent]),
+            ProcState::Absent
+        );
+        assert!(matches!(
+            combine_proc_states(&[
+                ProcState::Absent,
+                ProcState::Unknown("pgrep missing".into())
+            ]),
+            ProcState::Unknown(_)
+        ));
+        assert_eq!(
+            combine_proc_states(&[ProcState::Unknown("x".into()), ProcState::Running]),
+            ProcState::Running,
+            "a positive hit outranks an unrelated probe failure"
+        );
+    }
+
+    /// The bug this closes: an UNMOUNTED removable disk leaves its mount point on a
+    /// tmpfs under /run/media/<user>, the "not the root filesystem" test passes on
+    /// that parent, and the only restore point would be written to RAM.
+    #[test]
+    fn refuses_a_target_that_lands_on_tmpfs() {
+        let dir = std::env::temp_dir().join(format!("hug-tmpfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent = std::fs::canonicalize(&dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        // udisks layout: the parent exists as a tmpfs, the volume's own directory does not.
+        let entries = vec![
+            mount("/", "/dev/root", "ext4"),
+            mount(&parent, "tmpfs", "tmpfs"),
+        ];
+        let target = dir.join("New Volume/mcpvot-backup/hermes-guard");
+        let refused = prove_target_from(&target, false, &entries);
+        assert!(
+            refused.is_err(),
+            "an unmounted volume under a tmpfs parent must be refused"
+        );
+        let msg = format!("{:#}", refused.unwrap_err());
+        assert!(
+            msg.contains("RAM-backed") && msg.contains("Mount the volume"),
+            "the refusal must say why and what to do: {msg}"
+        );
+        assert!(!target.exists(), "the proof must never create the target");
+
+        // --allow-local-backup does NOT waive a volatile filesystem: it means the
+        // internal disk, never memory.
+        assert!(prove_target_from(&target, true, &entries).is_err());
+
+        // The same path is accepted once the volume is really mounted. A real
+        // mount makes the volume's own directory exist, which is exactly what the
+        // proof anchors on, so the fixture has to create it too. The mount entry
+        // must use the CANONICAL path: the proof canonicalises its anchor, and on
+        // macOS (/var -> /private/var) and Windows (8.3 names, \\?\ prefix) the
+        // raw temp path never matches the table.
+        let volume = std::fs::canonicalize(&dir).unwrap().join("New Volume");
+        std::fs::create_dir_all(&volume).unwrap();
+        let mounted = vec![
+            mount("/", "/dev/root", "ext4"),
+            mount(&parent, "tmpfs", "tmpfs"),
+            mount(volume.to_string_lossy().as_ref(), "/dev/sda2", "ntfs3"),
+        ];
+        let proof = prove_target_from(&target, false, &mounted).unwrap();
+        assert_eq!(proof.fstype, "ntfs3");
+        assert_eq!(proof.device, "/dev/sda2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The boot/installer refusal keeps its own reason, and a real backup
+    /// filesystem is never refused.
+    #[test]
+    fn fstype_refusals_name_their_reason() {
+        let p = Path::new("/run/media/u/ESD-USB");
+        let vfat = format!("{:#}", reject_unsafe_fstype(p, "vfat").unwrap_err());
+        assert!(vfat.contains("cannot preserve permissions"), "{vfat}");
+        let tmpfs = format!("{:#}", reject_unsafe_fstype(p, "tmpfs").unwrap_err());
+        assert!(tmpfs.contains("RAM-backed"), "{tmpfs}");
+        for ok in ["ntfs3", "ext4", "btrfs", "xfs", "apfs"] {
+            assert!(
+                reject_unsafe_fstype(p, ok).is_ok(),
+                "{ok} is a real backup filesystem"
+            );
+        }
+    }
+
+    /// macOS answers the mount question from `mount`, not from mountinfo. A table
+    /// in that shape must drive the same proof: a path on "/" is not a volume, and
+    /// a real mounted volume is accepted with its own device and fstype.
+    #[test]
+    fn posix_mount_table_feeds_the_same_proof() {
+        let table = "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n\
+                     devfs on /dev (devfs, local, nobrowse)\n\
+                     /dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled)\n\
+                     /dev/disk5s1 on /Volumes/Backup Disk (apfs, local, journaled)\n";
+        let entries = parse_mount_command(table);
+        assert_eq!(entries.len(), 4, "every mounted volume is parsed");
+        let backup = entries
+            .iter()
+            .find(|e| e.mount_point == Path::new("/Volumes/Backup Disk"))
+            .expect("a mount point containing a space must parse");
+        assert_eq!(backup.device, "/dev/disk5s1");
+        assert_eq!(backup.fstype, "apfs");
+
+        let dir = std::env::temp_dir().join(format!("hug-bsd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let target = dir.join("pre-update");
+
+        // Live on "/": not a volume, so a proven target is refused.
+        let on_root = facts_from_entries(&entries, &canonical);
+        assert!(!on_root.0, "a path on the root filesystem is not a volume");
+        assert!(prove_target_from(&target, false, &entries).is_err());
+
+        // The same path once its volume is in the table.
+        let mut mounted: Vec<MountEntry> = entries
+            .iter()
+            .map(|e| mount(&e.mount_point.to_string_lossy(), &e.device, &e.fstype))
+            .collect();
+        mounted.push(mount(
+            canonical.to_string_lossy().as_ref(),
+            "/dev/disk5s1",
+            "apfs",
+        ));
+        let proof = prove_target_from(&target, false, &mounted).unwrap();
+        assert!(proof.is_mountpoint);
+        assert_eq!(proof.fstype, "apfs");
+        assert_eq!(proof.device, "/dev/disk5s1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `fsutil fsinfo drivetype` is how Windows names a volume. Its labels feed the
+    /// same two refusal lists as the POSIX fstypes, so a CD-ROM and a RAM disk are
+    /// refused and a mounted removable disk is allowed.
+    #[test]
+    fn fsutil_drivetype_maps_to_the_refusal_labels() {
+        assert_eq!(
+            parse_fsutil_drivetype("E:\\ - Removable Drive").as_deref(),
+            Some("removable")
+        );
+        assert_eq!(
+            parse_fsutil_drivetype("C:\\ - Fixed Drive").as_deref(),
+            Some("fixed")
+        );
+        assert_eq!(
+            parse_fsutil_drivetype("D:\\ - CD-ROM Drive").as_deref(),
+            Some("cdrom")
+        );
+        assert_eq!(
+            parse_fsutil_drivetype("R:\\ - RAM Disk").as_deref(),
+            Some("ramdisk")
+        );
+        assert_eq!(
+            parse_fsutil_drivetype("Z:\\ - Network Drive").as_deref(),
+            Some("network")
+        );
+        assert_eq!(parse_fsutil_drivetype("garbage"), None);
+
+        assert!(reject_unsafe_fstype(Path::new("D:\\"), "cdrom").is_err());
+        assert!(reject_unsafe_fstype(Path::new("R:\\"), "ramdisk").is_err());
+        assert!(
+            reject_unsafe_fstype(Path::new("E:\\"), "removable").is_ok(),
+            "a mounted removable disk is a legal target: that is the whole feature"
+        );
+    }
+
+    /// A drive letter is the volume identity. `E:\` absent means the anchor lands on
+    /// `C:\`, and the two roots must not be confused for one another.
+    #[cfg(windows)]
+    #[test]
+    fn volume_root_names_the_drive_or_share() {
+        assert_eq!(
+            volume_root(Path::new("E:\\backup\\hermes")).unwrap(),
+            PathBuf::from("E:\\")
+        );
+        assert!(same_volume(Path::new("E:\\"), Path::new("e:\\")));
+        assert!(!same_volume(Path::new("E:\\"), Path::new("C:\\")));
+        assert!(volume_root(Path::new("relative\\path")).is_none());
+    }
+
+    /// A plain directory on the root filesystem is refused, and a path that does
+    /// not exist yet is refused too — and neither refusal creates anything.
+    #[test]
+    fn prove_target_refuses_the_root_filesystem_and_creates_nothing() {
+        let dir = std::env::temp_dir().join(format!("hug-proof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let root_only = vec![mount("/", "/dev/root", "ext4")];
+        let existing = prove_target_from(&dir, false, &root_only);
+        assert!(existing.is_err());
+        let msg = format!("{:#}", existing.unwrap_err());
+        assert!(
+            msg.contains("it is not a mount point") && msg.contains("--allow-local-backup"),
+            "the refusal must name the rule and the way out: {msg}"
+        );
+
+        let deep = dir.join("new/backup/dir");
+        let missing = prove_target_from(&deep, false, &root_only);
+        assert!(missing.is_err(), "a path that must be created is refused");
+        assert!(!deep.exists(), "the proof must not create the target");
+
+        // The operator can still choose the local disk deliberately.
+        let allowed = prove_target_from(&deep, true, &root_only).unwrap();
+        assert!(!allowed.is_mountpoint);
+        assert!(
+            !deep.exists(),
+            "--allow-local-backup must not create it either"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A target under a mounted non-root volume is accepted, and the proof carries
+    /// that volume's device and fstype.
+    #[test]
+    fn prove_target_accepts_a_mounted_volume() {
+        let dir = std::env::temp_dir().join(format!("hug-proof-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Canonicalise the same way the proof does: /var/folders on macOS and
+        // 8.3-expanded paths on Windows would otherwise never match the mount
+        // table entry and the test would fail for the wrong reason.
+        let parent = std::fs::canonicalize(&dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let entries = vec![
+            mount("/", "/dev/root", "ext4"),
+            mount(&parent, "/dev/sda2", "ntfs3"),
+        ];
+        let target = dir.join("mcpvot-backup/hermes-guard");
+        let proof = prove_target_from(&target, false, &entries).unwrap();
+        assert_eq!(proof.device, "/dev/sda2");
+        assert_eq!(proof.fstype, "ntfs3");
+        assert!(proof.is_mountpoint);
+        assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The control root is legal without any mount proof (backwards compatibility).
+    #[test]
+    fn control_root_is_accepted_without_a_proof() {
+        let home = std::env::temp_dir().join(format!("hug-control-{}", std::process::id()));
+        let control = control_root(&home);
+        let proof = prove_backup_target(&control, &control, false).unwrap();
+        assert!(proof.is_mountpoint);
+        assert_eq!(proof.device, "local");
+        assert!(
+            !control.exists(),
+            "proving must not create the control root"
+        );
+    }
+
+    /// Installer/boot filesystems cannot preserve permission bits, so they are
+    /// refused by TYPE, independently of whether the path is a mount point.
+    #[test]
+    fn prove_target_rejects_boot_and_installer_filesystems() {
+        for fs in ["vfat", "VFAT", "exfat", "iso9660"] {
+            assert!(
+                reject_unsafe_fstype(Path::new("/mnt/x"), fs).is_err(),
+                "{fs} must be refused"
+            );
+        }
+        for fs in ["ntfs3", "ext4", "btrfs", "apfs", "unknown"] {
+            assert!(reject_unsafe_fstype(Path::new("/mnt/x"), fs).is_ok());
+        }
+    }
+
+    /// mountinfo escapes spaces as `\040`; without decoding it, the real SanDisk
+    /// mount at `/run/media/tango/New Volume` can never match what was typed.
+    #[test]
+    fn mountinfo_parses_escaped_mount_points_and_longest_prefix() {
+        let text = "\
+413 29 8:2 / /run/media/tango/New\\040Volume rw,relatime shared:468 - ntfs3 /dev/sda2 rw\n\
+350 29 8:1 / /run/media/tango/ESD-USB rw,relatime shared:453 - vfat /dev/sda1 rw\n\
+29 33 0:26 / /run rw,nosuid shared:12 - tmpfs run rw\n";
+        let entries = parse_mountinfo(text);
+        assert_eq!(
+            entries[0].mount_point,
+            PathBuf::from("/run/media/tango/New Volume")
+        );
+        assert_eq!(entries[0].device, "/dev/sda2");
+        assert_eq!(entries[0].fstype, "ntfs3");
+        assert_eq!(entries[1].fstype, "vfat");
+
+        let target = Path::new("/run/media/tango/New Volume/mcpvot-backup/hermes-guard");
+        let hit = mount_entry_for(&entries, target).unwrap();
+        assert_eq!(hit.device, "/dev/sda2");
+
+        let (is_mount, device, fstype) = facts_from_entries(&entries, target);
+        assert!(is_mount);
+        assert_eq!(device, "/dev/sda2");
+        assert_eq!(fstype, "ntfs3");
+    }
+
+    fn write_desktop(dir: &Path, id: &str, body: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(id), body).unwrap();
+    }
+
+    fn launcher_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("hug-launchers-{tag}-{}", std::process::id()));
+        let user = base.join("user");
+        let system = base.join("system");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        (base, user, system)
+    }
+
+    /// Measured 2026-11-06: the checkout app and the `hermes-desktop` package
+    /// both installed `Name=Hermes`, and the launcher showed two identical icons.
+    #[test]
+    fn desktop_launchers_lists_both_installs() {
+        let (base, user, system) = launcher_fixture("both");
+        write_desktop(
+            &user,
+            "com.nousresearch.hermes.desktop",
+            "[Desktop Entry]\nType=Application\nName=Hermes\nExec=/home/x/.local/bin/hermes desktop --skip-build\n",
+        );
+        write_desktop(
+            &system,
+            "hermes-desktop.desktop",
+            "[Desktop Entry]\nType=Application\nName=Hermes\nExec=hermes-desktop %U\n",
+        );
+        let got = desktop_launchers_in(&[(user.clone(), "user"), (system.clone(), "system")]);
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|l| l.visible));
+        assert_eq!(got.iter().filter(|l| l.scope == "user").count(), 1);
+        assert_eq!(got.iter().filter(|l| l.scope == "system").count(), 1);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A user-level entry shadows the system entry with the same desktop-file
+    /// ID; if it is hidden, the menu is down to one icon even though the
+    /// packaged file still exists on disk.
+    #[test]
+    fn desktop_launchers_honour_xdg_shadowing_and_hidden() {
+        let (base, user, system) = launcher_fixture("shadow");
+        let hidden = "[Desktop Entry]\nType=Application\nName=Hermes Desktop (packaged)\nExec=hermes-desktop %U\nNoDisplay=true\nHidden=true\n";
+        write_desktop(&user, "hermes-desktop.desktop", hidden);
+        write_desktop(&system, "hermes-desktop.desktop", hidden);
+        write_desktop(
+            &user,
+            "com.nousresearch.hermes.desktop",
+            "[Desktop Entry]\nType=Application\nName=Hermes\nExec=/home/x/.local/bin/hermes desktop --skip-build\n",
+        );
+        let got = desktop_launchers_in(&[(user.clone(), "user"), (system, "system")]);
+        assert_eq!(
+            got.len(),
+            2,
+            "the shadowed system entry must not be listed twice"
+        );
+        assert_eq!(got.iter().filter(|l| l.visible).count(), 1);
+        assert!(got.iter().any(|l| !l.visible && l.path.starts_with(&user)));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The guard dashboard is not a Hermes Desktop install. Match the exact
+    /// name or the program basename, never a loose "hermes" substring.
+    #[test]
+    fn desktop_launchers_ignore_guard_and_unrelated_entries() {
+        let (base, user, system) = launcher_fixture("ignore");
+        write_desktop(
+            &user,
+            "guard.desktop",
+            "[Desktop Entry]\nType=Application\nName=Hermes Guard Dashboard\nExec=hermes-guard-dashboard\n",
+        );
+        write_desktop(
+            &user,
+            "files.desktop",
+            "[Desktop Entry]\nType=Application\nName=Files\nExec=nautilus\n",
+        );
+        write_desktop(
+            &user,
+            "com.nousresearch.hermes.desktop",
+            "[Desktop Entry]\nType=Application\nName=Hermes\nExec=hermes desktop\n",
+        );
+        let got = desktop_launchers_in(&[(user, "user"), (system, "system")]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "Hermes");
+        std::fs::remove_dir_all(&base).ok();
     }
 }

@@ -1,7 +1,7 @@
 ---
 name: hermes-update-guard
-description: Use when running or verifying a `hermes update`, or after a failed update left a stale lock — drives the guarded pipeline (preflight, WAL-safe backup, provider-drift tripwire, post-verify) through the hermes-update-guard binary.
-version: 0.3.8
+description: Use when running or verifying a `hermes update`: guards it with preflight, a WAL-safe backup on a mount-proven target, a provider-drift tripwire and post-verify.
+version: 0.4.3
 author: MCPVOT
 license: MIT
 platforms: [macos, linux, windows]
@@ -35,6 +35,11 @@ tripwire — the whole scripted update ritual in one static binary.
 | **Approve** the current surface as the golden reference | `hermes-update-guard bless` |
 | Prove no drift | `hermes-update-guard diff --baseline last-known` |
 | WAL-safe backup | `hermes-update-guard backup` |
+| Back up to a mounted disk | `hermes-update-guard backup --backup-root "<mount>/hermes-guard"` |
+| Leave credentials out | add `--no-secrets` (the manifest says partial) |
+| Keep only the newest N runs | add `--keep 5` |
+| Accept a non-mount target deliberately | add `--allow-local-backup` |
+| Allow a rewind/divergence | add `--allow-lineage-change` (the gate prints from/to first) |
 | Guarded update (all-in-one) | `hermes-update-guard update --close-desktop` |
 | Unattended update (survives a closed shell) | `hermes-update-guard update --close-desktop --detached` |
 | Watch a run live | `hermes-update-guard watch` (or `watch --no-tui` for a snapshot) |
@@ -49,6 +54,76 @@ tripwire — the whole scripted update ritual in one static binary.
 | Snapshot log signatures before an update | `hermes-update-guard snapshot-logs` |
 | Is the binary I am running current? | `hermes-update-guard self-check` |
 | Identity banner | `hermes-update-guard vibe` |
+
+## Backup roots and the mount proof
+
+`pre-update-<stamp>/` can be written to a mounted removable disk with
+`--backup-root <PATH>` or `$HERMES_GUARD_BULK_ROOT`. Everything else —
+`guard-run.json`, the log, `provider-surface/`, log signals, quarantine — stays in
+`<home>/backups`, so `watch`, `verify` and `self-check` work with the disk
+unplugged.
+
+`backup` and `update` prove the target is on a mounted, non-root volume before
+writing. A missing mount is refused (an unplugged disk must not become a directory
+on the internal SSD), and `vfat` / `exfat` / `iso9660` are always refused. Pass
+`--allow-local-backup` to choose the internal disk on purpose. `preflight` prints
+the proof and creates nothing.
+
+Each run writes `manifest.json` (files, bytes, target device/fstype, and every
+skip with a reason). `--no-secrets` excludes `.env` and `auth.json` and sets
+`secrets_included: false`, so `verify` reports the restore point as **PARTIAL**.
+
+`tmpfs`, `ramfs` and `devtmpfs` are refused as well, and `--allow-local-backup`
+does NOT waive them. An unmounted udisks volume leaves its mount point as a tmpfs
+under `/run/media/<user>`, so a proof that only asks "not the root filesystem"
+passes on that parent and the only restore point would be written to RAM. Before
+0.4.1 it was: `fstype: tmpfs, mount: true, free 3.6 GB`, exit 0.
+
+## What 0.4.1 changed in the probes
+
+- **The desktop-app probe is per platform.** `Hermes.exe` on Windows,
+  `Hermes.app/Contents/MacOS/Hermes` on macOS, `linux-unpacked/Hermes` on Linux,
+  combined so a positive match wins and an unreadable probe stays `Unknown` (fail
+  closed). `--close-desktop` therefore closes the app everywhere; before 0.4.1 it
+  was a no-op outside Windows, and the packaged rebuild overwrote a running app.
+  If `preflight` prints `not running` while the packaged app is up, the probe does
+  not match that build: stop and report it.
+- **`dup_uids` is session-scoped.** It counts a logical message stored more than
+  once inside ONE session. A fork legitimately carries the same `message_uid` in a
+  parent session and its fork, and is no longer counted (measured: 402 reported,
+  0 real). A non-zero `dup_uids` is real duplication: back up before touching it,
+  never delete sessions to clear it.
+- **A health baseline older than 6h is not an attribution.** `verify` prints
+  `pre-update baseline is <n>h old` and does not compare against it, so a verify
+  run hours later cannot blame the update for drift it never caused. Run a
+  guarded update to re-take the baseline.
+- **The venv probe reads stdout only (0.4.3).** `hermes update
+  --list-venv-holders` prints JSON on stdout; on a multi-profile host with
+  `HERMES_HOME` unset it also prints a fallback warning on stderr. The probe used
+  to merge the two and refuse a free venv with `venv state UNKNOWN (probe exit 0)`.
+  It now parses stdout only and passes `HERMES_HOME` to the child. Exporting
+  `HERMES_HOME` before a run is still good practice, not a requirement.
+- **The mount proof covers all three platforms (0.5.0).** Linux reads
+  `/proc/self/mountinfo`; macOS reads the `mount` table and refuses when an
+  unmounted `/Volumes/...` leaves the anchor on `/` (an unreadable table fails
+  closed); Windows compares volume roots, so an absent drive letter means the
+  anchor is on another volume and the target is refused. Windows drive types feed
+  the same lists: `cdrom` is unsafe, `ramdisk` is volatile, and a mounted
+  `removable` disk stays legal because that is the feature. A relative path has no
+  volume identity and is refused.
+
+## What 0.4.2 changed
+
+- **Duplicate desktop installs are reported, not guessed at.** Two installations
+  can each ship a launcher named `Hermes` — the checkout app (`hermes desktop`)
+  and a distribution package such as `hermes-desktop` — so the menu shows two
+  identical icons and one may start a stale build. `preflight` now prints a
+  `[desktop launchers]` section listing every entry that claims Hermes with its
+  scope (`user`/`system`), `Exec` and visibility, and warns when more than one is
+  visible. XDG shadowing and `Hidden=true` / `NoDisplay=true` are honoured, so a
+  user override that hides the stale entry counts as one icon. The check is
+  read-only; remediate by hiding the stale entry or removing the package that
+  owns it, never by skipping the update.
 
 ## Procedure
 
@@ -93,6 +168,10 @@ local build). If it is not installed:
 
 ## Decision rules
 
+- `preflight` → `lineage` (and `update`'s own lineage gate): a release that is an
+  ANCESTOR of HEAD (a rewind) or has DIVERGED blocks the update. A clean
+  fast-forward proceeds. `--allow-lineage-change` is the deliberate override; it
+  prints the from/to `git describe`, the tag and the commit counts both ways.
 - `preflight` reports `dirty: N file(s)` → those files will be stashed by the
   updater. `verify` afterwards proves they came back: a clean tree **with** stash
   entries still present is a FAIL (the patched file was parked, not restored).
@@ -276,6 +355,28 @@ Nothing above is about changing the binary. Load:
 | Reading a finished run: measured timings, where the minutes go, the gateway churn, a stale version label | `references/run-forensics.md` |
 | The pop-up window (`dashboard/`, separate Tauri crate, excluded from packaging) | the `tauri-desktop-app` skill |
 
+## When the host also has an agent-aware desktop (Omarchy)
+
+A desktop that integrates Hermes is a second way to update it. Measured on the mcpvot seat, 2026-11-07:
+
+- **Omarchy does not run its own updater.** Migration `1790017600.sh` retired the mise-built wrapper
+  with the note *"Hermes now updates itself"*, and `omarchy-default-agent` is `hermes`. The second path
+  is therefore Hermes' own passive checker and the Desktop's Update button, not an Omarchy timer.
+  Verified: no user timer, cron entry or script on that seat invokes `hermes update`.
+- **Disable the passive prompt where the guard owns updates.** `hermes config set updates.check false`
+  in the root home *and* in every profile: the one-click unguarded path is then not offered, and
+  `hermes update --check` still answers, which is the availability reading the operator and the guard
+  use.
+- **Keep a backup on the hand-run path.** Set `updates.pre_update_backup: quick` in every home too: one
+  seat here had `false`, so a hand-run update would have taken no backup at all before the guard's
+  backup existed.
+- **Two Hermes installs on one host is a different problem.** A packaged `hermes-desktop` next to the
+  checkout gives two launchers and one stale app; hide the stale launcher, and never let the packaged
+  app's update path own the checkout the guard verifies.
+- Own the decision in writing: on a guarded seat, `hermes update` runs only through
+  `hermes-update-guard update`. The desktop button, a typed command and any vendor nudge are the same
+  unguarded path under three names.
+
 ## Manual restore (emergency)
 
 ```bash
@@ -289,6 +390,18 @@ stopping the gateway (`hermes gateway stop`) and closing Hermes.
 ## Verification
 
 - `hermes-update-guard verify` exits `0` and reports DB integrity `ok` with no
-  drift versus the pre-update export.
+  drift vs the approved baseline, and names the snapshot age for the log-signature section.
+- Since 0.7.0 it also READS the restore point instead of trusting its manifest: every snapshot the
+  manifest lists is opened read-only and `pragma integrity_check`-ed (message count printed, or
+  `unknown` when the table is absent), and when secrets were included `.env` and `auth.json` must exist
+  and be non-empty for each profile. A manifest that says COMPLETE over a truncated snapshot or a
+  missing secret now fails the verdict, which is the only moment that matters: a restore is read once.
+- Since 0.6.0 it also prints two readings that used to be invisible: the
+  `.hermes-update*` markers left in the home (split into held by a LIVE run and
+  left behind by a dead one, with `quarantine --apply` as the way out) and the
+  gateway's served/parked profile map. Neither is a failure: a parked profile is
+  served by nobody and the gateway records why, and a marker held by a live pid
+  means an update really is in flight. A PASS with a parked profile is still a
+  fleet with a member down, so read the line before quoting the verdict.
 - Exit codes: `0` ok · `1` drift found, backup incomplete, verify failure, or any
   runtime error · `2` CLI usage error (bad flags/arguments).

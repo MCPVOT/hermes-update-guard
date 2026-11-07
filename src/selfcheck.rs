@@ -66,7 +66,7 @@ fn read_repo_version(repo: &Path) -> Option<String> {
 }
 
 /// Run the self-check. Exits 1 when something needs attention.
-pub fn run(home: &Path, repo: Option<&Path>) -> Result<()> {
+pub fn run(home: &Path, repo: Option<&Path>, bulk_root: &Path) -> Result<()> {
     println!("== GUARD SELF-CHECK ==");
     let mut problems = false;
 
@@ -243,7 +243,7 @@ pub fn run(home: &Path, repo: Option<&Path>) -> Result<()> {
         fleet.join(", "),
         fleet.len()
     );
-    let missing = env::profiles_gone_since_backup(home, &crate::retire::retired(home));
+    let missing = env::profiles_gone_since_backup(home, &crate::retire::retired(home), bulk_root);
     if !missing.is_empty() {
         println!(
             "  ! profile(s) present in an earlier backup but ABSENT now: {} - deleted, or never restored (recover from backups/pre-update-*)",

@@ -1,10 +1,11 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+use crate::config::Config;
 use crate::env;
 
 /// Read-only preflight: surface every condition that decides an update.
-pub fn run(home: &Path) -> Result<()> {
+pub fn run(home: &Path, cfg: &Config) -> Result<()> {
     crate::vibe::print_compact(env!("CARGO_PKG_VERSION"));
     println!("== HERMES UPDATE PREFLIGHT ==");
     println!("home: {}", home.display());
@@ -17,6 +18,51 @@ pub fn run(home: &Path) -> Result<()> {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "(unknown path)".into())
     );
+
+    // ---- backup target ------------------------------------------------------
+    // Printed, never created: preflight stays read-only even when the proof
+    // fails. The commands that would write refuse for the same reason.
+    println!("\n[backup target]");
+    println!("  control: {}", cfg.control_root.display());
+    println!(
+        "  bulk   : {}{}",
+        cfg.bulk_root.display(),
+        if cfg.bulk_is_control() {
+            " (default control root - no mount proof required)"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "  content: {}  secrets: {}  keep: {}",
+        if cfg.content.is_empty() {
+            "(none)".to_string()
+        } else {
+            cfg.content.join(",")
+        },
+        if cfg.no_secrets {
+            "EXCLUDED (--no-secrets)"
+        } else {
+            "included"
+        },
+        if cfg.keep == 0 {
+            "all".to_string()
+        } else {
+            cfg.keep.to_string()
+        }
+    );
+    match env::prove_backup_target(&cfg.bulk_root, &cfg.control_root, cfg.allow_local_backup) {
+        Ok(proof) => {
+            proof.print();
+            if cfg.allow_local_backup && !proof.is_mountpoint {
+                println!("  note   : --allow-local-backup accepted a non-mount target");
+            }
+        }
+        Err(e) => {
+            println!("  REFUSED: {e}");
+            println!("  backup/update would refuse this target; preflight wrote nothing");
+        }
+    }
 
     // version + update-channel state
     let hermes = env::venv_hermes(home);
@@ -49,6 +95,7 @@ pub fn run(home: &Path) -> Result<()> {
         .and_then(|rest| rest.split(')').next())
         .map(|s| s.trim().to_string())
         .filter(|s| s.len() >= 7);
+    let target_tag = crate::lineage::parse_target_tag(&cout);
     match target {
         Some(t) => println!("  TARGET : {}", t),
         None => {
@@ -145,6 +192,12 @@ pub fn run(home: &Path) -> Result<()> {
         }
         println!("  behind   : {}", behind);
         println!("  stashes  : {}", stashes.lines().count());
+        // Read-only lineage report: no fetch is run here, so a tag that has not
+        // been fetched locally is reported as such instead of guessed at.
+        println!(
+            "  lineage  : {}",
+            lineage_line(&repo, target_tag.as_deref())
+        );
         let dirty_lines: Vec<&str> = dirty.lines().collect();
         if dirty_lines.is_empty() {
             println!("  dirty    : (clean)");
@@ -230,8 +283,10 @@ pub fn run(home: &Path) -> Result<()> {
     println!("\n[update receipts]");
     report_stale_receipts(home);
 
-    // desktop app running (a blocker for the update phase) — fail closed
-    match env::process_state("Hermes.exe") {
+    // Desktop app is running (a blocker for the update). Probe every name the
+    // app can have on this platform: the old hard-coded `.exe` answered
+    // "absent" on a Linux host where the packaged app was running.
+    match env::desktop_app_state() {
         env::ProcState::Running => {
             println!("\n[desktop app] RUNNING — update phase needs it closed")
         }
@@ -241,6 +296,11 @@ pub fn run(home: &Path) -> Result<()> {
             why
         ),
     }
+
+    // A second installation leaves a second launcher, usually with the same
+    // `Name=Hermes`; the menu then shows two icons and one starts a stale build.
+    println!("\n[desktop launchers]");
+    report_desktop_launchers();
 
     // provider drift status (read-only)
     println!("\n[provider surface drift]");
@@ -307,6 +367,28 @@ pub fn run(home: &Path) -> Result<()> {
     }
     println!("\nPREFLIGHT DONE — see flags above.");
     Ok(())
+}
+
+/// Human-readable lineage verdict for the read-only preflight.
+fn lineage_line(repo: &Path, tag: Option<&str>) -> String {
+    use crate::lineage::Lineage;
+    let Some(tag) = tag else {
+        return "no release tag named by `hermes update --check`".to_string();
+    };
+    match crate::lineage::classify(repo, tag) {
+        Ok(Lineage::TagMissing) => "release tag not fetched locally: run preflight after `git fetch --tags` or let update test it".to_string(),
+        Ok(Lineage::UpToDate { .. }) => format!("HEAD is already at {tag}"),
+        Ok(Lineage::FastForward { add, drop }) => {
+            format!("fast-forward to {tag} (+{add} commit(s), {drop} dropped)")
+        }
+        Ok(Lineage::Rewind { add, drop }) => format!(
+            "! {tag} is an ANCESTOR of HEAD: the update would REWIND ({add} added, {drop} dropped); it will BLOCK unless --allow-lineage-change"
+        ),
+        Ok(Lineage::Divergent { add, drop }) => format!(
+            "! {tag} has DIVERGED from HEAD ({add} added, {drop} dropped); the update will BLOCK unless --allow-lineage-change"
+        ),
+        Err(e) => format!("cannot classify: {e}"),
+    }
 }
 
 /// How far a DETACHED install is from the commit the update would install.
@@ -457,4 +539,32 @@ fn drift_summary(home: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Report every launcher that claims Hermes and warn when more than one is
+/// visible. Read-only: it never edits or removes an entry.
+fn report_desktop_launchers() {
+    let launchers = env::desktop_launchers();
+    if launchers.is_empty() {
+        println!("  none found");
+        return;
+    }
+    for l in &launchers {
+        println!(
+            "  {:<7} {:<6} {}  (Exec={})",
+            if l.visible { "visible" } else { "hidden" },
+            l.scope,
+            l.path.display(),
+            l.exec
+        );
+    }
+    let visible = launchers.iter().filter(|l| l.visible).count();
+    if visible > 1 {
+        println!(
+            "  ! {visible} visible entries claim Hermes Desktop - the launcher shows {visible} icons and one may start a stale install"
+        );
+        println!(
+            "  ! keep one install: hide the stale entry (Hidden=true in ~/.local/share/applications) or remove the package that owns it"
+        );
+    }
 }

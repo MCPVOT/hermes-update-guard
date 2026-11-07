@@ -65,6 +65,7 @@ watched live without the viewer being able to touch it:
 - [Install](#install)
 - [Commands](#commands)
 - [Quick start](#quick-start)
+- [External backup target](#external-backup-target)
 - [Provider-surface tripwire](#provider-surface-tripwire)
 - [Exit codes](#exit-codes)
 - [Safety guarantees](#safety-guarantees)
@@ -124,7 +125,7 @@ cargo build --release         # or run target/release/hermes-update-guard
 | `preflight` | Read-only state check: version, git HEAD/behind/dirty/stashes, venv holders, **unfinished update receipts**, stale locks, desktop app running, provider drift summary, gateway state | none (read-only) |
 | `export` | Snapshot each profile's provider surface into `backups/provider-surface/<stamp>/` and advance `last-known`. It does **not** move `golden.json` — that is the approved reference `bless` moves | none (read-only on live config) |
 | `diff` | Compare the live surface against **golden** (or `--baseline last-known` / a path) | **exit 1 on any drift or unreadable baseline** |
-| `backup` | WAL-safe SQLite backup of every profile's `state.db` plus config/env/auth/gateway/content dirs into `backups/pre-update-<stamp>/`; verifies integrity + message counts | **refuses on incomplete backup** |
+| `backup` | WAL-safe SQLite backup of every profile's `state.db` plus config/env/auth/gateway/content dirs into `pre-update-<stamp>/` on the bulk root (default `backups/`); verifies integrity + message counts and writes a manifest | **refuses on incomplete backup, or a target that is not a provable mount** |
 | `update` | Full guarded update: preflight gate → export → backup → `hermes update --yes` → verify. Add `--detached` to run it in its own process group so a closed terminal or a caller timeout cannot kill the build | refuses while a venv is held (or its state is unknown) or the desktop app is running (add `--close-desktop`) |
 | `verify` | Post-update: HEAD advanced, DB integrity, **local-patch restoration**, drift-vs-export, gateway pid/state | **exit 1 on any failed or unperformable check** |
 | `watch` | Live, read-only view of a run: stage rail, per-profile backup matrix, blockers, log tail (`--no-tui` for a one-shot snapshot) | none (read-only) |
@@ -137,6 +138,19 @@ cargo build --release         # or run target/release/hermes-update-guard
 | `retire <profile>` | Record that a profile is **gone on purpose**, so `self-check` stops flagging it as missing (`--undo` restores the flag). Refuses if the profile still exists on disk | none |
 | `self-check` | Is the binary you are running the one you think? PATH resolution, stale clones, repo vs installed build, the fleet, **profiles that vanished since an earlier backup**, context health | `exit 1` when something needs attention |
 | `vibe` | Print the MCPVOT identity banner | none |
+
+### Backup and lineage flags (global)
+
+These are available on every subcommand; they are resolved once, before dispatch.
+
+| Flag | Effect |
+|---|---|
+| `--backup-root <PATH>` | Write `pre-update-<stamp>/` to `PATH`. Precedence: this flag, then `$HERMES_GUARD_BULK_ROOT`, then `<home>/backups`. The guard's own state (run file, log, provider-surface, log signals, quarantine) never moves. |
+| `--no-secrets` | Leave `.env` and `auth.json` out. The manifest records `secrets_included: false`, and `verify` prints `restore point is PARTIAL`. |
+| `--content <LIST>` | Comma-separated subset of `memories,skills,scripts,cron` (default: all four). |
+| `--keep <N>` | After a verified backup, keep only the newest N runs on the bulk root. `0` (default) keeps everything. The run just written is never removed, and nothing is pruned when the target fails its mount proof. |
+| `--allow-local-backup` | Accept a target that is not a mount point (deliberate internal-disk use). `vfat` / `exfat` / `iso9660` are still refused. |
+| `--allow-lineage-change` | Proceed when the selected release would rewind or diverge from HEAD. The gate prints what it is switching from and to. |
 
 ## Quick start
 
@@ -163,6 +177,115 @@ hermes-update-guard verify
 `update` runs the whole pipeline in one shot, so steps 2–6 can be collapsed into
 a single `hermes-update-guard update --close-desktop`. The individual subcommands
 exist so you can inspect or stop at any stage.
+
+## External backup target
+
+A restore point can live on a mounted removable disk instead of the internal SSD:
+
+```bash
+hermes-update-guard backup \
+  --dry-run \
+  --backup-root "/run/media/tango/New Volume/mcpvot-backup/hermes-guard" \
+  --no-secrets --keep 5
+```
+
+Or set `HERMES_GUARD_BULK_ROOT` once for every command. `preflight` never writes:
+it prints the target proof (path, device, fstype, mount status, free space) and
+stops there.
+
+### Two roots
+
+- **Control root — always local, never configurable:** `<home>/backups` holds
+  `guard-run.json`, `guard-update.log`, `provider-surface/`, `guard-logsignals.json`
+  and `quarantine/`. `watch`, `verify`, `self-check` and the drift baseline read
+  these, and they must survive the disk being unplugged — which is exactly when a
+  post-update verify matters.
+- **Bulk root — configurable:** only `pre-update-<stamp>/` directories. That is
+  the 200 MB-class payload, and moving it off the internal SSD frees the space a
+  backup would otherwise need there.
+
+### The mount-proof rule
+
+Before writing a byte, `backup` and `update` prove that the bulk root is on a
+mounted volume that is not the root filesystem. An unplugged disk otherwise
+becomes an ordinary empty directory on the internal SSD, the backup "succeeds",
+and the restore point is on the disk that was about to be replaced. The refusal is:
+
+```text
+refusing to use /path/to/target as a backup target: it is not a mount point. An unplugged disk must not turn into a directory on the root filesystem. Mount the disk, or pass --allow-local-backup to accept the internal disk.
+```
+
+Filesystem types that cannot preserve permissions are refused by type, so a boot
+or installer partition can never be chosen:
+
+```text
+refusing /run/media/tango/ESD-USB: vfat cannot preserve permissions and is usually a boot or installer partition
+```
+
+`--backup-root` equal to the control root is legal (that is the default) and does
+not require a proof. `--allow-local-backup` accepts a non-mount target on purpose,
+but never waives the filesystem-type refusal.
+
+### What a run records
+
+Each run writes `manifest.json`:
+
+```json
+{
+  "guard_version": "0.4.0",
+  "created": "2026-11-04T18:12:30+00:00",
+  "secrets_included": false,
+  "profiles": ["default", "trilogy-brain"],
+  "files": 1234,
+  "bytes": 76543210,
+  "target": { "path": "...", "device": "/dev/sda2", "fstype": "ntfs3",
+              "is_mountpoint": true, "free_bytes": 336000000000 },
+  "skipped": [
+    { "path": "trilogy-brain/skills/.hub", "reason": "dot-cache" },
+    { "path": "trilogy-brain/skills/omarchy", "reason": "symlink" },
+    { "path": "default/.env", "reason": "secret" }
+  ]
+}
+```
+
+`verify` reads it and says `restore point is PARTIAL: .env and auth.json were
+excluded (--no-secrets)` rather than implying completeness. A run with no
+manifest is reported as `no manifest (pre-0.4.0 run)`.
+
+### Secrets policy
+
+`.env` and `auth.json` are copied byte-for-byte by default (into a directory that
+inherits the Hermes home's access controls) and are never printed, read or
+modified. `--no-secrets` leaves them out entirely; only their names and sizes are
+ever mentioned.
+
+## Platform support and per-seat variables
+
+The gates are not identical on every OS. This is what the code does today.
+
+| Gate | Linux | macOS | Windows |
+|---|---|---|---|
+| desktop-app probe | `linux-unpacked/Hermes` via `pgrep -f` | `Hermes.app/Contents/MacOS/Hermes` via `pgrep -f` | `Hermes.exe` via `tasklist` |
+| close the app | matches are signalled, graceful then forced | same | `taskkill` |
+| backup target mount proof | real: `/proc/self/mountinfo`, refuses a non-mount point and a volatile filesystem | real: the `mount` table; an unmounted `/Volumes/...` leaves the anchor on `/` and is refused, an unreadable table fails closed | real: the drive letter names the volume; an absent letter means the anchor sits on another volume and the target is refused. Drive type from `fsutil` maps `cdrom` and `ramdisk` to the same refusals |
+| context health, drift, lineage, log signatures | identical on all three | identical | identical |
+
+Consequence: since 0.5.0 all three platforms prove the target. The Windows proof rests on the drive
+letter and the drive type from `fsutil`; on a Windows whose `fsutil` output is localised the type reads
+`unknown` and only the volume identity protects you, which is still enough to catch an absent drive.
+macOS reads `mount`; if that cannot be parsed the proof refuses rather than passing.
+
+Variables that change behaviour per seat:
+
+| Variable | Effect | Safe value |
+|---|---|---|
+| `HERMES_HOME` | which profile tree the guard reads; since 0.4.3 it is also passed to the `--list-venv-holders` child | the real home (`~/.hermes`), exported on any multi-profile host |
+| `HERMES_GUARD_BULK_ROOT` | backup target when `--backup-root` is absent | unset unless that volume is really mounted |
+| `TMPDIR` | tests only: a tmpfs temp dir exercises the volatile refusal; the suite gives the same verdict either way since 0.4.3 | any |
+
+Install from the release artifact for the seat's OS where one exists, otherwise build from source, and
+run `self-check --repo <clone>` afterwards: it compares the installed binary against the checkout and
+names a binary that predates it.
 
 ## Provider-surface tripwire
 
@@ -213,8 +336,12 @@ are printed so you can tell a genuine in-flight update from an abandoned one.
 ## Safety guarantees
 
 - **No secret leakage** — the tool never prints `.env` / `auth.json` contents.
-  They are copied byte-for-byte into `backups/` (which inherits the Hermes home's
-  own access controls) and never modified in place.
+  They are copied byte-for-byte into the backup directory (which inherits the
+  Hermes home's own access controls), never modified in place, and `--no-secrets`
+  leaves them out altogether while the manifest records that it did.
+- **No silent backup target** — a removable target must pass a mount proof before
+  anything is written, and a filesystem that cannot carry Unix permissions is
+  refused by type.
 - **No live writes** — every subcommand is read-only against live state except
   through the official `hermes update` CLI.
 - **No phone-home** — the binary makes no network calls of its own.
@@ -233,10 +360,12 @@ Full policy and how to report a vulnerability: [SECURITY.md](SECURITY.md).
 ```
 src/
   main.rs      CLI (clap)
-  env.rs       home/profile discovery, OS probes, command runner
+  config.rs    two roots + backup/content flags, resolved once
+  env.rs       home/profile discovery, mount proof, OS probes, command runner
   drift.rs     provider surface: extract / export / diff
-  backup.rs    WAL-safe DB backup + completeness gate
-  guard.rs     full update orchestration
+  backup.rs    WAL-safe DB backup, manifest, retention, completeness gate
+  guard.rs     full update orchestration + lineage gate
+  lineage.rs   fast-forward / rewind / divergence verdicts
   verify.rs    post-update verification
   preflight.rs read-only state check
   vibe.rs      MCPVOT identity banner
