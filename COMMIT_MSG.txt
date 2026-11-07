@@ -1,0 +1,15 @@
+fix: 0.4.3 - report the markers the update actually leaves, name the stash, catch a stale gateway_state
+
+Three leftovers from the v0.22.7 -> v0.23.0 guarded update on 2026-11-06, all visible in its own log:
+
+1. verify printed "state=stopped (pid=38876); nothing is serving" while pid 38876 was alive and serving.
+   The non-running branch now probes the pid via a pure predicate state_file_is_stale(state, pid, alive)
+   and reports the state file as stale instead of reassuring the operator their gateway is down.
+2. "1 stash entry also present (a partial restore?)" was a question the tool could answer: it printed no
+   entry. It now names every stash and the exact git command to inspect it - the case that mattered was the
+   NVIDIA catalog hunk sitting in BOTH the tree and stash@{0}.
+3. preflight and update scanned a FIXED PAIR of marker names, so .hermes-update-paused-gateways.lock - the
+   one marker the update actually left - was never reported while it sat in the home overnight. Both paths
+   now share one update_markers(home) prefix scan, matching what quarantine already did.
+
+Tests: 67 passed (was 65), both directions for each new predicate. cargo fmt clean.

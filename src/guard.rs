@@ -137,11 +137,10 @@ fn run_stages(
             }
         }
 
-        for m in [
-            ".hermes-update-in-progress",
-            ".hermes-update-in-progress.lock",
-        ] {
-            if home.join(m).exists() {
+        // Same prefix scan as preflight (2026-11-06): a fixed pair missed
+        // `.hermes-update-paused-gateways.lock`, which the update left behind.
+        for m in crate::preflight::update_markers(home) {
+            if home.join(&m).exists() {
                 // A leftover marker is a warning, not a refusal: hermes quarantines
                 // these itself, and blocking on them strands an install forever.
                 println!(

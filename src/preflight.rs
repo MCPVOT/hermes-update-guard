@@ -186,11 +186,8 @@ pub fn run(home: &Path) -> Result<()> {
     // stale locks / interrupted-update markers
     println!("\n[locks / interrupted markers]");
     let mut found = false;
-    for marker in [
-        ".hermes-update-in-progress",
-        ".hermes-update-in-progress.lock",
-    ] {
-        let p = home.join(marker);
+    for marker in update_markers(home) {
+        let p = home.join(&marker);
         if p.exists() {
             // Not a blocker, and saying "!" made it look like one: the updater
             // quarantines these itself and the guarded update only WARNS. Say what
@@ -457,4 +454,57 @@ fn drift_summary(home: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Every update-state marker in the home, whatever its exact name.
+///
+/// WHY A SCAN AND NOT A PAIR (measured 2026-11-06, 0.3.9, during the v0.22.7 -> v0.23.0 update): that run left
+/// `.hermes-update-paused-gateways.lock` in the home, and this path named exactly two variants
+/// (`.hermes-update-in-progress`, `.hermes-update-in-progress.lock`). The one file that was actually present
+/// was invisible to preflight while it sat there, and the operator had to find it by hand. `quarantine`
+/// already scans by prefix for this reason; the reporting paths now agree with it, so a marker introduced by
+/// a future Hermes version is reported the first time it appears rather than never.
+pub(crate) fn update_markers(home: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(home)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(".hermes-update"))
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+#[cfg(test)]
+mod marker_scan_tests {
+    use super::update_markers;
+
+    /// Positive control: the marker actually left behind on 2026-11-06 is found.
+    /// Negative control: an unrelated dotfile is not - a scan that reports everything is not a report.
+    #[test]
+    fn finds_the_leftover_and_ignores_neighbours() {
+        let d = std::env::temp_dir().join(format!("hug-markers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(".hermes-update-paused-gateways.lock"), "").unwrap();
+        std::fs::write(d.join(".hermes-update-in-progress.lock"), "").unwrap();
+        std::fs::write(d.join(".env"), "X=1\n").unwrap();
+        let found = update_markers(&d);
+        assert!(
+            found.contains(&".hermes-update-paused-gateways.lock".to_string()),
+            "{found:?}"
+        );
+        assert!(
+            found.contains(&".hermes-update-in-progress.lock".to_string()),
+            "{found:?}"
+        );
+        assert!(
+            !found.iter().any(|n| n == ".env"),
+            "unrelated dotfile reported: {found:?}"
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
