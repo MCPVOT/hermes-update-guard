@@ -212,6 +212,16 @@ pub fn run(home: &Path) -> Result<()> {
                             failures.push(format!("gateway pid {} liveness unverifiable", pid));
                         }
                     }
+                } else if state_file_is_stale(st, pid, &env::pid_running(pid)) {
+                    // MEASURED 2026-11-06 (0.3.9, the v0.22.7 -> v0.23.0 update): the state file said
+                    // state=stopped for pid 38876 while that very pid was alive and serving. The old line
+                    // then printed "nothing is serving - not a failure if you stopped it deliberately",
+                    // which is a reassurance built on a stale file and reads as "your gateway is down" to
+                    // anyone who believes it. A state file is a CLAIM; the pid is the measurement.
+                    println!(
+                        "  ! gateway_state.json says state={} (pid={}), but that pid is ALIVE - the state file is stale, the gateway is up",
+                        st, pid
+                    );
                 } else {
                     println!(
                         "  ! gateway is recorded as state={} (pid={}); nothing is serving - not a failure if you stopped it deliberately",
@@ -399,9 +409,21 @@ fn check_patch_restored(home: &Path, repo: &Path, failures: &mut Vec<String>) {
         }
         if !stashes.is_empty() {
             println!(
-                "  !    {} stash entr{} also present (a partial restore?)",
+                "  !    {} stash entr{} also present (a partial restore?) - READ these before answering:",
                 stashes.len(),
                 if stashes.len() == 1 { "y" } else { "ies" }
+            );
+            // "a partial restore?" is a question this tool can answer for itself: the stash LIST already
+            // names every entry. Measured 2026-11-06: the run left the NVIDIA catalog patch modified in the
+            // tree AND the same hunk in stash@{0} from an earlier update, and the operator had to go dig to
+            // find out which patch was in which place. Print the entries, and say where they should be
+            // re-applied from when the tree already carries the pinned file.
+            for s in &stashes {
+                println!("       {}", s);
+            }
+            println!(
+                "       the working tree above already carries the pinned patch, so a stash of the same hunk is a leftover from an earlier update - inspect it with `git stash show -p stash@{{{}}}` and drop it only after confirming the tree has the change",
+                stashes.len() - 1
             );
         }
         return;
@@ -650,5 +672,38 @@ mod tests {
     #[test]
     fn expected_patched_files_empty_without_backups() {
         assert!(expected_patched_files(Path::new("C:/definitely-not-here-xyz")).is_empty());
+    }
+}
+
+/// Is the gateway state file contradicting a live process?
+///
+/// MEASURED 2026-11-06 (0.3.9, v0.22.7 -> v0.23.0): the state file read `state=stopped` for pid 38876 while
+/// that pid was alive and serving, and the old code printed "nothing is serving - not a failure if you
+/// stopped it deliberately". That reassurance is built on a file and it tells an operator their gateway is
+/// down when it is not. A state file is a CLAIM; the pid is the measurement.
+///
+/// Pure, so both directions are testable without a live gateway on the box.
+pub(crate) fn state_file_is_stale(state: &str, pid: u32, alive: &env::ProcState) -> bool {
+    pid > 0 && state != "running" && matches!(alive, env::ProcState::Running)
+}
+
+#[cfg(test)]
+mod gateway_state_tests {
+    use super::state_file_is_stale;
+    use crate::env::ProcState;
+
+    #[test]
+    fn stale_file_is_caught_when_the_pid_lives() {
+        // the exact shape measured on 2026-11-06: the file says stopped, the pid is alive
+        assert!(state_file_is_stale("stopped", 38876, &ProcState::Running));
+        assert!(state_file_is_stale("", 38876, &ProcState::Running));
+    }
+
+    #[test]
+    fn it_does_not_fire_when_the_gateway_really_is_down() {
+        // negative controls: a dead pid, no pid, and the branch that already handles running
+        assert!(!state_file_is_stale("stopped", 38876, &ProcState::Absent));
+        assert!(!state_file_is_stale("stopped", 0, &ProcState::Running));
+        assert!(!state_file_is_stale("running", 38876, &ProcState::Running));
     }
 }
