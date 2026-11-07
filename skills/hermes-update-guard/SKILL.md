@@ -355,6 +355,28 @@ Nothing above is about changing the binary. Load:
 | Reading a finished run: measured timings, where the minutes go, the gateway churn, a stale version label | `references/run-forensics.md` |
 | The pop-up window (`dashboard/`, separate Tauri crate, excluded from packaging) | the `tauri-desktop-app` skill |
 
+## When the host also has an agent-aware desktop (Omarchy)
+
+A desktop that integrates Hermes is a second way to update it. Measured on the mcpvot seat, 2026-11-07:
+
+- **Omarchy does not run its own updater.** Migration `1790017600.sh` retired the mise-built wrapper
+  with the note *"Hermes now updates itself"*, and `omarchy-default-agent` is `hermes`. The second path
+  is therefore Hermes' own passive checker and the Desktop's Update button, not an Omarchy timer.
+  Verified: no user timer, cron entry or script on that seat invokes `hermes update`.
+- **Disable the passive prompt where the guard owns updates.** `hermes config set updates.check false`
+  in the root home *and* in every profile: the one-click unguarded path is then not offered, and
+  `hermes update --check` still answers, which is the availability reading the operator and the guard
+  use.
+- **Keep a backup on the hand-run path.** Set `updates.pre_update_backup: quick` in every home too: one
+  seat here had `false`, so a hand-run update would have taken no backup at all before the guard's
+  backup existed.
+- **Two Hermes installs on one host is a different problem.** A packaged `hermes-desktop` next to the
+  checkout gives two launchers and one stale app; hide the stale launcher, and never let the packaged
+  app's update path own the checkout the guard verifies.
+- Own the decision in writing: on a guarded seat, `hermes update` runs only through
+  `hermes-update-guard update`. The desktop button, a typed command and any vendor nudge are the same
+  unguarded path under three names.
+
 ## Manual restore (emergency)
 
 ```bash
