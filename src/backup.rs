@@ -745,6 +745,12 @@ mod tests {
 
     /// The two roots are genuinely separate: run state stays local while the
     /// pre-update payload goes to the configured bulk root.
+    ///
+    /// A runner whose temp dir is tmpfs (Linux `/tmp`) cannot host a bulk root at
+    /// all, because the volatile-filesystem refusal is unconditional. Assert THAT
+    /// there instead of skipping, and assert the retention behaviour where a
+    /// backup can actually be written, so the test never depends on the machine's
+    /// TEMP filesystem.
     #[test]
     fn bulk_root_receives_only_pre_update_runs() {
         let h = home("roots");
@@ -753,6 +759,17 @@ mod tests {
         let mut c = cfg(&h);
         c.bulk_root = external.clone();
         c.allow_local_backup = true; // the temp dir is not a real mount
+
+        if env::target_is_volatile(&external) {
+            let err = format!("{:#}", run(&h, false, &c).unwrap_err());
+            assert!(
+                err.contains("RAM-backed"),
+                "a volatile bulk root must be refused with the RAM reason, got: {err}"
+            );
+            let _ = fs::remove_dir_all(&h);
+            return;
+        }
+
         let dir = run(&h, false, &c).unwrap();
         assert!(dir.starts_with(&external));
         assert!(!h.join("backups").join(dir.file_name().unwrap()).exists());

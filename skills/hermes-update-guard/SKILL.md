@@ -1,7 +1,7 @@
 ---
 name: hermes-update-guard
 description: Use when running or verifying a `hermes update`: guards it with preflight, a WAL-safe backup on a mount-proven target, a provider-drift tripwire and post-verify.
-version: 0.4.1
+version: 0.4.3
 author: MCPVOT
 license: MIT
 platforms: [macos, linux, windows]
@@ -97,6 +97,12 @@ passes on that parent and the only restore point would be written to RAM. Before
   `pre-update baseline is <n>h old` and does not compare against it, so a verify
   run hours later cannot blame the update for drift it never caused. Run a
   guarded update to re-take the baseline.
+- **The venv probe reads stdout only (0.4.3).** `hermes update
+  --list-venv-holders` prints JSON on stdout; on a multi-profile host with
+  `HERMES_HOME` unset it also prints a fallback warning on stderr. The probe used
+  to merge the two and refuse a free venv with `venv state UNKNOWN (probe exit 0)`.
+  It now parses stdout only and passes `HERMES_HOME` to the child. Exporting
+  `HERMES_HOME` before a run is still good practice, not a requirement.
 
 ## What 0.4.2 changed
 

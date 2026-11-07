@@ -277,6 +277,31 @@ pub fn prove_target_with(p: &Path, allow_local: bool) -> Result<TargetProof> {
     finish_proof(p, allow_local, is_mountpoint, device, fstype, &anchor)
 }
 
+/// True when the nearest existing directory of `p` sits on a volatile filesystem.
+///
+/// The same fact `reject_unsafe_fstype` refuses on, exposed so callers (and tests)
+/// can ask "could a restore point live here at all" without attempting a write.
+/// Today the caller is the backup test, which must not change verdict with the
+/// runner's TEMP filesystem; `reject_unsafe_fstype` stays the production refusal.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn target_is_volatile(p: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let anchor = nearest_existing(p);
+        let canonical = anchor.canonicalize().unwrap_or_else(|_| anchor.clone());
+        let fstype = match std::fs::read_to_string("/proc/self/mountinfo") {
+            Ok(text) => facts_from_entries(&parse_mountinfo(&text), &canonical).2,
+            Err(_) => fallback_mount_facts(&canonical).2,
+        };
+        VOLATILE_FSTYPES.contains(&fstype.to_ascii_lowercase().as_str())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = p;
+        false
+    }
+}
+
 /// Prove by consulting an explicit mount table.
 ///
 /// Split out so the refusal rules are testable without a real mount and without
@@ -666,6 +691,41 @@ pub fn run_capture(program: &Path, args: &[&str], cwd: Option<&Path>) -> Result<
     Ok((out.status.code().unwrap_or(-1), text))
 }
 
+/// Run a command and return `(exit, stdout ONLY)`.
+///
+/// Separate from [`run_capture`] because a probe whose PAYLOAD is stdout must not
+/// be poisoned by a diagnostic on stderr. Measured: `hermes update
+/// --list-venv-holders` prints `[]` on stdout and a ~626-byte
+/// `[HERMES_HOME fallback]` warning on stderr when `HERMES_HOME` is unset on a
+/// multi-profile host; merging the two made the JSON unparseable and the venv gate
+/// refuse a free venv with "venv state UNKNOWN (probe exit 0)".
+///
+/// `home` is passed to the child as `HERMES_HOME` when given, which removes the
+/// fallback warning at its source as well as tolerating it.
+pub fn run_capture_stdout(
+    program: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<(i32, String)> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    if let Some(d) = cwd {
+        cmd.current_dir(d);
+    }
+    if let Some(h) = home {
+        cmd.env("HERMES_HOME", h);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    let out = cmd
+        .output()
+        .with_context(|| format!("failed to spawn {}", program.display()))?;
+    Ok((
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    ))
+}
+
 /// Collect every process holding the hermes venv, via hermes' own probe.
 ///
 /// `hermes update --list-venv-holders` prints
@@ -680,21 +740,30 @@ pub fn run_capture(program: &Path, args: &[&str], cwd: Option<&Path>) -> Result<
 /// exit...") instead of the JSON list, so the third flag lets callers say
 /// "venv state UNKNOWN — treat as held" rather than assuming free.
 pub fn venv_holders_probe(home: &Path) -> (Vec<String>, i32, bool) {
-    venv_holders_probe_with(resolve_hermes(home).as_deref())
+    venv_holders_probe_with(resolve_hermes(home).as_deref(), Some(home))
 }
 
 /// Testable core of [`venv_holders_probe`]: `None` means no CLI was resolvable,
 /// which must read as UNKNOWN (parsed = false), never as "venv free".
-fn venv_holders_probe_with(cli: Option<&Path>) -> (Vec<String>, i32, bool) {
+///
+/// stdout only: the payload is JSON on stdout, and a fallback warning on stderr
+/// used to merge into it and turn a free venv into UNKNOWN.
+fn venv_holders_probe_with(cli: Option<&Path>, home: Option<&Path>) -> (Vec<String>, i32, bool) {
     let Some(hermes) = cli else {
         return (vec![], -1, false);
     };
-    let Ok((code, out)) = run_capture(hermes, &["update", "--list-venv-holders"], None) else {
+    let Ok((code, out)) =
+        run_capture_stdout(hermes, &["update", "--list-venv-holders"], None, home)
+    else {
         return (vec![], -1, false);
     };
     let trimmed = out.trim();
     if trimmed.is_empty() {
-        return (vec![], code, true);
+        // No payload at all. Exit 0 is the probe's documented "venv is free";
+        // any other exit is UNKNOWN, never free. Since stderr is no longer read,
+        // an empty stdout plus a non-zero exit is the shape of a CLI that
+        // answered in prose (or has no such subcommand), and that must not pass.
+        return (vec![], code, code == 0);
     }
     match serde_json::from_str::<serde_json::Value>(trimmed) {
         Ok(serde_json::Value::Array(arr)) if arr.is_empty() => (vec![], code, true),
@@ -1459,11 +1528,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bare);
     }
 
+    /// The venv probe's payload is stdout. A diagnostic on stderr used to merge
+    /// into it and turn a free venv into UNKNOWN (measured: 626 bytes of
+    /// `[HERMES_HOME fallback]` warning beside a real `[]`). Both directions: the
+    /// stdout-only reader ignores stderr, and the merging reader still shows it.
+    #[cfg(unix)]
+    #[test]
+    fn stdout_only_capture_ignores_stderr() {
+        let (code, out) = run_capture_stdout(
+            Path::new("sh"),
+            &[
+                "-c",
+                "printf '[]'; printf '[HERMES_HOME fallback] noisy' >&2",
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "[]", "stdout is the payload, nothing else");
+
+        let (_, merged) = run_capture(
+            Path::new("sh"),
+            &["-c", "printf '[]'; printf 'noisy' >&2"],
+            None,
+        )
+        .unwrap();
+        assert!(
+            merged.contains("noisy"),
+            "the merging reader is the one that poisoned the probe"
+        );
+    }
+
     /// venv_holders_probe must report "unknown" (parsed=false) when there is no
     /// hermes CLI at all, so callers fail closed instead of assuming the venv free.
     #[test]
     fn venv_probe_unknown_without_hermes() {
-        let (holders, code, parsed) = venv_holders_probe_with(None);
+        let (holders, code, parsed) = venv_holders_probe_with(None, None);
         assert!(!parsed, "no hermes CLI must mean UNKNOWN, not free");
         assert_eq!(code, -1);
         assert!(holders.is_empty());
@@ -1474,7 +1575,7 @@ mod tests {
     #[test]
     fn venv_probe_unknown_on_prose() {
         // any CLI that prints prose instead of the documented JSON
-        let (_, code, parsed) = venv_holders_probe_with(Some(Path::new("git")));
+        let (_, code, parsed) = venv_holders_probe_with(Some(Path::new("git")), None);
         assert!(!parsed, "prose output is not the documented JSON");
         assert_ne!(code, 0, "git has no `update` subcommand");
     }

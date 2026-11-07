@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-07
+
+### Fixed
+- **A stderr diagnostic poisoned the venv probe.** `run_capture` appends stderr to stdout (it is the
+  reader for `pgrep`, `df` and version calls, where that is fine). The venv probe parses JSON from the
+  same reader, so on a multi-profile host with `HERMES_HOME` unset the checkout's `hermes` printed a
+  626-byte `[HERMES_HOME fallback]` warning to stderr, the `[]` payload no longer parsed, and the gate
+  refused a free venv with `venv state UNKNOWN (probe exit 0)`. The probe now uses
+  `run_capture_stdout` (stdout only) and passes `HERMES_HOME` to the child, so the warning is both
+  ignored and not produced.
+- **One backup test depended on the runner's temp filesystem.** `bulk_root_receives_only_pre_update_runs`
+  built a temp-dir bulk root with `allow_local_backup`, which the unconditional volatile refusal now
+  rejects when `TMPDIR` is tmpfs (Linux `/tmp`). It asserts the RAM-backed refusal there and the
+  retention behaviour where a backup can actually be written, so the test no longer changes verdict
+  with the machine it runs on. CI was green because the runners use disk-backed temp.
+
+### Added
+- `env::target_is_volatile()`: whether the nearest existing directory of a path sits on a volatile
+  filesystem, without attempting a write.
+
 ## [0.4.2] - 2026-11-06
 
 ### Fixed
