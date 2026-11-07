@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-07
+
+### Added
+- **`verify` reads the restore point instead of trusting its manifest.** The manifest is a claim about
+  what the backup contains; the files are the evidence, and the only moment anyone checks is when they
+  need to restore. `verify` now opens every snapshot the manifest lists read-only and runs
+  `pragma integrity_check` (printing the message count, or `unknown` when the table is absent), and when
+  the manifest says secrets were included it confirms `.env` and `auth.json` exist and are non-empty for
+  every profile. Either failure is a check failure with the path in the message.
+- Two directions tested: a whole restore point passes, a missing secret and an unreadable snapshot are
+  each caught.
+
+### Changed
+- The completeness line now reads `COMPLETE per its manifest`, because the manifest is what says so and
+  the following lines are the reading that can contradict it.
+
 ## [0.6.0] - 2026-11-07
 
 ### Added

@@ -140,7 +140,7 @@ pub fn run(home: &Path, cfg: &Config) -> Result<()> {
             Some(m) => {
                 if m.secrets_included {
                     println!(
-                        "  restore point is COMPLETE (secrets included): {} files, {:.1} MB",
+                        "  restore point is COMPLETE per its manifest (secrets included): {} files, {:.1} MB",
                         m.files,
                         m.bytes as f64 / 1_048_576.0
                     );
@@ -155,6 +155,11 @@ pub fn run(home: &Path, cfg: &Config) -> Result<()> {
                         m.skipped.len()
                     );
                 }
+                // The manifest is a CLAIM about the restore point. Read the point
+                // itself: a truncated snapshot or a silently skipped secret is
+                // discovered at restore time otherwise, which is the worst possible
+                // moment to find out.
+                check_restore_point(&run, &m.profiles, m.secrets_included, &mut failures);
             }
             None if run.join("manifest.json").exists() => println!(
                 "  ! manifest.json is unreadable - cannot say whether this restore point is complete"
@@ -707,6 +712,93 @@ pub fn gateway_status(home: &Path) -> Option<GatewayStatus> {
     parse_gateway_status(&std::fs::read_to_string(&gw).ok()?)
 }
 
+/// Read the restore point itself, not just its manifest.
+///
+/// Every profile the manifest lists must have a snapshot that opens and passes
+/// `pragma integrity_check`, and when the manifest claims secrets were included
+/// `.env` and `auth.json` must actually be there and non-empty. A restore point
+/// that fails here is a trap, because it is only ever read at the moment it is
+/// needed.
+fn check_restore_point(run: &Path, profiles: &[String], secrets: bool, failures: &mut Vec<String>) {
+    for p in profiles {
+        let db = run.join(p).join("state.db");
+        match restore_db_summary(&db) {
+            Ok((verdict, messages)) if verdict.eq_ignore_ascii_case("ok") => {
+                if messages >= 0 {
+                    println!("  ok   {}/state.db integrity=ok messages={}", p, messages);
+                } else {
+                    println!("  ok   {}/state.db integrity=ok messages=unknown", p);
+                }
+            }
+            Ok((verdict, _)) => {
+                println!(
+                    "  FAIL {}/state.db integrity_check says: {}",
+                    p,
+                    one_line(&verdict)
+                );
+                failures.push(format!("restore point {p}/state.db failed integrity_check"));
+            }
+            Err(e) => {
+                println!(
+                    "  FAIL {}/state.db cannot be read back: {}",
+                    p,
+                    one_line(&e.to_string())
+                );
+                failures.push(format!("restore point {p}/state.db unreadable"));
+            }
+        }
+    }
+
+    if !secrets {
+        return;
+    }
+    let mut missing: Vec<String> = Vec::new();
+    for p in profiles {
+        for f in [".env", "auth.json"] {
+            let present = std::fs::metadata(run.join(p).join(f))
+                .map(|md| md.len() > 0)
+                .unwrap_or(false);
+            if !present {
+                missing.push(format!("{}/{}", p, f));
+            }
+        }
+    }
+    if missing.is_empty() {
+        println!("  ok   secrets present for every profile the manifest lists (.env, auth.json)");
+    } else {
+        for m in &missing {
+            println!(
+                "  FAIL {} is missing or empty but the manifest says secrets were included",
+                m
+            );
+            failures.push(format!("restore point is missing {m}"));
+        }
+    }
+}
+
+/// `(integrity_check verdict, message count)` for a backed-up snapshot.
+///
+/// Read-only: verify must never touch the point it is checking. `-1` means the
+/// snapshot opened but has no `messages` table, which is reported as unknown
+/// rather than as zero.
+fn restore_db_summary(db: &Path) -> Result<(String, i64)> {
+    if !db.exists() {
+        bail!("no file at {}", db.display());
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening {}", db.display()))?;
+    let verdict: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .with_context(|| format!("integrity_check on {}", db.display()))?;
+    let messages: i64 = conn
+        .query_row("select count(*) from messages", [], |r| r.get(0))
+        .unwrap_or(-1);
+    Ok((verdict, messages))
+}
+
 /// Collapse a reason the gateway recorded into one printable line.
 fn one_line(why: &str) -> String {
     let flat: String = why
@@ -760,6 +852,51 @@ fn integrity(db: &Path) -> Result<(String, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The restore point is evidence, not a claim: the snapshot must open and pass
+    /// integrity_check, and a manifest that says "secrets included" must be true on
+    /// disk. Both directions, because a hole here is only found at restore time.
+    #[test]
+    fn restore_point_is_read_not_assumed() {
+        let dir = std::env::temp_dir().join(format!("hug-rp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prof = dir.join("ofcrm");
+        std::fs::create_dir_all(&prof).unwrap();
+        {
+            let conn = rusqlite::Connection::open(prof.join("state.db")).unwrap();
+            conn.execute_batch(
+                "create table messages (message_uid text);\
+                 insert into messages values ('a'),('b');",
+            )
+            .unwrap();
+        }
+        std::fs::write(prof.join(".env"), "KEY=1\n").unwrap();
+        std::fs::write(prof.join("auth.json"), "{}\n").unwrap();
+        let profiles = vec!["ofcrm".to_string()];
+
+        let mut failures = Vec::new();
+        check_restore_point(&dir, &profiles, true, &mut failures);
+        assert!(
+            failures.is_empty(),
+            "a whole restore point must pass: {failures:?}"
+        );
+
+        // A manifest that claims secrets while the file is gone.
+        std::fs::remove_file(prof.join(".env")).unwrap();
+        let mut failures = Vec::new();
+        check_restore_point(&dir, &profiles, true, &mut failures);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains(".env"), "{failures:?}");
+
+        // A snapshot that cannot be read back at all.
+        std::fs::write(prof.join("state.db"), b"not a database").unwrap();
+        let mut failures = Vec::new();
+        check_restore_point(&dir, &profiles, false, &mut failures);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("unreadable"), "{failures:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A multiplexed gateway records what it serves and what it parked. Both shapes
     /// must parse, including a state file that predates the field, because the old

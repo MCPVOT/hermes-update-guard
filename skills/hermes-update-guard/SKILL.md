@@ -369,6 +369,11 @@ stopping the gateway (`hermes gateway stop`) and closing Hermes.
 
 - `hermes-update-guard verify` exits `0` and reports DB integrity `ok` with no
   drift vs the approved baseline, and names the snapshot age for the log-signature section.
+- Since 0.7.0 it also READS the restore point instead of trusting its manifest: every snapshot the
+  manifest lists is opened read-only and `pragma integrity_check`-ed (message count printed, or
+  `unknown` when the table is absent), and when secrets were included `.env` and `auth.json` must exist
+  and be non-empty for each profile. A manifest that says COMPLETE over a truncated snapshot or a
+  missing secret now fails the verdict, which is the only moment that matters: a restore is read once.
 - Since 0.6.0 it also prints two readings that used to be invisible: the
   `.hermes-update*` markers left in the home (split into held by a LIVE run and
   left behind by a dead one, with `quarantine --apply` as the way out) and the
