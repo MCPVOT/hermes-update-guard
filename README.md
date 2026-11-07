@@ -259,6 +259,34 @@ inherits the Hermes home's access controls) and are never printed, read or
 modified. `--no-secrets` leaves them out entirely; only their names and sizes are
 ever mentioned.
 
+## Platform support and per-seat variables
+
+The gates are not identical on every OS. This is what the code does today.
+
+| Gate | Linux | macOS | Windows |
+|---|---|---|---|
+| desktop-app probe | `linux-unpacked/Hermes` via `pgrep -f` | `Hermes.app/Contents/MacOS/Hermes` via `pgrep -f` | `Hermes.exe` via `tasklist` |
+| close the app | matches are signalled, graceful then forced | same | `taskkill` |
+| backup target mount proof | real: `/proc/self/mountinfo`, refuses a non-mount point and a volatile filesystem | **no proof**: the non-Linux path reports `is_mountpoint: true`, `fstype: unknown` | **no proof**, same |
+| context health, drift, lineage, log signatures | identical on all three | identical | identical |
+
+Consequence: on macOS and Windows a `--backup-root` pointing at a removable drive is taken on the
+operator's word, and an unplugged path is not caught. Use the default control root
+(`<home>/backups`) there, and treat an external target as Linux-only until the proof lands for the
+other two platforms.
+
+Variables that change behaviour per seat:
+
+| Variable | Effect | Safe value |
+|---|---|---|
+| `HERMES_HOME` | which profile tree the guard reads; since 0.4.3 it is also passed to the `--list-venv-holders` child | the real home (`~/.hermes`), exported on any multi-profile host |
+| `HERMES_GUARD_BULK_ROOT` | backup target when `--backup-root` is absent | unset unless that volume is really mounted |
+| `TMPDIR` | tests only: a tmpfs temp dir exercises the volatile refusal; the suite gives the same verdict either way since 0.4.3 | any |
+
+Install from the release artifact for the seat's OS where one exists, otherwise build from source, and
+run `self-check --repo <clone>` afterwards: it compares the installed binary against the checkout and
+names a binary that predates it.
+
 ## Provider-surface tripwire
 
 `export` / `diff` protect exactly the config an update must never silently
