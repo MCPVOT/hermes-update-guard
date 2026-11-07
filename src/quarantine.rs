@@ -155,6 +155,42 @@ fn quarantine_receipts(home: &Path, apply: bool) -> Result<usize> {
     Ok(moved)
 }
 
+/// Every `.hermes-update*` marker in the home, with the pid it records (if any)
+/// and what that pid is doing.
+///
+/// Shared by `quarantine` and `verify` so both read the same set with the same
+/// rule: `Unknown` (the probe could not answer) counts as HELD.
+pub fn markers_with_owner(home: &Path) -> Vec<(String, Option<u32>, env::ProcState)> {
+    markers(home)
+        .into_iter()
+        .map(|(name, p)| {
+            let pid = marker_pid(&p);
+            let state = match pid {
+                Some(v) => env::pid_running(v),
+                None => env::ProcState::Absent,
+            };
+            (name, pid, state)
+        })
+        .collect()
+}
+
+/// Split markers into `(held by a live or unverifiable run, left behind by a run
+/// whose pid is gone)`. Pure, so both directions are testable without a home.
+pub fn classify_markers(
+    entries: &[(String, Option<u32>, env::ProcState)],
+) -> (Vec<String>, Vec<String>) {
+    let mut live = Vec::new();
+    let mut stale = Vec::new();
+    for (name, _, state) in entries {
+        if matches!(state, env::ProcState::Absent) {
+            stale.push(name.clone());
+        } else {
+            live.push(name.clone());
+        }
+    }
+    (live, stale)
+}
+
 pub fn run(home: &Path, apply: bool, receipts: bool) -> Result<()> {
     println!("== UPDATE-STATE QUARANTINE ==");
     if receipts {
@@ -178,7 +214,6 @@ pub fn run(home: &Path, apply: bool, receipts: bool) -> Result<()> {
         };
         entries.push((name, p, pid, state));
     }
-
     if entries.is_empty() {
         println!("  no stale update markers to move");
         return Ok(());
@@ -261,6 +296,36 @@ mod tests {
         std::fs::write(&f, "27224\n1791896026\nct:1791896014.929\n").unwrap();
         assert_eq!(marker_pid(&f), Some(27224));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Markers split by owner: a live pid holds the set, a dead one is leftover.
+    /// `Unknown` counts as held, because moving a marker we could not judge is how
+    /// a real update gets broken.
+    #[test]
+    fn markers_split_into_live_and_leftover() {
+        use crate::env::ProcState;
+        let entries = vec![
+            (
+                ".hermes-update-in-progress.lock".to_string(),
+                None,
+                ProcState::Absent,
+            ),
+            (
+                ".hermes-update-in-progress".to_string(),
+                Some(1234),
+                ProcState::Running,
+            ),
+            (
+                ".hermes-update-other".to_string(),
+                Some(2),
+                ProcState::Unknown("probe could not run".into()),
+            ),
+        ];
+        let (live, stale) = classify_markers(&entries);
+        assert_eq!(stale, vec![".hermes-update-in-progress.lock".to_string()]);
+        assert_eq!(live.len(), 2, "Running and Unknown are both HELD: {live:?}");
+        let (live0, stale0) = classify_markers(&[]);
+        assert!(live0.is_empty() && stale0.is_empty());
     }
 
     /// An empty lock has no owner, which is why the aggregate hold exists:

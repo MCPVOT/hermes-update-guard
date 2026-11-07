@@ -305,11 +305,60 @@ pub fn run(home: &Path, cfg: &Config) -> Result<()> {
                         }
                     }
                 }
+
+                // A MULTIPLEXED gateway parks a profile it could not bring up (its
+                // session store was unusable) and answers `profile_parked` for it.
+                // The code_sha check above is one process, so it says nothing about
+                // whether every profile is actually being served.
+                if !g.parked.is_empty() {
+                    for (name, why) in &g.parked {
+                        println!(
+                            "  ! profile '{}' is PARKED by the gateway: {}",
+                            name,
+                            one_line(why)
+                        );
+                    }
+                    println!(
+                        "  ! a parked profile is served by nobody until a rescan; the gateway recorded the reason, so check that store before blaming the update"
+                    );
+                } else if !g.served.is_empty() {
+                    println!(
+                        "  gateway serves {} profile(s): {}",
+                        g.served.len(),
+                        g.served.join(", ")
+                    );
+                }
             }
             Err(e) => {
                 println!("  FAIL gateway_state.json: {}", e);
                 failures.push(format!("gateway state: {}", e));
             }
+        }
+    }
+
+    // ---- 7b. update markers left behind -------------------------------------
+    // The updater writes `.hermes-update*` markers and normally clears them. Two
+    // survived the v0.23.0 run on this seat and sat in the home for hours, so a
+    // finished verify should SAY it rather than leave the next operator to trip
+    // over them. Never a failure: a marker held by a live pid means an update is
+    // genuinely in flight, which is not this run's business.
+    println!("  update markers:");
+    let marker_entries = crate::quarantine::markers_with_owner(home);
+    let (live, stale) = crate::quarantine::classify_markers(&marker_entries);
+    if marker_entries.is_empty() {
+        println!("  ok   no .hermes-update* markers left in the home");
+    } else {
+        for name in &stale {
+            println!(
+                "  ! {} was left behind by a run whose pid is gone - clear it with `hermes-update-guard quarantine --apply`",
+                name
+            );
+        }
+        for name in &live {
+            println!(
+                "  ! {} is held by a LIVE run - an update may be in flight; not a failure",
+                name
+            );
         }
     }
 
@@ -594,16 +643,44 @@ pub struct GatewayStatus {
     pub pid: u32,
     pub state: String,
     pub code_sha: String,
+    /// Profiles the gateway itself reports as served.
+    pub served: Vec<String>,
+    /// Profiles the gateway could NOT bring up, name → the reason it recorded.
+    /// A parked profile is served by nobody: the gateway answers `profile_parked`
+    /// instead of waiting, so its chats are down until a rescan picks it up.
+    pub parked: std::collections::BTreeMap<String, String>,
 }
 
-/// Read the root gateway state file.
-pub fn gateway_status(home: &Path) -> Option<GatewayStatus> {
-    let gw = home.join("gateway_state.json");
-    if !gw.exists() {
-        return None;
-    }
-    let text = std::fs::read_to_string(&gw).ok()?;
-    let js: serde_json::Value = serde_json::from_str(&text).ok()?;
+/// Parse a gateway state file body. Pure so the shape can be tested without a
+/// running gateway: `parked_profiles` is a map of name → reason, and a file that
+/// predates the field simply has it absent.
+pub fn parse_gateway_status(text: &str) -> Option<GatewayStatus> {
+    let js: serde_json::Value = serde_json::from_str(text).ok()?;
+    let parked = js
+        .get("parked_profiles")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        v.as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| v.to_string()),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let served = js
+        .get("served_profiles")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
     Some(GatewayStatus {
         pid: js.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         state: js
@@ -616,7 +693,32 @@ pub fn gateway_status(home: &Path) -> Option<GatewayStatus> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        served,
+        parked,
     })
+}
+
+/// Read the root gateway state file.
+pub fn gateway_status(home: &Path) -> Option<GatewayStatus> {
+    let gw = home.join("gateway_state.json");
+    if !gw.exists() {
+        return None;
+    }
+    parse_gateway_status(&std::fs::read_to_string(&gw).ok()?)
+}
+
+/// Collapse a reason the gateway recorded into one printable line.
+fn one_line(why: &str) -> String {
+    let flat: String = why
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let trimmed = flat.trim();
+    if trimmed.chars().count() > 160 {
+        format!("{}...", trimmed.chars().take(160).collect::<String>())
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// The commit the install is on (short form), if it is a git install.
@@ -658,6 +760,50 @@ fn integrity(db: &Path) -> Result<(String, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A multiplexed gateway records what it serves and what it parked. Both shapes
+    /// must parse, including a state file that predates the field, because the old
+    /// struct ignored both and verify could not tell a parked profile from a
+    /// healthy one.
+    #[test]
+    fn gateway_state_reports_served_and_parked_profiles() {
+        let healthy = r#"{"pid": 2394633, "gateway_state": "running",
+                          "code_sha": "2bd378ed1b8d",
+                          "served_profiles": ["default","ofcrm","trilogy-brain"],
+                          "parked_profiles": {}}"#;
+        let g = parse_gateway_status(healthy).unwrap();
+        assert_eq!(g.pid, 2394633);
+        assert_eq!(g.served.len(), 3);
+        assert!(g.parked.is_empty(), "nothing parked is the healthy shape");
+
+        let parked = r#"{"pid": 7, "gateway_state": "running", "code_sha": "abc",
+                         "served_profiles": ["default"],
+                         "parked_profiles": {"ofcrm": "session store unusable: disk I/O error"}}"#;
+        let g = parse_gateway_status(parked).unwrap();
+        assert_eq!(g.parked.len(), 1);
+        assert!(g.parked["ofcrm"].contains("session store unusable"));
+        assert_eq!(g.served, vec!["default".to_string()]);
+
+        // A state file written before the field existed: empty, never an error.
+        let legacy = r#"{"pid": 1, "gateway_state": "running", "code_sha": "x"}"#;
+        let g = parse_gateway_status(legacy).unwrap();
+        assert!(g.parked.is_empty() && g.served.is_empty());
+        assert!(parse_gateway_status("not json").is_none());
+    }
+
+    /// A recorded reason can carry newlines; a report line must not.
+    #[test]
+    fn a_parked_reason_stays_on_one_line() {
+        assert_eq!(
+            one_line("store unusable\nretry pending"),
+            "store unusable retry pending"
+        );
+        assert_eq!(one_line("  padded  "), "padded");
+        let long = "x".repeat(400);
+        let out = one_line(&long);
+        assert_eq!(out.chars().count(), 163, "160 chars plus an ellipsis");
+        assert!(out.ends_with("..."));
+    }
 
     /// The pre-update working-tree.patch is the record of what was pinned. If we
     /// cannot read the file list back, verify can never notice a dropped patch.

@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-07
+
+### Added
+- **`verify` reports the update markers a finished run left behind.** Two
+  `.hermes-update*` markers survived the v0.23.0 update on this seat and sat in the home for hours;
+  `preflight` warned, but the post-update verdict said nothing. `verify` now prints them and names the
+  way out (`quarantine --apply`), splitting them by owner: a dead pid is a leftover, a live or
+  unverifiable one means an update really is in flight. Never a failure, because the updater owns them.
+- **`verify` reports the gateway's served and parked profile map.** The fleet is one process with
+  `servedProfiles`, so a single connection hides a member: a profile can be `parked` with a reason
+  (its shell or store could not open) and its chats are served by nobody until a rescan. The state
+  file now parses both fields (`parse_gateway_status`, pure and tested, including a file that predates
+  them), prints the served list, and names every parked profile with the reason the gateway recorded.
+  Reported, not failed: the gateway is the authority on why it parked, and the cause is usually a
+  store the update did not touch.
+
+### Changed
+- `quarantine::markers_with_owner` and `classify_markers` are shared with `verify`, so both commands
+  read the same marker set under the same rule (`Unknown` counts as held).
+
 ## [0.5.0] - 2026-11-07
 
 ### Fixed

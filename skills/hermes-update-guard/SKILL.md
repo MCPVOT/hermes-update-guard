@@ -368,6 +368,13 @@ stopping the gateway (`hermes gateway stop`) and closing Hermes.
 ## Verification
 
 - `hermes-update-guard verify` exits `0` and reports DB integrity `ok` with no
-  drift versus the pre-update export.
+  drift vs the approved baseline, and names the snapshot age for the log-signature section.
+- Since 0.6.0 it also prints two readings that used to be invisible: the
+  `.hermes-update*` markers left in the home (split into held by a LIVE run and
+  left behind by a dead one, with `quarantine --apply` as the way out) and the
+  gateway's served/parked profile map. Neither is a failure: a parked profile is
+  served by nobody and the gateway records why, and a marker held by a live pid
+  means an update really is in flight. A PASS with a parked profile is still a
+  fleet with a member down, so read the line before quoting the verdict.
 - Exit codes: `0` ok · `1` drift found, backup incomplete, verify failure, or any
   runtime error · `2` CLI usage error (bad flags/arguments).
