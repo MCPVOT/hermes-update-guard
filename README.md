@@ -267,13 +267,13 @@ The gates are not identical on every OS. This is what the code does today.
 |---|---|---|---|
 | desktop-app probe | `linux-unpacked/Hermes` via `pgrep -f` | `Hermes.app/Contents/MacOS/Hermes` via `pgrep -f` | `Hermes.exe` via `tasklist` |
 | close the app | matches are signalled, graceful then forced | same | `taskkill` |
-| backup target mount proof | real: `/proc/self/mountinfo`, refuses a non-mount point and a volatile filesystem | **no proof**: the non-Linux path reports `is_mountpoint: true`, `fstype: unknown` | **no proof**, same |
+| backup target mount proof | real: `/proc/self/mountinfo`, refuses a non-mount point and a volatile filesystem | real: the `mount` table; an unmounted `/Volumes/...` leaves the anchor on `/` and is refused, an unreadable table fails closed | real: the drive letter names the volume; an absent letter means the anchor sits on another volume and the target is refused. Drive type from `fsutil` maps `cdrom` and `ramdisk` to the same refusals |
 | context health, drift, lineage, log signatures | identical on all three | identical | identical |
 
-Consequence: on macOS and Windows a `--backup-root` pointing at a removable drive is taken on the
-operator's word, and an unplugged path is not caught. Use the default control root
-(`<home>/backups`) there, and treat an external target as Linux-only until the proof lands for the
-other two platforms.
+Consequence: since 0.5.0 all three platforms prove the target. The Windows proof rests on the drive
+letter and the drive type from `fsutil`; on a Windows whose `fsutil` output is localised the type reads
+`unknown` and only the volume identity protects you, which is still enough to catch an absent drive.
+macOS reads `mount`; if that cannot be parsed the proof refuses rather than passing.
 
 Variables that change behaviour per seat:
 

@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-07
+
+### Fixed
+- **The backup-target mount proof only existed on Linux.** The non-Linux branch of `prove_target_with`
+  returned `is_mountpoint: true` with `fstype: unknown` for ANY path, so a `--backup-root` on a macOS
+  or Windows seat was accepted without a proof, and an unplugged disk was not caught.
+  - macOS now reads the `mount` table (`parse_mount_command`, tested on every platform with a real
+    shaped sample including a mount point that contains a space) and answers from it. An unmounted
+    `/Volumes/Backup` leaves the anchor on `/`, which is not a volume, so the target is refused. A
+    table that cannot be read answers "not a mount point": fail closed, never the permissive default.
+  - Windows now uses the drive letter as the volume identity. `volume_root` maps `E:\a\b` to `E:\` and
+    `\\server\share\x` to `\\server\share`; if the letter the target names is absent, the nearest
+    existing ancestor is on another volume and the two roots differ, so the target is refused. The
+    drive type comes from `fsutil fsinfo drivetype` and its labels feed the existing refusals:
+    `cdrom` is added to `UNSAFE_FSTYPES`, `ramdisk` to `VOLATILE_FSTYPES`, and a mounted
+    `removable` disk stays legal, because that is the feature.
+- Other Unix (`freebsd`, `openbsd`) now fails closed instead of assuming a mount.
+
+### Added
+- `parse_fsutil_drivetype`, `parse_mount_command`, `volume_root` (Windows) and `bsd_mount_entries`
+  (macOS), each split out so the decision is testable without the host's real volumes.
+- Two tests that run on every platform: the macOS-shaped table end to end through `prove_target_from`
+  (refused on `/`, accepted once its volume is listed) and the fsutil label mapping.
+
 ## [0.4.3] - 2026-11-07
 
 ### Fixed

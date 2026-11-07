@@ -244,7 +244,7 @@ impl TargetProof {
 /// a boot or installer partition. The `ESD-USB` partition on the measured disk is
 /// 32 GB of vfat sitting next to the real ntfs3 backup volume — choosing it would
 /// produce a backup that cannot be restored with its modes intact.
-pub const UNSAFE_FSTYPES: [&str; 3] = ["exfat", "iso9660", "vfat"];
+pub const UNSAFE_FSTYPES: [&str; 4] = ["cdrom", "exfat", "iso9660", "vfat"];
 
 /// Filesystems that do not survive a restart. A removable disk that is NOT mounted
 /// leaves its mount point as an empty directory under `/run/media/<user>`, and
@@ -253,7 +253,7 @@ pub const UNSAFE_FSTYPES: [&str; 3] = ["exfat", "iso9660", "vfat"];
 /// accepted, printed as `mount: true, fstype: tmpfs`, and the only restore point
 /// would have been written to RAM. Refused unconditionally, like the other unsafe
 /// types: `--allow-local-backup` means "the internal disk", not "memory".
-pub const VOLATILE_FSTYPES: [&str; 3] = ["ramfs", "tmpfs", "devtmpfs"];
+pub const VOLATILE_FSTYPES: [&str; 4] = ["ramfs", "ramdisk", "tmpfs", "devtmpfs"];
 
 /// Prove that `p` really is on a mounted volume before a byte is written.
 pub fn prove_target(p: &Path) -> Result<TargetProof> {
@@ -272,8 +272,26 @@ pub fn prove_target_with(p: &Path, allow_local: bool) -> Result<TargetProof> {
             Err(_) => fallback_mount_facts(&canonical),
         }
     };
-    #[cfg(not(target_os = "linux"))]
-    let (is_mountpoint, device, fstype) = (true, String::new(), "unknown".to_string());
+    // macOS answers the same question from `mount`, which prints
+    // "<device> on <mount point> (<fstype>, ...)" for every mounted volume. An
+    // unmounted /Volumes/Backup leaves the anchor on "/" and is refused. A table
+    // that cannot be read answers "not a mount point" (fail closed), never the
+    // permissive default this branch used to return.
+    #[cfg(target_os = "macos")]
+    let (is_mountpoint, device, fstype) = {
+        let canonical = anchor.canonicalize().unwrap_or_else(|_| anchor.clone());
+        match bsd_mount_entries() {
+            Some(entries) => facts_from_entries(&entries, &canonical),
+            None => (false, String::new(), "unknown".to_string()),
+        }
+    };
+    // Windows makes the intended volume explicit with a drive letter: when the
+    // letter the target names is absent, the nearest existing ancestor is on a
+    // different volume (C:\Users\...), which is precisely the unplugged-disk case.
+    #[cfg(windows)]
+    let (is_mountpoint, device, fstype) = windows_target_facts(p, &anchor);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    let (is_mountpoint, device, fstype) = (false, String::new(), "unknown".to_string());
     finish_proof(p, allow_local, is_mountpoint, device, fstype, &anchor)
 }
 
@@ -295,11 +313,165 @@ pub fn target_is_volatile(p: &Path) -> bool {
         };
         VOLATILE_FSTYPES.contains(&fstype.to_ascii_lowercase().as_str())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let anchor = nearest_existing(p);
+        let canonical = anchor.canonicalize().unwrap_or_else(|_| anchor.clone());
+        match bsd_mount_entries() {
+            Some(entries) => {
+                let fstype = facts_from_entries(&entries, &canonical).2;
+                VOLATILE_FSTYPES.contains(&fstype.to_ascii_lowercase().as_str())
+            }
+            None => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        match volume_root(p)
+            .or_else(|| volume_root(&nearest_existing(p)))
+            .and_then(|root| drive_type_label(&root))
+        {
+            Some(label) => VOLATILE_FSTYPES.contains(&label.as_str()),
+            None => false,
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = p;
         false
     }
+}
+
+/// Parse the POSIX `mount` table (macOS/BSD, and Linux's `mount` too):
+/// `"/dev/disk3s1 on /Volumes/My Backup (apfs, local, journaled)"`.
+///
+/// `rsplit_once(" (")` is deliberate: mount points may contain `" ("`, and the
+/// option group is the last one on the line.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub fn parse_mount_command(text: &str) -> Vec<MountEntry> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((device, rest)) = line.split_once(" on ") else {
+            continue;
+        };
+        let Some((mount_point, opts)) = rest.rsplit_once(" (") else {
+            continue;
+        };
+        let fstype = opts.split(',').next().unwrap_or("unknown").trim();
+        let mount_point = mount_point.trim();
+        let device = device.trim();
+        if mount_point.is_empty() || device.is_empty() {
+            continue;
+        }
+        out.push(MountEntry {
+            mount_point: PathBuf::from(mount_point),
+            device: device.to_string(),
+            fstype: fstype.to_string(),
+        });
+    }
+    out
+}
+
+/// The mounted-volume table on macOS, or `None` when `mount` cannot answer.
+#[cfg(target_os = "macos")]
+pub fn bsd_mount_entries() -> Option<Vec<MountEntry>> {
+    let (code, out) = run_capture_stdout(Path::new("mount"), &[], None, None).ok()?;
+    if code != 0 {
+        return None;
+    }
+    let entries = parse_mount_command(&out);
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
+}
+
+/// Windows volume root for a path: `E:\a\b` → `E:\`, `\\server\share\x` →
+/// `\\server\share`. `None` when the path is relative.
+#[cfg(windows)]
+pub fn volume_root(p: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut comps = p.components();
+    match comps.next() {
+        Some(Component::Prefix(prefix)) => {
+            let mut root = PathBuf::from(prefix.as_os_str());
+            if matches!(comps.next(), Some(Component::RootDir)) {
+                root.push(std::path::MAIN_SEPARATOR.to_string());
+            }
+            Some(root)
+        }
+        Some(Component::RootDir) => Some(PathBuf::from(std::path::MAIN_SEPARATOR.to_string())),
+        _ => None,
+    }
+}
+
+/// `fsutil fsinfo drivetype` output → a label the fstype refusals understand.
+///
+/// Pure and tested on every platform: the labels slot into `UNSAFE_FSTYPES`
+/// (`cdrom`) and `VOLATILE_FSTYPES` (`ramdisk`) so one set of rules covers both
+/// worlds.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub fn parse_fsutil_drivetype(out: &str) -> Option<String> {
+    let lower = out.to_ascii_lowercase();
+    let label = if lower.contains("cd-rom") {
+        "cdrom"
+    } else if lower.contains("ram disk") || lower.contains("ramdisk") {
+        "ramdisk"
+    } else if lower.contains("removable") {
+        "removable"
+    } else if lower.contains("network") {
+        "network"
+    } else if lower.contains("fixed") {
+        "fixed"
+    } else {
+        return None;
+    };
+    Some(label.to_string())
+}
+
+/// Drive type of a Windows volume root, or `None` when `fsutil` cannot answer.
+#[cfg(windows)]
+pub fn drive_type_label(root: &Path) -> Option<String> {
+    let (code, out) = run_capture_stdout(
+        Path::new("fsutil"),
+        &["fsinfo", "drivetype", &root.to_string_lossy()],
+        None,
+        None,
+    )
+    .ok()?;
+    if code != 0 {
+        return None;
+    }
+    parse_fsutil_drivetype(&out)
+}
+
+/// Two paths name the same Windows volume. Drive letters are case-insensitive.
+#[cfg(windows)]
+fn same_volume(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+/// Mount facts for a Windows target.
+///
+/// The proof used to be `(true, "", "unknown")` on every non-Linux host, so a
+/// `--backup-root` on an absent drive letter was accepted and the restore point
+/// would have landed on whatever volume happened to sit above the missing one.
+#[cfg(windows)]
+fn windows_target_facts(target: &Path, anchor: &Path) -> (bool, String, String) {
+    let (Some(target_root), Some(anchor_root)) = (volume_root(target), volume_root(anchor)) else {
+        // A relative path has no volume identity to prove.
+        return (false, String::new(), "unknown".to_string());
+    };
+    let device = target_root.display().to_string();
+    if !target_root.exists() || !same_volume(&target_root, &anchor_root) {
+        // The target names a volume that is not there; the anchor landed on another.
+        return (false, device, "unknown".to_string());
+    }
+    let fstype = drive_type_label(&target_root).unwrap_or_else(|| "unknown".to_string());
+    (true, device, fstype)
 }
 
 /// Prove by consulting an explicit mount table.
@@ -1740,6 +1912,102 @@ mod tests {
                 "{ok} is a real backup filesystem"
             );
         }
+    }
+
+    /// macOS answers the mount question from `mount`, not from mountinfo. A table
+    /// in that shape must drive the same proof: a path on "/" is not a volume, and
+    /// a real mounted volume is accepted with its own device and fstype.
+    #[test]
+    fn posix_mount_table_feeds_the_same_proof() {
+        let table = "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n\
+                     devfs on /dev (devfs, local, nobrowse)\n\
+                     /dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled)\n\
+                     /dev/disk5s1 on /Volumes/Backup Disk (apfs, local, journaled)\n";
+        let entries = parse_mount_command(table);
+        assert_eq!(entries.len(), 4, "every mounted volume is parsed");
+        let backup = entries
+            .iter()
+            .find(|e| e.mount_point == Path::new("/Volumes/Backup Disk"))
+            .expect("a mount point containing a space must parse");
+        assert_eq!(backup.device, "/dev/disk5s1");
+        assert_eq!(backup.fstype, "apfs");
+
+        let dir = std::env::temp_dir().join(format!("hug-bsd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let target = dir.join("pre-update");
+
+        // Live on "/": not a volume, so a proven target is refused.
+        let on_root = facts_from_entries(&entries, &canonical);
+        assert!(!on_root.0, "a path on the root filesystem is not a volume");
+        assert!(prove_target_from(&target, false, &entries).is_err());
+
+        // The same path once its volume is in the table.
+        let mut mounted: Vec<MountEntry> = entries
+            .iter()
+            .map(|e| mount(&e.mount_point.to_string_lossy(), &e.device, &e.fstype))
+            .collect();
+        mounted.push(mount(
+            canonical.to_string_lossy().as_ref(),
+            "/dev/disk5s1",
+            "apfs",
+        ));
+        let proof = prove_target_from(&target, false, &mounted).unwrap();
+        assert!(proof.is_mountpoint);
+        assert_eq!(proof.fstype, "apfs");
+        assert_eq!(proof.device, "/dev/disk5s1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `fsutil fsinfo drivetype` is how Windows names a volume. Its labels feed the
+    /// same two refusal lists as the POSIX fstypes, so a CD-ROM and a RAM disk are
+    /// refused and a mounted removable disk is allowed.
+    #[test]
+    fn fsutil_drivetype_maps_to_the_refusal_labels() {
+        assert_eq!(
+            parse_fsutil_drivetype("E:\\ - Removable Drive").as_deref(),
+            Some("removable")
+        );
+        assert_eq!(
+            parse_fsutil_drivetype("C:\\ - Fixed Drive").as_deref(),
+            Some("fixed")
+        );
+        assert_eq!(
+            parse_fsutil_drivetype("D:\\ - CD-ROM Drive").as_deref(),
+            Some("cdrom")
+        );
+        assert_eq!(
+            parse_fsutil_drivetype("R:\\ - RAM Disk").as_deref(),
+            Some("ramdisk")
+        );
+        assert_eq!(
+            parse_fsutil_drivetype("Z:\\ - Network Drive").as_deref(),
+            Some("network")
+        );
+        assert_eq!(parse_fsutil_drivetype("garbage"), None);
+
+        assert!(reject_unsafe_fstype(Path::new("D:\\"), "cdrom").is_err());
+        assert!(reject_unsafe_fstype(Path::new("R:\\"), "ramdisk").is_err());
+        assert!(
+            reject_unsafe_fstype(Path::new("E:\\"), "removable").is_ok(),
+            "a mounted removable disk is a legal target: that is the whole feature"
+        );
+    }
+
+    /// A drive letter is the volume identity. `E:\` absent means the anchor lands on
+    /// `C:\`, and the two roots must not be confused for one another.
+    #[cfg(windows)]
+    #[test]
+    fn volume_root_names_the_drive_or_share() {
+        assert_eq!(
+            volume_root(Path::new("E:\\backup\\hermes")).unwrap(),
+            PathBuf::from("E:\\")
+        );
+        assert!(same_volume(Path::new("E:\\"), Path::new("e:\\")));
+        assert!(!same_volume(Path::new("E:\\"), Path::new("C:\\")));
+        assert!(volume_root(Path::new("relative\\path")).is_none());
     }
 
     /// A plain directory on the root filesystem is refused, and a path that does

@@ -103,6 +103,14 @@ passes on that parent and the only restore point would be written to RAM. Before
   to merge the two and refuse a free venv with `venv state UNKNOWN (probe exit 0)`.
   It now parses stdout only and passes `HERMES_HOME` to the child. Exporting
   `HERMES_HOME` before a run is still good practice, not a requirement.
+- **The mount proof covers all three platforms (0.5.0).** Linux reads
+  `/proc/self/mountinfo`; macOS reads the `mount` table and refuses when an
+  unmounted `/Volumes/...` leaves the anchor on `/` (an unreadable table fails
+  closed); Windows compares volume roots, so an absent drive letter means the
+  anchor is on another volume and the target is refused. Windows drive types feed
+  the same lists: `cdrom` is unsafe, `ramdisk` is volatile, and a mounted
+  `removable` disk stays legal because that is the feature. A relative path has no
+  volume identity and is refused.
 
 ## What 0.4.2 changed
 
