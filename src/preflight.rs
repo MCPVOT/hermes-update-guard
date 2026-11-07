@@ -297,6 +297,11 @@ pub fn run(home: &Path, cfg: &Config) -> Result<()> {
         ),
     }
 
+    // A second installation leaves a second launcher, usually with the same
+    // `Name=Hermes`; the menu then shows two icons and one starts a stale build.
+    println!("\n[desktop launchers]");
+    report_desktop_launchers();
+
     // provider drift status (read-only)
     println!("\n[provider surface drift]");
     drift_summary(home)?;
@@ -534,4 +539,32 @@ fn drift_summary(home: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Report every launcher that claims Hermes and warn when more than one is
+/// visible. Read-only: it never edits or removes an entry.
+fn report_desktop_launchers() {
+    let launchers = env::desktop_launchers();
+    if launchers.is_empty() {
+        println!("  none found");
+        return;
+    }
+    for l in &launchers {
+        println!(
+            "  {:<7} {:<6} {}  (Exec={})",
+            if l.visible { "visible" } else { "hidden" },
+            l.scope,
+            l.path.display(),
+            l.exec
+        );
+    }
+    let visible = launchers.iter().filter(|l| l.visible).count();
+    if visible > 1 {
+        println!(
+            "  ! {visible} visible entries claim Hermes Desktop - the launcher shows {visible} icons and one may start a stale install"
+        );
+        println!(
+            "  ! keep one install: hide the stale entry (Hidden=true in ~/.local/share/applications) or remove the package that owns it"
+        );
+    }
 }

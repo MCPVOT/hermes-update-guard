@@ -98,6 +98,19 @@ passes on that parent and the only restore point would be written to RAM. Before
   run hours later cannot blame the update for drift it never caused. Run a
   guarded update to re-take the baseline.
 
+## What 0.4.2 changed
+
+- **Duplicate desktop installs are reported, not guessed at.** Two installations
+  can each ship a launcher named `Hermes` — the checkout app (`hermes desktop`)
+  and a distribution package such as `hermes-desktop` — so the menu shows two
+  identical icons and one may start a stale build. `preflight` now prints a
+  `[desktop launchers]` section listing every entry that claims Hermes with its
+  scope (`user`/`system`), `Exec` and visibility, and warns when more than one is
+  visible. XDG shadowing and `Hidden=true` / `NoDisplay=true` are honoured, so a
+  user override that hides the stale entry counts as one icon. The check is
+  read-only; remediate by hiding the stale entry or removing the package that
+  owns it, never by skipping the update.
+
 ## Procedure
 
 1. **Confirm the binary is available** (see *Binary availability* below).

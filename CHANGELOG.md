@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-06
+
+### Fixed
+- **Two Hermes installations produced two identical launcher icons, and preflight never said so.**
+  Measured on `mcpvot`: `~/.local/share/applications/com.nousresearch.hermes.desktop` (the checkout app
+  rewritten by `hermes desktop`) and `/usr/share/applications/hermes-desktop.desktop` (the
+  `hermes-desktop 2026.9.7-7` package) both carried `Name=Hermes`, so the app menu showed two icons and
+  one entry could start a stale build. `preflight` now prints a `[desktop launchers]` section: every
+  entry that claims Hermes, its scope (`user`/`system`), its `Exec`, whether it is visible, and — when
+  more than one is visible — a warning that the launcher will show duplicate icons plus the two safe
+  remedies (hide the stale entry, or remove the package that owns it). It is read-only and never edits
+  a launcher.
+  XDG precedence is honoured: a user entry shadows the system entry with the same desktop-file ID, and
+  `Hidden=true` / `NoDisplay=true` entries are listed as hidden rather than counted as a second icon.
+  Matching is exact (`Name=Hermes`, `hermes desktop`, `hermes-desktop`), so `Hermes Guard Dashboard` is
+  not mistaken for a desktop install.
+
+### Changed
+- Three tests added: both installs are listed with their scopes; a hidden user override shadows the
+  system entry and leaves one visible icon; unrelated and guard-dashboard entries are ignored.
+
+
 ## [0.4.1] - 2026-11-06
 
 ### Fixed

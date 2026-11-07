@@ -924,6 +924,152 @@ pub fn desktop_app_state() -> ProcState {
     combine_proc_states(&states)
 }
 
+/// A `.desktop` entry that claims to launch a Hermes desktop app.
+///
+/// Two installations can each ship one: the checkout app that `hermes desktop`
+/// installs, and a distribution package such as `hermes-desktop`. Both are
+/// `Name=Hermes`, so the launcher shows two identical icons and one of them can
+/// start a stale build. Preflight reports them instead of guessing which is
+/// current.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopLauncher {
+    pub path: PathBuf,
+    /// `user` for `$XDG_DATA_HOME`, `system` for `$XDG_DATA_DIRS`.
+    pub scope: &'static str,
+    pub name: String,
+    pub exec: String,
+    /// False when the entry sets `NoDisplay=true` or `Hidden=true`.
+    pub visible: bool,
+}
+
+/// Application directories in XDG precedence order.
+pub fn desktop_launcher_dirs() -> Vec<(PathBuf, &'static str)> {
+    let mut dirs = Vec::new();
+    let user = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".local/share"))
+        });
+    if let Some(root) = user {
+        dirs.push((root.join("applications"), "user"));
+    }
+    let data_dirs = std::env::var("XDG_DATA_DIRS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+    for root in data_dirs.split(':').filter(|s| !s.is_empty()) {
+        dirs.push((PathBuf::from(root).join("applications"), "system"));
+    }
+    dirs
+}
+
+/// Every launcher entry that claims Hermes, after XDG shadowing.
+pub fn desktop_launchers() -> Vec<DesktopLauncher> {
+    desktop_launchers_in(&desktop_launcher_dirs())
+}
+
+/// Testable core: the first directory wins for a desktop-file ID, exactly as the
+/// XDG spec says, so a user override with `Hidden=true` really hides the system
+/// entry it shadows.
+pub fn desktop_launchers_in(dirs: &[(PathBuf, &'static str)]) -> Vec<DesktopLauncher> {
+    let mut seen: Vec<std::ffi::OsString> = Vec::new();
+    let mut found = Vec::new();
+    for (dir, scope) in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "desktop"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Some(id) = path.file_name().map(|n| n.to_owned()) else {
+                continue;
+            };
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some((name, exec, visible)) = parse_desktop_entry(&text) else {
+                continue;
+            };
+            if claims_hermes(&name, &exec) {
+                found.push(DesktopLauncher {
+                    path,
+                    scope,
+                    name,
+                    exec,
+                    visible,
+                });
+            }
+        }
+    }
+    found
+}
+
+/// `(Name, Exec, visible)` from the `[Desktop Entry]` group.
+fn parse_desktop_entry(text: &str) -> Option<(String, String, bool)> {
+    let mut name = None;
+    let mut exec = None;
+    let mut kind = None;
+    let mut hidden = false;
+    let mut in_entry = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_entry = line.eq_ignore_ascii_case("[Desktop Entry]");
+            continue;
+        }
+        if !in_entry {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "Name" => name = Some(value.trim().to_string()),
+            "Exec" => exec = Some(value.trim().to_string()),
+            "Type" => kind = Some(value.trim().to_string()),
+            "Hidden" | "NoDisplay" if value.trim().eq_ignore_ascii_case("true") => hidden = true,
+            _ => {}
+        }
+    }
+    if kind.is_some_and(|k| !k.eq_ignore_ascii_case("Application")) {
+        return None;
+    }
+    Some((name?, exec?, !hidden))
+}
+
+/// Does this entry point at a Hermes desktop app? Match the name and the program
+/// basename, never an arbitrary substring: `Hermes Guard Dashboard` must not be
+/// counted as a second Hermes Desktop.
+fn claims_hermes(name: &str, exec: &str) -> bool {
+    let name = name.to_lowercase();
+    let exec = exec.to_lowercase();
+    let program = exec
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c| c == '"' || c == '\'');
+    let base = program.rsplit('/').next().unwrap_or(program);
+    let by_name =
+        name == "hermes" || name.starts_with("hermes desktop") || name.starts_with("hermes agent");
+    let by_exec = base == "hermes" || base == "hermes-desktop" || exec.contains("/hermes desktop");
+    by_name || by_exec
+}
+
 /// Is `pid` still alive? Same tri-state discipline as the image probe: a failed
 /// `tasklist` answers Unknown, never "dead".
 #[cfg(windows)]
@@ -1609,5 +1755,93 @@ mod tests {
         assert!(is_mount);
         assert_eq!(device, "/dev/sda2");
         assert_eq!(fstype, "ntfs3");
+    }
+
+    fn write_desktop(dir: &Path, id: &str, body: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(id), body).unwrap();
+    }
+
+    fn launcher_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("hug-launchers-{tag}-{}", std::process::id()));
+        let user = base.join("user");
+        let system = base.join("system");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        (base, user, system)
+    }
+
+    /// Measured 2026-11-06: the checkout app and the `hermes-desktop` package
+    /// both installed `Name=Hermes`, and the launcher showed two identical icons.
+    #[test]
+    fn desktop_launchers_lists_both_installs() {
+        let (base, user, system) = launcher_fixture("both");
+        write_desktop(
+            &user,
+            "com.nousresearch.hermes.desktop",
+            "[Desktop Entry]\nType=Application\nName=Hermes\nExec=/home/x/.local/bin/hermes desktop --skip-build\n",
+        );
+        write_desktop(
+            &system,
+            "hermes-desktop.desktop",
+            "[Desktop Entry]\nType=Application\nName=Hermes\nExec=hermes-desktop %U\n",
+        );
+        let got = desktop_launchers_in(&[(user.clone(), "user"), (system.clone(), "system")]);
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|l| l.visible));
+        assert_eq!(got.iter().filter(|l| l.scope == "user").count(), 1);
+        assert_eq!(got.iter().filter(|l| l.scope == "system").count(), 1);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A user-level entry shadows the system entry with the same desktop-file
+    /// ID; if it is hidden, the menu is down to one icon even though the
+    /// packaged file still exists on disk.
+    #[test]
+    fn desktop_launchers_honour_xdg_shadowing_and_hidden() {
+        let (base, user, system) = launcher_fixture("shadow");
+        let hidden = "[Desktop Entry]\nType=Application\nName=Hermes Desktop (packaged)\nExec=hermes-desktop %U\nNoDisplay=true\nHidden=true\n";
+        write_desktop(&user, "hermes-desktop.desktop", hidden);
+        write_desktop(&system, "hermes-desktop.desktop", hidden);
+        write_desktop(
+            &user,
+            "com.nousresearch.hermes.desktop",
+            "[Desktop Entry]\nType=Application\nName=Hermes\nExec=/home/x/.local/bin/hermes desktop --skip-build\n",
+        );
+        let got = desktop_launchers_in(&[(user.clone(), "user"), (system, "system")]);
+        assert_eq!(
+            got.len(),
+            2,
+            "the shadowed system entry must not be listed twice"
+        );
+        assert_eq!(got.iter().filter(|l| l.visible).count(), 1);
+        assert!(got.iter().any(|l| !l.visible && l.path.starts_with(&user)));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The guard dashboard is not a Hermes Desktop install. Match the exact
+    /// name or the program basename, never a loose "hermes" substring.
+    #[test]
+    fn desktop_launchers_ignore_guard_and_unrelated_entries() {
+        let (base, user, system) = launcher_fixture("ignore");
+        write_desktop(
+            &user,
+            "guard.desktop",
+            "[Desktop Entry]\nType=Application\nName=Hermes Guard Dashboard\nExec=hermes-guard-dashboard\n",
+        );
+        write_desktop(
+            &user,
+            "files.desktop",
+            "[Desktop Entry]\nType=Application\nName=Files\nExec=nautilus\n",
+        );
+        write_desktop(
+            &user,
+            "com.nousresearch.hermes.desktop",
+            "[Desktop Entry]\nType=Application\nName=Hermes\nExec=hermes desktop\n",
+        );
+        let got = desktop_launchers_in(&[(user, "user"), (system, "system")]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "Hermes");
+        std::fs::remove_dir_all(&base).ok();
     }
 }
