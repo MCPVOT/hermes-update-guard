@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-08
+
+### Fixed
+- **`preflight` and `backup` assume a venv-only install and report nothing on every other layout.**
+  Both called `env::venv_hermes(home)` (`<home>/hermes-agent/venv/bin/hermes`) instead of
+  `env::resolve_hermes(home)`, which already exists for exactly this reason. On a host whose CLI is
+  `~/.local/bin/hermes` with no venv (measured on the hoodbot droplet), `preflight` printed
+  `[version] cannot run hermes --version` and `[update --check] cannot run hermes update --check`,
+  so the one gate that should name the release it would install named nothing, and
+  `version-before.txt` in every restore point was empty. Both now resolve the CLI the way hermes
+  itself does and fail with the venv path plus the PATH candidates when there is genuinely none.
+  Verified on that host: `preflight` now prints `v0.23.0 … local 2bd378ed1b8d`,
+  `✓ Up to date with the latest release` and `TARGET : none - this update would be a NO-OP`.
+
 ## [0.7.0] - 2026-11-07
 
 ### Added

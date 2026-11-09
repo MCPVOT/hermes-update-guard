@@ -293,8 +293,12 @@ pub fn run_with(
         .ok()
         .map(|(_, sp)| fs::write(dir.join("stash-0.patch"), sp));
     }
-    let (_, version) = env::run_capture(&env::venv_hermes(home), &["--version"], None)
-        .unwrap_or((-1, String::new()));
+    // Same resolution as preflight: a non-source install has no venv CLI, so the venv path
+    // recorded nothing and version-before.txt was empty on this host (measured 2026-11-08).
+    let version = env::resolve_hermes(home)
+        .and_then(|h| env::run_capture(&h, &["--version"], None).ok())
+        .map(|(_, v)| v)
+        .unwrap_or_default();
     fs::write(dir.join("version-before.txt"), version)?;
 
     if fails > 0 {
