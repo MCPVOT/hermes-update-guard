@@ -180,16 +180,20 @@ enum Cmd {
 }
 
 /// Map a --baseline string to an explicit baseline path (None = auto: golden, else last-known).
-fn resolve_baseline(s: &str) -> Option<std::path::PathBuf> {
-    let h = env::hermes_home().ok()?;
+///
+/// Takes the RESOLVED home, not `env::hermes_home()`: `--home` is a global flag,
+/// and resolving "golden" against the default home made `--home /tmp/x diff
+/// --baseline golden` read the REAL ~/.hermes baseline while reporting on the
+/// temp home's profiles — a mismatch that reads as a clean pass.
+fn resolve_baseline(home: &std::path::Path, s: &str) -> Option<std::path::PathBuf> {
     match s {
         "golden" => Some(
-            h.join("backups")
+            home.join("backups")
                 .join("provider-surface")
                 .join("golden.json"),
         ),
         "last-known" => Some(
-            h.join("backups")
+            home.join("backups")
                 .join("provider-surface")
                 .join("last-known"),
         ),
@@ -222,7 +226,7 @@ fn main() -> Result<()> {
         Cmd::Export => drift::export(&home),
         Cmd::Bless => drift::bless(&home),
         Cmd::Diff { baseline } => {
-            let b = baseline.as_deref().and_then(resolve_baseline);
+            let b = baseline.as_deref().and_then(|s| resolve_baseline(&home, s));
             drift::diff(&home, b.as_deref())
         }
         Cmd::Backup { dry_run } => backup::run(&home, dry_run, &cfg).map(|_| ()),

@@ -217,7 +217,10 @@ pub fn run(home: &Path, cfg: &Config) -> Result<()> {
             if now.is_worse_than(b) {
                 println!("  FAIL context health got WORSE during the update");
                 failures.push("context health regressed during the update".to_string());
-            } else if now.same_as(b) {
+            } else if now.same_as(b) && !now.healthy() {
+                // Equal numbers only mean "PRE-EXISTING condition" when the condition is
+                // a problem. On a clean fleet the same reading is a clean fleet, and a
+                // `!` warning on every healthy verify trains the reader to ignore it.
                 println!("  ! context health unchanged - PRE-EXISTING condition, not caused by this update");
             } else {
                 println!(

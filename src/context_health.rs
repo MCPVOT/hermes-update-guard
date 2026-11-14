@@ -54,6 +54,16 @@ impl Summary {
     pub fn same_as(&self, before: &Summary) -> bool {
         !self.is_worse_than(before) && !before.is_worse_than(self)
     }
+
+    /// True when the reading is healthy, using the same bar as `Health::is_problematic`.
+    ///
+    /// `same_as` only answers "did this change"; on a healthy fleet it is true because
+    /// nothing was wrong to begin with. A verify that prints "PRE-EXISTING condition"
+    /// whenever the numbers are equal warns about a condition that does not exist, and a
+    /// warning on every clean run is wallpaper.
+    pub fn healthy(&self) -> bool {
+        self.dup_uids == 0 && self.stuck == 0 && self.max_bloat < 4.0
+    }
 }
 
 /// Snapshot the fleet's context health for later comparison.
@@ -695,5 +705,30 @@ mod tests {
     fn archived_copies_are_not_live_duplicates() {
         let conn = db_with(&[("d", "s1", 1), ("d", "s1", 0)]);
         assert_eq!(count_live_dup_uids(&conn), 0);
+    }
+
+    /// `same_as` is true on a healthy fleet because nothing changed — that is not a
+    /// "PRE-EXISTING condition". The warning must fire only when the equal reading is a
+    /// problem, or a clean verify warns about a condition that does not exist.
+    #[test]
+    fn a_healthy_unchanged_reading_is_healthy_not_a_condition() {
+        let healthy = Summary {
+            dup_uids: 0,
+            max_bloat: 1.1,
+            stuck: 0,
+            at_risk: 0,
+        };
+        assert!(healthy.healthy());
+        assert!(healthy.same_as(&healthy));
+        assert!(!(healthy.same_as(&healthy) && !healthy.healthy()));
+
+        let broken = Summary {
+            dup_uids: 2,
+            max_bloat: 1.0,
+            stuck: 0,
+            at_risk: 0,
+        };
+        assert!(!broken.healthy());
+        assert!(broken.same_as(&broken));
     }
 }
