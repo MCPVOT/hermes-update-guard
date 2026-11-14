@@ -65,16 +65,29 @@ pub fn run(home: &Path, cfg: &Config) -> Result<()> {
     }
 
     // version + update-channel state
-    let hermes = env::venv_hermes(home);
-    let (vcode, vout) = env::run_capture(&hermes, &["--version"], None)
-        .unwrap_or((-1, "cannot run hermes --version".into()));
+    // Resolve the CLI the way hermes itself does. A venv-only assumption is wrong on every
+    // install that is not a source checkout: this guard was shipped to a droplet whose CLI is
+    // ~/.local/bin/hermes, so preflight printed "cannot run hermes --version" and could not
+    // name the channel target it would install (measured 2026-11-08).
+    let venv = env::venv_hermes(home);
+    let hermes = env::resolve_hermes(home);
+    let no_cli = format!(
+        "cannot find the hermes CLI: no executable at {} and none on PATH",
+        venv.display()
+    );
+    let (vcode, vout) = hermes
+        .as_deref()
+        .and_then(|h| env::run_capture(h, &["--version"], None).ok())
+        .unwrap_or((-1, no_cli.clone()));
     println!("\n[version] (exit {})", vcode);
     for l in vout.lines().take(4) {
         println!("  {}", l);
     }
 
-    let (ccode, cout) = env::run_capture(&hermes, &["update", "--check"], None)
-        .unwrap_or((-1, "cannot run hermes update --check".into()));
+    let (ccode, cout) = hermes
+        .as_deref()
+        .and_then(|h| env::run_capture(h, &["update", "--check"], None).ok())
+        .unwrap_or((-1, no_cli.clone()));
     println!("\n[update --check] (exit {})", ccode);
     for l in cout.trim().lines().take(4) {
         println!("  {}", l);

@@ -6,6 +6,51 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-11-13
+
+### Fixed
+- **A missing baseline read as "no drift" and exited 0.** `baseline_surface` returned
+  `Ok(None)` for a path that did not exist, so `diff --baseline golden` on a host where
+  `golden.json` was never written printed `no provider-surface drift detected` and passed.
+  An absent baseline is an absent reading: `diff` now refuses with the path and a hint, and
+  the library function errors instead of returning `None`. Measured on 0.7.0 against a home
+  with no `golden.json`: false PASS, exit 0. Now: `baseline ... does not exist`, exit 1.
+- **An unreadable live `config.yaml` was skipped as if the profile had no drift.** The drift
+  walk called `let Ok(surface) = extract_surface(...) else { continue }`, so a corrupt live
+  config produced no row at all. It now reports `live surface UNREADABLE` and counts the
+  reading as a failure of the drift check, the same direction the baseline side already took.
+- **The UNREADABLE counter only matched baseline lines.** The new live-reading line would
+  not have reached the failure branch, so the check would have printed an unreadable profile
+  and still exited 0. The counter now matches both.
+- **`--home` was ignored when resolving `--baseline golden`.** `resolve_baseline` called
+  `env::hermes_home()` instead of using the resolved home, so `--home /tmp/x diff --baseline
+  golden` read the REAL `~/.hermes` baseline while reporting on the temp home's profiles.
+  It now takes the resolved home.
+- **A healthy unchanged context reading warned about a "PRE-EXISTING condition".** `verify`
+  printed the warning whenever the before/after summaries were equal, including on a clean
+  fleet where there was no condition. It now warns only when the equal reading is actually
+  a problem (`dup_uids`/`stuck`/bloat); a healthy unchanged run prints the `ok` line.
+- **The `self-check` "stale clones" hint printed a Windows path on Linux.** It used
+  `home.display()\\tools`; it now uses `home.join("tools")`.
+
+### Tests
+- 105 unit tests. New controls: a missing baseline errors instead of passing; an unparseable
+  live config produces an UNREADABLE row; a healthy unchanged summary is not a condition.
+
+## [0.7.1] - 2026-11-08
+
+### Fixed
+- **`preflight` and `backup` assume a venv-only install and report nothing on every other layout.**
+  Both called `env::venv_hermes(home)` (`<home>/hermes-agent/venv/bin/hermes`) instead of
+  `env::resolve_hermes(home)`, which already exists for exactly this reason. On a host whose CLI is
+  `~/.local/bin/hermes` with no venv (measured on the hoodbot droplet), `preflight` printed
+  `[version] cannot run hermes --version` and `[update --check] cannot run hermes update --check`,
+  so the one gate that should name the release it would install named nothing, and
+  `version-before.txt` in every restore point was empty. Both now resolve the CLI the way hermes
+  itself does and fail with the venv path plus the PATH candidates when there is genuinely none.
+  Verified on that host: `preflight` now prints `v0.23.0 … local 2bd378ed1b8d`,
+  `✓ Up to date with the latest release` and `TARGET : none - this update would be a NO-OP`.
+
 ## [0.7.0] - 2026-11-07
 
 ### Added

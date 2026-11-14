@@ -291,12 +291,22 @@ pub fn diff(home: &Path, explicit_baseline: Option<&Path>) -> Result<()> {
     } else {
         bail!("no baseline found — run `export` first (or pass -Baseline)");
     };
-    let base_label = if base.file_name().map(|f| f.to_string_lossy().into_owned())
-        == Some("golden.json".into())
-    {
-        "GOLDEN"
-    } else {
-        "last-known"
+    // An explicit baseline that does not exist is an ABSENT reading, not a clean
+    // one. `baseline_surface` returns None for a missing file, so without this
+    // check `diff --baseline golden` printed "no drift" and exited 0 on a host
+    // where golden.json was never written. Refuse instead: a baseline you cannot
+    // read is never evidence that nothing changed.
+    if !base.exists() {
+        bail!(
+            "baseline {} does not exist — run `export` first (or pass a valid path)",
+            base.display()
+        );
+    }
+    let base_name = base.file_name().map(|f| f.to_string_lossy().into_owned());
+    let base_label = match base_name.as_deref() {
+        Some("golden.json") => "GOLDEN",
+        Some("last-known") => "last-known",
+        _ => base_name.as_deref().unwrap_or("<explicit path>"),
     };
 
     println!(
@@ -311,10 +321,7 @@ pub fn diff(home: &Path, explicit_baseline: Option<&Path>) -> Result<()> {
     }
 
     let drifted = count_drift_lines(&lines);
-    let unreadable = lines
-        .iter()
-        .filter(|l| l.contains(" baseline UNREADABLE"))
-        .count();
+    let unreadable = lines.iter().filter(|l| l.contains("UNREADABLE")).count();
     if drifted == 0 && unreadable == 0 {
         println!("  no provider-surface drift detected");
         Ok(())
@@ -328,7 +335,7 @@ pub fn diff(home: &Path, explicit_baseline: Option<&Path>) -> Result<()> {
         }
         if unreadable > 0 {
             println!(
-                "  [FAIL] {} baseline file(s) UNREADABLE - drift check incomplete",
+                "  [FAIL] {} reading(s) UNREADABLE - drift check incomplete",
                 unreadable
             );
         }
@@ -392,7 +399,11 @@ pub fn baseline_surface(base: &Path, profile: &str) -> Result<Option<Value>> {
         return read_json_file(&f).map(Some);
     }
     if !base.exists() {
-        return Ok(None);
+        // A baseline path that does not exist is an absent reading. Returning
+        // Ok(None) here made every caller treat "the file is missing" as "this
+        // profile has no baseline" — and the drift walk then reported "no drift"
+        // on a host where the baseline was never written.
+        bail!("baseline {} does not exist", base.display());
     }
     let whole = read_json_file(base)?;
     // A flat file carries the surface keys at the top level; an aggregate carries
@@ -440,8 +451,16 @@ pub fn compare_against(home: &Path, base: &Path) -> Vec<String> {
         if !cfg.exists() {
             continue;
         }
-        let Ok(live) = extract_surface(&cfg) else {
-            continue;
+        // A live config we cannot read is an UNREADABLE reading, not a clean
+        // profile. Skipping it silently made a broken config.yaml read as "no
+        // drift" — the same absent-reading-as-health mistake the baseline side
+        // refuses to make.
+        let live = match extract_surface(&cfg) {
+            Ok(v) => v,
+            Err(e) => {
+                lines.push(format!("  ! {} live surface UNREADABLE: {}", p, e));
+                continue;
+            }
         };
         match baseline_surface(base, p) {
             Ok(None) => continue,
@@ -808,6 +827,56 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("baseline UNREADABLE")),
             "expected an UNREADABLE line, got {:?}",
+            lines
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A baseline path that does not exist must not read as "no drift".
+    /// Measured before the fix: `diff --baseline golden` on a host with no
+    /// golden.json printed "no provider-surface drift detected" and exited 0.
+    #[test]
+    fn missing_baseline_file_is_an_error_not_a_clean_pass() {
+        let home = std::env::temp_dir().join("hug-test-missing-baseline");
+        let prof = home.join("profiles").join("alpha");
+        std::fs::create_dir_all(&prof).unwrap();
+        std::fs::write(
+            prof.join("config.yaml"),
+            "model:\n  provider: openrouter\n  default: x\n",
+        )
+        .unwrap();
+        let missing = home.join("no-such-golden.json");
+        assert!(
+            baseline_surface(&missing, "alpha").is_err(),
+            "a missing baseline file must be an error, not Ok(None)"
+        );
+        let lines = compare_against(&home, &missing);
+        assert!(
+            lines.iter().any(|l| l.contains("UNREADABLE")),
+            "a missing baseline must produce an UNREADABLE line, got {:?}",
+            lines
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A live config we cannot parse is an unreadable reading, not a clean one.
+    #[test]
+    fn unreadable_live_config_is_not_a_clean_pass() {
+        let home = std::env::temp_dir().join("hug-test-live-unreadable");
+        let prof = home.join("profiles").join("alpha");
+        std::fs::create_dir_all(&prof).unwrap();
+        std::fs::write(prof.join("config.yaml"), "model:\n  provider: [unclosed\n").unwrap();
+        let base = home.join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("alpha.json"),
+            serde_json::json!({"model.provider": "openrouter"}).to_string(),
+        )
+        .unwrap();
+        let lines = compare_against(&home, &base);
+        assert!(
+            lines.iter().any(|l| l.contains("live surface UNREADABLE")),
+            "an unparseable live config must produce an UNREADABLE line, got {:?}",
             lines
         );
         let _ = std::fs::remove_dir_all(&home);

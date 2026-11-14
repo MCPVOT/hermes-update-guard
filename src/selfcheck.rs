@@ -115,10 +115,13 @@ pub fn run(home: &Path, repo: Option<&Path>, bulk_root: &Path) -> Result<()> {
             }
         }
         if clones.is_empty() {
-            println!("  stale clones: none under {}\\tools", home.display());
+            println!(
+                "  stale clones: none under {}",
+                home.join("tools").display()
+            );
         } else {
             println!(
-                "  ! {} copy/copies of the tool under {}\\tools (a `cargo install` from one reinstalls a stale build): {}",
+                "  ! {} copy/copies of the tool under {} (a `cargo install` from one reinstalls a stale build): {}",
                 clones.len(),
                 home.display(),
                 clones.join(", ")
